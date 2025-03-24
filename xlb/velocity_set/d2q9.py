@@ -18,7 +18,7 @@ class D2Q9(VelocitySet):
         cx = [0, 0, 0, 1, -1, 1, -1, 1, -1]
         cy = [0, 1, -1, 0, 1, -1, 0, 1, -1]
         c = np.array(tuple(zip(cx, cy))).T
-        w = np.array([4 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 36, 1 / 36, 1 / 9, 1 / 36, 1 / 36])
+        w = np.array([4 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 36, 1 / 36, 1 / 36, 1 / 36])
 
         # Call the parent constructor
         super().__init__(2, 9, c, w, precision_policy=precision_policy, compute_backend=compute_backend)
