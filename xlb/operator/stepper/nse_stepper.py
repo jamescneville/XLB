@@ -236,14 +236,14 @@ class IncompressibleNavierStokesStepper(Stepper):
             _f0_thread = _f_vec()
             _f1_thread = _f_vec()
             _missing_mask = _missing_mask_vec()
+            i = index[0]
+            j = index[1]
+            k = index[2]
             for l in range(self.velocity_set.q):
                 # q-sized vector of pre-streaming populations
-                _f0_thread[l] = self.compute_dtype(f0_buffer[l, index[0], index[1], index[2]])
-                _f1_thread[l] = self.compute_dtype(f1_buffer[l, index[0], index[1], index[2]])
-                if missing_mask[l, index[0], index[1], index[2]]:
-                    _missing_mask[l] = wp.uint8(1)
-                else:
-                    _missing_mask[l] = wp.uint8(0)
+                _f0_thread[l] = self.compute_dtype(f0_buffer[l, i, j, k])
+                _f1_thread[l] = self.compute_dtype(f1_buffer[l, i, j, k])
+                _missing_mask[l] = wp.select(missing_mask[l, i, j, k], wp.uint8(0), wp.uint8(1))
 
             return _f0_thread, _f1_thread, _missing_mask
 
