@@ -144,6 +144,7 @@ class HelperFunctionsBC(object):
             # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
+            epsilon = compute_dtype(1e-7)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             nt = _d * (_d + 1) // 2
@@ -156,6 +157,7 @@ class HelperFunctionsBC(object):
                 # fneq ~ f^1
                 fpop1 = compute_dtype(4.5) * _w[l] * QiPi1
                 fpop[l] = feq[l] + fpop1
+                fpop[l] = wp.max(epsilon, fpop[l])
             return fpop
 
         @wp.func
@@ -176,30 +178,42 @@ class HelperFunctionsBC(object):
 
             # Compute pressure tensor Pi using all f_post-streaming values
             Pi = momentum_flux.warp_functional(f_post)
+            epsilon = compute_dtype(1e-7)            
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
+            three = compute_dtype(3.0)
+            four_pt_five = compute_dtype(4.5)
+            missing_count = zero
+
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    missing_count += one
+            scale = one - (missing_count / compute_dtype(_q)) 
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             nt = _d * (_d + 1) // 2
             for l in range(_q):
                 if _missing_mask[l] == wp.uint8(1):
                     # compute dot product of qi and Pi
-                    QiPi = compute_dtype(0.0)
+                    QiPi = zero
                     for t in range(nt):
                         if t == 0 or t == 3 or t == 5:
-                            QiPi += _qi[l, t] * (Pi[t] - rho / compute_dtype(3.0))
+                            QiPi += _qi[l, t] * (Pi[t] - rho / three)
                         else:
                             QiPi += _qi[l, t] * Pi[t]
 
                     # Compute c.u
-                    cu = compute_dtype(0.0)
+                    cu = zero
                     for d in range(_d):
-                        if _c[d, l] == 1:
-                            cu += u[d]
-                        elif _c[d, l] == -1:
-                            cu -= u[d]
-                    cu *= compute_dtype(3.0)
+                        cu += _c_float[d, l] * u[d]
+                    cu *= three
 
                     # change f_post using the Grad's approximation
-                    f_post[l] = rho * _w[l] * (compute_dtype(1.0) + cu) + _w[l] * compute_dtype(4.5) * QiPi
+                    f_post[l] = rho * _w[l] * (one + cu) + _w[l] * four_pt_five * QiPi * scale
+
+                    f_post[l] = wp.max(epsilon, f_post[l])
+                else:
+                    f_post[l] = wp.max(epsilon, f_post[l])
 
             return f_post
 
