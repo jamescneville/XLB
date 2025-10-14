@@ -1,10 +1,10 @@
 import numpy as np
 import trimesh
-from typing import Any
-
+from typing import Any, Optional
+import time
 import neon
 import warp as wp
-
+from xlb.utils.utils import UnitConvertor
 
 
 def adjust_bbox(cuboid_max, cuboid_min, voxel_size_up):
@@ -19,23 +19,34 @@ def adjust_bbox(cuboid_max, cuboid_min, voxel_size_up):
     Returns:
         tuple: (adjusted_min, adjusted_max) snapped to grid points of one level higher.
     """
-
     adjusted_min = np.round(cuboid_min / voxel_size_up) * voxel_size_up
     adjusted_max = np.round(cuboid_max / voxel_size_up) * voxel_size_up
     return adjusted_min, adjusted_max
 
+
 def prepare_sparsity_pattern(level_data):
     """
-    Prepare the sparsity pattern for the multiresolution grid based on the level data.
+    Prepare the sparsity pattern for the multiresolution grid based on the level data. "level_data" is expected to be formatted as in
+    the output of "make_cuboid_mesh".
     """
-    sparsity_pattern = []
+    num_levels = len(level_data)
     level_origins = []
-    for lvl in range(len(level_data)):
+    sparsity_pattern = []
+    for lvl in range(num_levels):
+        # Get the level mask from the level data
         level_mask = level_data[lvl][0]
+
+        # Ensure level_0 is contiguous int32
         level_mask = np.ascontiguousarray(level_mask, dtype=np.int32)
+
+        # Append the padded level mask to the sparsity pattern
         sparsity_pattern.append(level_mask)
+
+        # Get the origin for this level
         level_origins.append(level_data[lvl][2])
+
     return sparsity_pattern, level_origins
+
 
 def make_cuboid_mesh(voxel_size, cuboids, stl_filename):
     """
@@ -95,13 +106,13 @@ def make_cuboid_mesh(voxel_size, cuboids, stl_filename):
 
         xmin, ymin, zmin = adjusted_min
         xmax, ymax, zmax = adjusted_max
-        
+
         # Compute number of voxels based on level-specific voxel size
         nx = int(np.round((xmax - xmin) / voxel_size_level))
         ny = int(np.round((ymax - ymin) / voxel_size_level))
         nz = int(np.round((zmax - zmin) / voxel_size_level))
         print(f"Domain {nx}, {ny}, {nz}  Origin {adjusted_min}  Voxel Size {voxel_size_level} Voxel Level Up {voxel_level_up}")
-    
+
         voxel_matrix = np.ones((nx, ny, nz), dtype=bool)
 
         origin = adjusted_min
@@ -135,15 +146,18 @@ def make_cuboid_mesh(voxel_size, cuboids, stl_filename):
     num_levels = len(level_data)
     level_data = [(dr, int(v / voxel_size), np.round(dOrigin / v).astype(int), num_levels - 1 - l) for dr, v, dOrigin, l in level_data]
 
-    level_data =  list(reversed(level_data))
-    sparsity_pattern, level_origins = prepare_sparsity_pattern(level_data)
-    
-    return level_data, sparsity_pattern, level_origins
-
+    return list(reversed(level_data))
 
 
 class MultiresIO(object):
-    def __init__(self, field_name_cardinality_dict, levels_data, scale=1, offset=(0.0, 0.0, 0.0), store_precision=None, timestep_size=1):
+    def __init__(
+        self,
+        field_name_cardinality_dict,
+        levels_data,
+        unit_convertor: UnitConvertor = None,
+        offset: Optional[tuple] = (0.0, 0.0, 0.0),
+        store_precision=None,
+    ):
         """
         Initialize the MultiresIO object.
 
@@ -154,17 +168,18 @@ class MultiresIO(object):
             Example: {'velocity_x': 1, 'velocity_y': 1, 'velocity': 3, 'density': 1}
         levels_data : list of tuples
             Each tuple contains (data, voxel_size, origin, level).
-        scale : float or tuple, optional
-            Scale factor for the coordinates. Typically smallest voxel size
+        unit_convertor : UnitConvertor
+            An instance of the UnitConvertor class for unit conversions.
         offset : tuple, optional
             Offset to be applied to the coordinates.
         store_precision : str, optional
             The precision policy for storing data.
-        timestep_size: float
-            Scale factor to convert velocities to model units. Typically smallest timestep size
         """
+        # Set the unit convertor object
+        self.unit_convertor = unit_convertor
+        start_time = time.time()
         # Process the multires geometry and extract coordinates and connectivity in the coordinate system of the finest level
-        coordinates, connectivity, level_id_field, total_cells = self.process_geometry(levels_data, scale)
+        coordinates, connectivity, level_id_field, total_cells = self.process_geometry(levels_data)
 
         # Ensure that coordinates and connectivity are not empty
         assert coordinates.size != 0, "Error: No valid data to process. Check the input levels_data."
@@ -172,8 +187,8 @@ class MultiresIO(object):
         # Merge duplicate points
         coordinates, connectivity = self._merge_duplicates(coordinates, connectivity, levels_data)
 
-        # Apply scale and offset
-        coordinates = self._transform_coordinates(coordinates, scale, offset)
+        # Transform coordinates to physical units and apply offset if provided
+        coordinates = self._transform_coordinates(coordinates, offset)
 
         # Assign to self
         self.field_name_cardinality_dict = field_name_cardinality_dict
@@ -182,15 +197,8 @@ class MultiresIO(object):
         self.connectivity = connectivity
         self.level_id_field = level_id_field
         self.total_cells = total_cells
-        self.centroids = np.mean(coordinates[connectivity], axis=1)
-
-        #For convertin velocities to model units
-        if scale != 1 and timestep_size !=1:            
-            self.velocity_conversion = scale / timestep_size
-            self.pressure_conversion = (1.204 / 3)  * (scale**2 / timestep_size**2)
-        else: 
-            self.velocity_conversion = 1
-            self.pressure_conversion = 1
+        #self.centroids = np.mean(coordinates[connectivity], axis=1)
+        self.centroids = np.einsum('ijk->ij', coordinates[connectivity]) * 0.125
 
         # Set the default precision policy if not provided
         from xlb import DefaultConfig
@@ -204,8 +212,9 @@ class MultiresIO(object):
 
         # Construct the NEON container for exporting multi-resolution data
         self.container = self._construct_neon_container()
+        print(f"MutliResIO initialized in {time.time()-start_time}sec ")
 
-    def process_geometry(self, levels_data, scale):
+    def process_geometry(self, levels_data):
         num_voxels_per_level = [np.sum(data) for data, _, _, _ in levels_data]
         num_points_per_level = [8 * nv for nv in num_voxels_per_level]
         point_id_offsets = np.cumsum([0] + num_points_per_level[:-1])
@@ -217,10 +226,10 @@ class MultiresIO(object):
 
         for level_idx, (data, voxel_size, origin, level) in enumerate(levels_data):
             origin = origin * voxel_size
-            corners_list, conn_list, _ = self._process_level(data, voxel_size, origin, level, point_id_offsets[level_idx])
+            corners_list, conn_list = self._process_level(data, voxel_size, origin, point_id_offsets[level_idx])
 
             if corners_list:
-                print(f"\tProcessing level {level}: Voxel size {voxel_size * scale}, Origin {origin}, Shape {data.shape}")
+                print(f"\tProcessing level {level}: Voxel size {voxel_size}, Origin {origin}, Shape {data.shape}")
                 all_corners.extend(corners_list)
                 all_connectivity.extend(conn_list)
                 num_cells = sum(c.shape[0] for c in conn_list)
@@ -236,13 +245,13 @@ class MultiresIO(object):
 
         return coordinates, connectivity, level_id_field, total_cells
 
-    def _process_level(self, data, voxel_size, origin, level, point_id_offset):
+    def _process_level(self, data, voxel_size, origin, point_id_offset):
         """
         Given a voxel grid, returns all corners and connectivity in NumPy for this resolution level.
         """
         true_indices = np.argwhere(data)
         if true_indices.size == 0:
-            return [], [], level
+            return [], []
 
         max_voxels_per_chunk = 268_435_450
         chunks = np.array_split(true_indices, max(1, (len(true_indices) + max_voxels_per_chunk - 1) // max_voxels_per_chunk))
@@ -259,7 +268,7 @@ class MultiresIO(object):
             all_connectivity.append(connectivity)
             pid_offset += len(chunk) * 8
 
-        return all_corners, all_connectivity, level
+        return all_corners, all_connectivity
 
     def _process_voxel_chunk(self, true_indices, origin, voxel_size, point_id_offset):
         """
@@ -287,36 +296,6 @@ class MultiresIO(object):
 
         return corners, connectivity
 
-    def optimal_chunk_shape(self, shape, dtype, target_mb=4, min_chunks=64, max_chunks=4096, max_chunk_mb=64):
-        """
-        Choose a row-major HDF5 chunk shape for compression:
-          - target_mb: desired uncompressed bytes per chunk (e.g., 4 for gzip, 8–16 for lzf/lz4)
-          - keeps total number of chunks roughly in [min_chunks, max_chunks]
-          - caps chunk size at max_chunk_mb to limit per-chunk memory
-
-        Returns a tuple suitable for h5py.create_dataset(..., chunks=...).
-        """
-        
-        n0 = int(shape[0]) if len(shape) else 1
-        itemsize = np.dtype(dtype).itemsize
-        row_elems = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
-        row_bytes = max(1, row_elems * itemsize)
-
-        # initial rows by target size
-        target_bytes = int(target_mb * 1024 * 1024)
-        rows = max(1, target_bytes // row_bytes)
-
-        # clamp by desired chunk-count window
-        lower_rows = max(1, (n0 + max_chunks - 1) // max_chunks)   # ensures <= max_chunks
-        upper_rows = max(1, n0 // max_chunks if min_chunks == 0 else n0 // min_chunks)  # ensures >= min_chunks
-        rows = min(max(rows, lower_rows), max(1, upper_rows))
-
-        # cap by max bytes per chunk
-        max_bytes = int(max_chunk_mb * 1024 * 1024)
-        rows = min(rows, max(1, max_bytes // row_bytes))
-
-        return (min(n0, rows),) + tuple(shape[1:])
-        
     def save_xdmf(self, h5_filename, xmf_filename, total_cells, num_points, fields={}):
         # Generate an XDMF file to accompany the HDF5 file
         print(f"\tGenerating XDMF file: {xmf_filename}")
@@ -380,60 +359,72 @@ class MultiresIO(object):
         """
         import h5py
 
-        pts_chunks  = self.optimal_chunk_shape(coordinates.shape,  np.float32, target_mb=4)
-        conn_chunks = self.optimal_chunk_shape(connectivity.shape, np.int32,   target_mb=4)
-        lvl_chunks  = self.optimal_chunk_shape(level_id_field.shape, np.uint8, target_mb=4)
-        fld_chunks  = self.optimal_chunk_shape((self.total_cells,), np.float32, target_mb=4)
-        
         with h5py.File(filename + ".h5", "w") as f:
-            f.create_dataset("/Mesh/Points", data=coordinates, compression=compression, compression_opts=compression_opts, chunks=pts_chunks, shuffle=True)
-            f.create_dataset("/Mesh/Connectivity", data=connectivity, compression=compression, compression_opts=compression_opts, chunks=conn_chunks, shuffle=True)
-            f.create_dataset("/Mesh/Level", data=level_id_field, compression=compression, compression_opts=compression_opts, chunks=lvl_chunks, shuffle=True)
+            f.create_dataset("/Mesh/Points", data=coordinates, compression=compression, compression_opts=compression_opts, chunks=True)
+            f.create_dataset(
+                "/Mesh/Connectivity",
+                data=connectivity,
+                compression=compression,
+                compression_opts=compression_opts,
+                chunks=True,
+            )
+            f.create_dataset("/Mesh/Level", data=level_id_field, compression=compression, compression_opts=compression_opts)
             fg = f.create_group("/Fields")
             for fname, fdata in fields_data.items():
-                #Convert lbm velocity to model velocity
-                if "velocity" in fname.lower():
-                    fdata = fdata * self.velocity_conversion
-                elif "rho" in fname.lower():
-                    fdata = fdata * self.pressure_conversion
-                fg.create_dataset(fname, data=fdata.astype(np.float32), compression=compression, compression_opts=compression_opts, chunks=fld_chunks, shuffle=True)
+                fg.create_dataset(fname, data=fdata.astype(np.float32), compression=compression, compression_opts=compression_opts, chunks=True)
 
     def _merge_duplicates(self, coordinates, connectivity, levels_data):
-        # Merging duplicate points
-        tolerance = 0.01
-        chunk_size = 10_000_000  # Adjust based on GPU memory
+        """
+        Merge duplicate points using parallel sorting.
+        ~3-4x faster than np.unique for large arrays.
+        """
+        import time
+        tic = time.perf_counter()
+        
         num_points = coordinates.shape[0]
-        unique_points = []
-        mapping = np.zeros(num_points, dtype=np.int32)
-        unique_idx = 0
+        finest_voxel = min(voxel_size for (_, voxel_size, _, _) in levels_data)
+        print(f"\tMerging duplicates from {num_points:,} points (finest voxel={finest_voxel}m)...")
+        
+        # Quantize coordinates to finest voxel grid
+        inv = 1.0 / finest_voxel
+        qi = np.rint(coordinates * inv).astype(np.int64)  # Removed unnecessary float64 cast
+        
+        # Compute tight bounding box
+        mins = qi.min(axis=0)
+        spans = qi.max(axis=0) - mins + 1
+        shifts = qi - mins
+        
+        # Create hash keys
+        hash_keys = shifts[:, 0] + spans[0] * (shifts[:, 1] + spans[1] * shifts[:, 2])        
+        
+        # Use stable sort (preserves first occurrence ordering)
+        sort_idx = np.argsort(hash_keys, kind='stable')
+        sorted_keys = hash_keys[sort_idx]
+        
+        # Find unique boundaries (vectorized)
+        unique_mask = np.concatenate([[True], sorted_keys[1:] != sorted_keys[:-1]])
+        unique_indices = sort_idx[unique_mask]
+        
+        # Build inverse mapping efficiently
+        unique_ranks = np.cumsum(unique_mask) - 1
+        inverse_indices = np.empty(num_points, dtype=np.int32)
+        inverse_indices[sort_idx] = unique_ranks
+        
+        # Preserve original coordinates
+        unique_coordinates = coordinates[unique_indices]
+        new_connectivity = inverse_indices[connectivity]
+        
+        toc = time.perf_counter()
+        reduction = 100 * (1 - len(unique_coordinates) / num_points)
+        print(f"\tMerged to {len(unique_coordinates):,} unique points ({reduction:.1f}% reduction) in {toc - tic:.2f} seconds")
+        
+        return unique_coordinates, new_connectivity
 
-        # Get the grid shape of computational box at the finest level from the levels_data
-        num_levels = len(levels_data)
-        grid_shape_finest = np.array(levels_data[-1][0].shape) * 2 ** (num_levels - 1)
-
-        for start in range(0, num_points, chunk_size):
-            end = min(start + chunk_size, num_points)
-            coords_chunk = coordinates[start:end]
-
-            # Simple hashing: grid coordinates as tuple keys
-            grid_coords = np.round(coords_chunk / tolerance).astype(np.int64)
-            hash_keys = grid_coords[:, 0] + grid_coords[:, 1] * grid_shape_finest[0] + grid_coords[:, 2] * grid_shape_finest[0] * grid_shape_finest[1]
-            unique_hash, inverse = np.unique(hash_keys, return_inverse=True)
-            unique_hash, unique_indices, inverse = np.unique(hash_keys, return_index=True, return_inverse=True)
-            unique_chunk = coords_chunk[unique_indices]
-
-            unique_points.append(unique_chunk)
-            mapping[start:end] = inverse + unique_idx
-            unique_idx += len(unique_hash)
-
-        coordinates = np.concatenate(unique_points)
-        connectivity = mapping[connectivity]
-        return coordinates, connectivity
-
-    def _transform_coordinates(self, coordinates, scale, offset):
-        scale = np.array([scale] * 3 if isinstance(scale, (int, float)) else scale, dtype=np.float32)
+    def _transform_coordinates(self, coordinates, offset):
         offset = np.array(offset, dtype=np.float32)
-        return coordinates * scale + offset
+        if self.unit_convertor is not None:
+            coordinates = self.unit_convertor.length_to_physical(coordinates)
+        return coordinates + offset
 
     def _prepare_container_inputs(self):
         # load necessary modules
@@ -507,7 +498,7 @@ class MultiresIO(object):
 
         # Ensure that this operator is called on multires grids
         grid_mres = next(iter(field_neon_dict.values())).get_grid()
-        assert grid_mres.name== "mGrid", f"Operation {self.__class__.__name} is only applicable to multi-resolution cases"
+        assert grid_mres.name == "mGrid", f"Operation {self.__class__.__name} is only applicable to multi-resolution cases!"
 
         for field_name in field_neon_dict.keys():
             assert field_name in self.field_name_cardinality_dict.keys(), (
@@ -550,9 +541,19 @@ class MultiresIO(object):
             fields_data[field_name] = np.concatenate(fields_data[field_name])
             assert fields_data[field_name].size == self.total_cells, f"Error: Field {field_name} size mismatch!"
 
+            # Unit conversion if applicable
+            if self.unit_convertor is not None:
+                if "velocity" in field_name.lower():
+                    fields_data[field_name] = self.unit_convertor.velocity_to_physical(fields_data[field_name])
+                elif "density" in field_name.lower():
+                    fields_data[field_name] = self.unit_convertor.density_to_physical(fields_data[field_name])
+                elif "pressure" in field_name.lower():
+                    fields_data[field_name] = self.unit_convertor.pressure_to_physical(fields_data[field_name])
+                # Add more physical quantities as needed
+
         return fields_data
 
-    def to_hdf5(self, output_filename, field_neon_dict, compression="gzip", compression_opts=0, store_precision=None):
+    def to_hdf5(self, output_filename, field_neon_dict, compression="gzip", compression_opts=0):
         """
         Export the multi-resolution mesh data to an HDF5 file.
         Parameters
@@ -565,8 +566,6 @@ class MultiresIO(object):
             The compression method to use for the HDF5 file.
         compression_opts : int, optional
             The compression options to use for the HDF5 file.
-        store_precision : str, optional
-            The precision policy for storing data in the HDF5 file.
         """
         import time
 
@@ -594,10 +593,8 @@ class MultiresIO(object):
         grid_res=512,
         cmap=None,
         component=None,
-        show_axes=True,
-        show_colorbar=True,
-        normalize=1.0,
-        output=None,
+        show_axes=False,
+        show_colorbar=False,
         **kwargs,
     ):
         """
@@ -622,19 +619,14 @@ class MultiresIO(object):
             Physical size of slice grid (width, height).
         cmap : str
             Matplotlib colormap.
-        normalize : float
-            Factor to scale and normalize data to ensure consistent images
-        output: str
-            None = png output, 'array' = no PNG and returns array of results, 'both' = png and returns array
         """
-  
         # Get the fields data from the NEON fields
         assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
         fields_data = self.get_fields_data(field_neon_dict)
 
         # Check if the component is within the valid range
         if component is None:
-            print("\tCreating slice image of the field magnitude!") 
+            print("\tCreating slice image of the field magnitude!")
             cell_data = list(fields_data.values())
             squared = [comp**2 for comp in cell_data]
             cell_data = np.sqrt(sum(squared))
@@ -646,17 +638,9 @@ class MultiresIO(object):
             print(f"\tCreating slice image for component {component} of the input field!")
             field_name = list(fields_data.keys())[component]
             cell_data = fields_data[field_name]
-        if "velocity" in field_name.lower():
-            cell_data = cell_data * self.velocity_conversion
-        elif "rho" in field_name.lower():
-            cell_data = cell_data * self.pressure_conversion
 
-        if normalize != 1.0:  
-            cell_data = np.clip((cell_data / normalize),0,1)
-        else:   
-            cell_data = cell_data  
         # Plot each field in the dictionary
-        result =  self._to_slice_image_single_field(
+        self._to_slice_image_single_field(
             f"{output_filename}_{field_name}",
             cell_data,
             plane_point,
@@ -667,18 +651,10 @@ class MultiresIO(object):
             cmap=cmap,
             show_axes=show_axes,
             show_colorbar=show_colorbar,
-            output=output,
-            normalize=normalize,
             **kwargs,
         )
-        if output == 'array':
-            return result            
-        elif output == 'both':
-            print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
-            return result            
-        else:            
-            print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
- 
+        print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
+
     def _to_slice_image_single_field(
         self,
         output_filename,
@@ -691,8 +667,6 @@ class MultiresIO(object):
         cmap,
         show_axes,
         show_colorbar,
-        output,
-        normalize,
         **kwargs,
     ):
         """
@@ -702,8 +676,7 @@ class MultiresIO(object):
         import numpy as np
         import matplotlib.pyplot as plt
         from scipy.spatial import cKDTree
-        
-        
+
         # field data are associated with the cells centers
         cell_values = field_data
 
@@ -753,36 +726,35 @@ class MultiresIO(object):
         bounded_y_min = local_y[mask_bounds].min()
         bounded_y_max = local_y[mask_bounds].max()
         width_x = bounded_x_max - bounded_x_min
-        height_y = bounded_y_max - bounded_y_min        
-        aspect_ratio = height_y / width_x        
-        grid_resY = max(1, int(np.round(grid_res*aspect_ratio)))
+        height_y = bounded_y_max - bounded_y_min
+        aspect_ratio = height_y / width_x
+        grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
+
         # Create grid
         grid_x = np.linspace(bounded_x_min, bounded_x_max, grid_res)
         grid_y = np.linspace(bounded_y_min, bounded_y_max, grid_resY)
         xv, yv = np.meshgrid(grid_x, grid_y, indexing="xy")
-        
+
         # Fast KDTree-based interpolation
         points = np.column_stack((local_x[mask_bounds], local_y[mask_bounds]))
         tree = cKDTree(points)
-        
+
         # Query points
         query_points = np.column_stack((xv.ravel(), yv.ravel()))
-        
+
         # Find k nearest neighbors for smoother interpolation
         k = min(4, len(points))  # Use 4 neighbors or less if not enough points
-        distances, indices = tree.query(query_points, k=k, workers=-1) #-1 uses all cores
-        
+        distances, indices = tree.query(query_points, k=k, workers=-1)  # -1 uses all cores
+
         # Inverse distance weighting
         epsilon = 1e-10
         weights = 1.0 / (distances + epsilon)
         weights /= weights.sum(axis=1, keepdims=True)
-        
+
         # Interpolate values
         neighbor_values = values[mask_bounds][indices]
         grid_field = (neighbor_values * weights).sum(axis=1).reshape(grid_resY, grid_res)
-        
-        if output == 'array':
-            return grid_field
+
         # Plot
         if show_colorbar or show_axes:
             dpi = 300
@@ -793,39 +765,34 @@ class MultiresIO(object):
                 origin="lower",
                 aspect="equal",
                 **kwargs,
-            )        
+            )
             if show_colorbar:
                 plt.colorbar()
             if not show_axes:
-                plt.axis('off')
+                plt.axis("off")
             plt.savefig(output_filename + ".png", dpi=dpi, bbox_inches="tight", pad_inches=0)
             plt.close()
         else:
-            if normalize != 1.0:
-                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower", vmin=0, vmax=1)
-            else:
-                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
-            
-        if output == 'both':
-            return grid_field
-            
-    
-    def to_line(self, 
-        output_filename, 
-        field_neon_dict, 
-        start_point, 
-        end_point, 
-        resolution, 
+            plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
+
+    def to_line(
+        self,
+        output_filename,
+        field_neon_dict,
+        start_point,
+        end_point,
+        resolution,
         component=None,
         radius=1.0,
-        **kwargs,):
+        **kwargs,
+    ):
         """
         Extract field data along a line between start_point and end_point and save to a CSV file.
 
         This function performs two main steps:
         1. Extracts field data from field_neon_dict, handling components or computing magnitude.
         2. Interpolates the field values along a line defined by start_point and end_point,
-           then saves the results (coordinates and field values) to a CSV file.
+        then saves the results (coordinates and field values) to a CSV file.
 
         Parameters
         ----------
@@ -849,7 +816,7 @@ class MultiresIO(object):
             The specific component of the field to extract (e.g., 0 for x-component, 1 for y-component).
             If None, the magnitude of the field is computed. Default is None.
         radius : int
-            The specified distance (in units of the coordinate system) to prefilter and query for line plot 
+            The specified distance (in units of the coordinate system) to prefilter and query for line plot
 
         Returns
         -------
@@ -860,12 +827,11 @@ class MultiresIO(object):
         -----
         - The output CSV file will contain columns: 'x', 'y', 'z', and the value of the field name (e.g., 'velocity_x' or 'velocity_magnitude').
         """
-        
-       
+
         # Get the fields data from the NEON fields
         assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
         fields_data = self.get_fields_data(field_neon_dict)
-        
+
         # Check if the component is within the valid range
         if component is None:
             print("\tCreating csv plot of the field magnitude!")
@@ -873,7 +839,7 @@ class MultiresIO(object):
             squared = [comp**2 for comp in cell_data]
             cell_data = np.sqrt(sum(squared))
             field_name = list(fields_data.keys())[0].split("_")[0] + "_magnitude"
-            
+
         else:
             assert component < max(self.field_name_cardinality_dict.values()), (
                 f"Error: Component {component} is out of range for the provided fields."
@@ -881,12 +847,7 @@ class MultiresIO(object):
             print(f"\tCreating csv plot for component {component} of the input field!")
             field_name = list(fields_data.keys())[component]
             cell_data = fields_data[field_name]
-           
-        if "velocity" in field_name.lower():
-            cell_data = cell_data * self.velocity_conversion
-        elif "rho" in field_name.lower():
-            cell_data = cell_data * self.pressure_conversion
-       
+
         # Plot each field in the dictionary
         self._to_line_field(
             f"{output_filename}_{field_name}",
@@ -898,36 +859,36 @@ class MultiresIO(object):
             **kwargs,
         )
         print(f"\tLine Plot for field {field_name} saved as {output_filename}.csv")
-    
+
     def _to_line_field(
-        self, 
-        output_filename, 
-        cell_data, 
-        start_point, 
-        end_point, 
+        self,
+        output_filename,
+        cell_data,
+        start_point,
+        end_point,
         resolution,
         radius,
         **kwargs,
-        ):
+    ):
         """
         Helper function to create a line plot for a single field.
         """
         import numpy as np
-        
-        #cell_points = self.coordinates[self.connectivity]  # Shape: (M, K, 3), where M is num cells, K is nodes per cell
-        #centroids = np.mean(cell_points, axis=1)  # Shape: (M, 3)
+
+        # cell_points = self.coordinates[self.connectivity]  # Shape: (M, K, 3), where M is num cells, K is nodes per cell
+        # centroids = np.mean(cell_points, axis=1)  # Shape: (M, 3)
         centroids = self.centroids
         p0 = np.array(start_point, dtype=np.float32)
         p1 = np.array(end_point, dtype=np.float32)
-        
+
         # direction and parameter t for each centroid
-        d = (p1 - p0)
+        d = p1 - p0
         L = np.linalg.norm(d)
         d_unit = d / L
         v = centroids - p0
         t = v.dot(d_unit)
         closest = p0 + np.outer(t, d_unit)
-        perp_dist = np.linalg.norm(centroids-closest, axis=1)
+        perp_dist = np.linalg.norm(centroids - closest, axis=1)
 
         # optionally mask to [0,L] or a small perp-radius
         mask = (t >= 0) & (t <= L) & (perp_dist <= radius)
@@ -945,14 +906,8 @@ class MultiresIO(object):
         vals_line = np.interp(t_line, t_sorted, data_sorted, left=np.nan, right=np.nan)
 
         # reconstruct (x,y,z)
-        line_xyz = p0[None,:] + t_line[:,None]*d_unit[None,:]
+        line_xyz = p0[None, :] + t_line[:, None] * d_unit[None, :]
 
         # vectorized CSV dump
-        out = np.hstack([line_xyz, vals_line[:,None]])
-        np.savetxt(
-            output_filename + '.csv',
-            out,
-            delimiter=',',
-            header='x,y,z,value',
-            comments=''
-        )
+        out = np.hstack([line_xyz, vals_line[:, None]])
+        np.savetxt(output_filename + ".csv", out, delimiter=",", header="x,y,z,value", comments="")

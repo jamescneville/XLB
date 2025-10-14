@@ -314,3 +314,186 @@ def axangle2mat(axis, angle, is_normalized=False):
         [xyC + zs, y * yC + c, yzC - xs],
         [zxC - ys, yzC + xs, z * zC + c],
     ])
+
+
+class ToJAX(object):
+    def __init__(self, field_name, field_cardinality, grid_shape, store_precision=None):
+        """
+        Initialize the MultiresIO object.
+
+        Parameters
+        ----------
+        field_name : str
+            The name of the field to be converted.
+        field_cardinality : int
+            The cardinality of the field to be converted.
+        grid_shape : tuple
+            The shape of the grid on which the field is defined.
+        store_precision : str, optional
+            The precision policy for storing data.
+        """
+        from xlb.compute_backend import ComputeBackend
+        from xlb.grid import grid_factory
+        from xlb import DefaultConfig
+
+        # Assign to self
+        self.field_name = field_name
+        self.field_cardinality = field_cardinality
+        self.grid_shape = grid_shape
+        self.compute_backend = DefaultConfig.default_backend
+        self.velocity_set = DefaultConfig.velocity_set
+        if store_precision is None:
+            self.store_precision = DefaultConfig.default_precision_policy.store_precision
+            self.store_dtype = DefaultConfig.default_precision_policy.store_precision.wp_dtype
+
+        if self.compute_backend == ComputeBackend.NEON:
+            # Allocate warp fields for copying neon fields
+            # Use the warp backend to create dense fields for copying NEON dGrid fields
+            grid_dense = grid_factory(grid_shape, compute_backend=ComputeBackend.WARP)
+            self.warp_field = grid_dense.create_field(cardinality=self.field_cardinality, dtype=self.store_precision)
+
+    def copy_neon_to_warp(self, neon_field):
+        """Convert a dense neon field to a warp field by copying."""
+        import warp as wp
+        import neon
+        from typing import Any
+
+        assert neon_field.get_grid().name == "dGrid", "to_warp only supports dense grids"
+        _d = self.velocity_set.d
+
+        @neon.Container.factory("to_warp")
+        def container(src_field: Any, dst_field: Any, cardinality: wp.int32):
+            def loading_step(loader: neon.Loader):
+                loader.set_grid(src_field.get_grid())
+                src_pn = loader.get_read_handle(src_field)
+
+                @wp.func
+                def cloning(gridIdx: Any):
+                    cIdx = wp.neon_global_idx(src_pn, gridIdx)
+                    gx = wp.neon_get_x(cIdx)
+                    gy = wp.neon_get_y(cIdx)
+                    gz = wp.neon_get_z(cIdx)
+
+                    # XLB is flattening the z dimension in 3D, while neon uses the y dimension
+                    if _d == 2:
+                        gy, gz = gz, gy
+
+                    for card in range(cardinality):
+                        value = wp.neon_read(src_pn, gridIdx, card)
+                        dst_field[card, gx, gy, gz] = value
+
+                loader.declare_kernel(cloning)
+
+            return loading_step
+
+        cardinality = neon_field.cardinality
+        c = container(neon_field, self.warp_field, cardinality)
+        c.run(0)
+        wp.synchronize()
+        return self.warp_field
+
+    def __call__(self, field):
+        from xlb.compute_backend import ComputeBackend
+        import warp as wp
+
+        if self.compute_backend == ComputeBackend.JAX:
+            return field
+        elif self.compute_backend == ComputeBackend.WARP:
+            return wp.to_jax(field)
+        elif self.compute_backend == ComputeBackend.NEON:
+            assert field.cardinality == self.field_cardinality, (
+                f"Field cardinality mismatch! Expected {self.field_cardinality}, got {field.cardinality}!"
+            )
+            return wp.to_jax(self.copy_neon_to_warp(field))
+
+        else:
+            raise ValueError("Unsupported compute backend!")
+
+
+class UnitConvertor(object):
+    def __init__(
+        self,
+        velocity_lbm_unit: float,
+        velocity_physical_unit: float,
+        voxel_size_physical_unit: float,
+        density_physical_unit: float = 1.2041,
+        pressure_physical_unit: float = 1.101325e5,
+    ):
+        """
+        Initialize the UnitConvertor object.
+
+        Parameters
+        ----------
+        velocity_lbm_unit : float
+            The reference velocity in lattice Boltzmann units.
+        velocity_physical_unit : float
+            The reference velocity in physical units (e.g., m/s).
+        voxel_size_physical_unit : float
+            The size of a voxel in physical units (e.g., meters).
+        density_physical_unit : float, optional
+            The reference density in physical units (e.g., kg/m^3). Default is 1.2041 (density of air at room temperature).
+        pressure_physical_unit : float, optional
+            The reference pressure in physical units (e.g., Pascals). Default is 1.101325e5 (atmospheric pressure at sea level).
+        """
+
+        self.voxel_size = voxel_size_physical_unit
+        self.velocity_lbm_unit = velocity_lbm_unit
+        self.velocity_phys_unit = velocity_physical_unit
+
+        # Reference density and pressure in physical units
+        self.reference_density = density_physical_unit
+        self.referece_pressure = pressure_physical_unit
+
+    @property
+    def time_step_physical(self):
+        return self.voxel_size * self.velocity_lbm_unit / self.velocity_phys_unit
+
+    @property
+    def reference_length(self):
+        return self.voxel_size
+
+    @property
+    def reference_time(self):
+        return self.time_step_physical
+
+    @property
+    def reference_velocity(self):
+        return self.reference_length / self.reference_time
+
+    def length_to_lbm(self, length_phys):
+        return length_phys / self.reference_length
+
+    def length_to_physical(self, length_lbm):
+        return length_lbm * self.reference_length
+
+    def time_to_lbm(self, time_phys):
+        return time_phys / self.reference_time
+
+    def time_to_physical(self, time_lbm):
+        return time_lbm * self.reference_time
+
+    def density_to_lbm(self, rho_phys):
+        return rho_phys / self.reference_density
+
+    def density_to_physical(self, rho_lbm):
+        return rho_lbm * self.reference_density
+
+    def velocity_to_lbm(self, velocity_phys):
+        return velocity_phys / self.reference_velocity
+
+    def velocity_to_physical(self, velocity_lbm):
+        return velocity_lbm * self.reference_velocity
+
+    def viscosity_to_lbm(self, viscosity_phys):
+        return viscosity_phys * (self.reference_time / (self.reference_length**2))
+
+    def viscosity_to_physical(self, viscosity_lbm):
+        return viscosity_lbm * (self.reference_length**2 / self.reference_time)
+
+    def pressure_to_lbm(self, pressure_phys):
+        pressure_perturbation = pressure_phys - self.reference_pressure
+        return pressure_perturbation / self.reference_density / self.reference_velocity**2
+
+    def pressure_to_physical(self, pressure_lbm):
+        pressure_perturbation = pressure_lbm - 1.0 / 3.0
+        return self.referece_pressure + pressure_perturbation * self.reference_density * (self.reference_velocity**2)

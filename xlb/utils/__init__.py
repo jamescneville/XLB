@@ -6,6 +6,8 @@ from .utils import (
     rotate_geometry,
     voxelize_stl,
     axangle2mat,
+    ToJAX,
+    UnitConvertor,
 )
 from .mesher import make_cuboid_mesh, MultiresIO
 from .makemesh import makeMesh

@@ -644,25 +644,9 @@ def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, gr
     print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
     print(f"/// Mesh Generation Complete in {toc - tic:0.2f} seconds")
-    print()
+    print()        
     
-    sparsity_pattern, level_origins = prepare_sparsity_pattern(level_data)
-    
-    return level_data, domainSize / voxSize, sparsity_pattern, level_origins
-
-def prepare_sparsity_pattern(level_data):
-    """
-    Prepare the sparsity pattern for the multiresolution grid based on the level data.
-    """
-    sparsity_pattern = []
-    level_origins = []
-    for lvl in range(len(level_data)):
-        level_mask = level_data[lvl][0]
-        level_mask = np.ascontiguousarray(level_mask, dtype=np.int32)
-        sparsity_pattern.append(level_mask)
-        level_origins.append(level_data[lvl][2])
-    return sparsity_pattern, level_origins
-
+    return level_data
 
 # Calculate convolution kernels based on padding values
 def calculate_kernel(padding_values):
