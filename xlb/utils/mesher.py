@@ -197,8 +197,8 @@ class MultiresIO(object):
         self.connectivity = connectivity
         self.level_id_field = level_id_field
         self.total_cells = total_cells
-        #self.centroids = np.mean(coordinates[connectivity], axis=1)
-        self.centroids = np.einsum('ijk->ij', coordinates[connectivity]) * 0.125
+        self.centroids = np.mean(coordinates[connectivity], axis=1)
+        
 
         # Set the default precision policy if not provided
         from xlb import DefaultConfig
@@ -594,7 +594,9 @@ class MultiresIO(object):
         cmap=None,
         component=None,
         show_axes=False,
-        show_colorbar=False,
+        show_colorbar=False,        
+        normalize=1.0,
+        output=None,
         **kwargs,
     ):
         """
@@ -619,6 +621,8 @@ class MultiresIO(object):
             Physical size of slice grid (width, height).
         cmap : str
             Matplotlib colormap.
+        normalize : float
+            Factor to scale and normalize data to ensure consistent images
         """
         # Get the fields data from the NEON fields
         assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
@@ -639,6 +643,11 @@ class MultiresIO(object):
             field_name = list(fields_data.keys())[component]
             cell_data = fields_data[field_name]
 
+        if normalize != 1.0:  
+            cell_data = np.clip((cell_data / normalize),0,1)
+        else:   
+            cell_data = cell_data      
+
         # Plot each field in the dictionary
         self._to_slice_image_single_field(
             f"{output_filename}_{field_name}",
@@ -651,6 +660,7 @@ class MultiresIO(object):
             cmap=cmap,
             show_axes=show_axes,
             show_colorbar=show_colorbar,
+            normalize=normalize,
             **kwargs,
         )
         print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
@@ -667,6 +677,7 @@ class MultiresIO(object):
         cmap,
         show_axes,
         show_colorbar,
+        normalize,
         **kwargs,
     ):
         """
@@ -773,7 +784,10 @@ class MultiresIO(object):
             plt.savefig(output_filename + ".png", dpi=dpi, bbox_inches="tight", pad_inches=0)
             plt.close()
         else:
-            plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
+            if normalize != 1.0:
+                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower", vmin=0, vmax=1)
+            else:
+                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
 
     def to_line(
         self,
