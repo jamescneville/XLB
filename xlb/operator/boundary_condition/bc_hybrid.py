@@ -270,13 +270,65 @@ class HybridBC(BoundaryCondition):
                 u_wall,
                 wp.static(self.needs_moving_wall_treatment),
                 wp.static(self.needs_mesh_distance),
+                
             )
-
             # Compute density, velocity using all f_post-streaming values
             rho, u = self.macroscopic.warp_functional(f_post)
 
             # Compute Grad's approximation using full equation as in Eq (10) of Dorschner et al.
-            f_post = self.bc_helper.grads_approximate_fpop(_missing_mask, rho, u, f_post)
+            f_post = self.bc_helper.grads_approximate_fpop(
+                _missing_mask,                                
+                rho,
+                u,
+                f_post,
+                
+                )
+            return f_post
+        
+        @wp.func
+        def hybrid_bounceback_full_grads(
+            index: Any,
+            timestep: Any,
+            _missing_mask: Any,
+            f_0: Any,
+            f_1: Any,
+            f_pre: Any,
+            f_post: Any,
+        ):
+            # Using Grad's approximation [1] to represent fpop using macroscopic values derived from interpolated bounceback scheme of [2].
+            # missing data in lattice Boltzmann.
+            # [1] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
+            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
+            # [2] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
+            #     in: 41st aerospace sciences meeting and exhibit, p. 953.
+
+            # Apply interpolated bounceback first to find missing populations at the boundary
+            u_wall = self.profile_functional(f_1, index, timestep)
+            f_post = self.bc_helper.interpolated_bounceback(
+                index,
+                _missing_mask,
+                f_0,
+                f_1,
+                f_pre,
+                f_post,
+                u_wall,
+                wp.static(self.needs_moving_wall_treatment),
+                wp.static(self.needs_mesh_distance),
+                
+            )
+            # Compute density, velocity using all f_post-streaming values
+            rho, u = self.macroscopic.warp_functional(f_post)
+
+            # Compute Grad's approximation using full equation as in Eq (10) of Dorschner et al.
+            f_post = self.bc_helper.grads_full_fpop(
+                _missing_mask,                
+                f_post, 
+                rho,
+                u,
+                f_1,
+                index,
+                wp.static(self.needs_mesh_distance),
+                )
             return f_post
 
         @wp.func
@@ -322,6 +374,8 @@ class HybridBC(BoundaryCondition):
             functional = hybrid_bounceback_regularized
         elif self.bc_method == "bounceback_grads":
             functional = hybrid_bounceback_grads
+        elif self.bc_method == "bounceback_full_grads":
+            functional = hybrid_bounceback_full_grads
         elif self.bc_method == "nonequilibrium_regularized":
             functional = hybrid_nonequilibrium_regularized
 

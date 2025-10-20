@@ -34,11 +34,14 @@ class HelperFunctionsBC(object):
         _opp_indices = self.velocity_set.opp_indices
         _w = self.velocity_set.w
         _c = self.velocity_set.c
+        _cs2 = compute_dtype(self.velocity_set.cs2)
         _c_float = self.velocity_set.c_float
         _qi = self.velocity_set.qi
         _u_vec = wp.vec(_d, dtype=compute_dtype)
         _f_vec = wp.vec(_q, dtype=compute_dtype)
         _missing_mask_vec = wp.vec(_q, dtype=wp.uint8)  # TODO fix vec bool
+        _nt = _d * (_d + 1) // 2
+        _pi_vec = wp.vec(_nt, dtype=compute_dtype)
 
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
@@ -191,12 +194,11 @@ class HelperFunctionsBC(object):
             scale = one - (missing_count / compute_dtype(_q)) 
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            nt = _d * (_d + 1) // 2
             for l in range(_q):
                 if _missing_mask[l] == wp.uint8(1):
                     # compute dot product of qi and Pi
                     QiPi = zero
-                    for t in range(nt):
+                    for t in range(_nt):
                         if t == 0 or t == 3 or t == 5:
                             QiPi += _qi[l, t] * (Pi[t] - rho / three)
                         else:
@@ -216,6 +218,92 @@ class HelperFunctionsBC(object):
                     f_post[l] = wp.max(epsilon, f_post[l])
 
             return f_post
+
+        @wp.func
+        def grads_full_fpop(
+            _missing_mask: Any,
+            f_post: Any,
+            rho: Any,
+            u: Any,
+            f_1: Any,  # For q if needs_mesh_distance
+            index: Any,
+            needs_mesh_distance: bool,
+        ):
+            epsilon = compute_dtype(1e-7)
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
+            three = compute_dtype(3.0)
+            four_pt_five = compute_dtype(4.5)
+            one_pt_five = compute_dtype(1.5)   
+            
+            # Compute Pi
+            Pi = _pi_vec()
+            for l in range(_q):              
+                    Pi[0] += f_post[l] * _c_float[0,l] * _c_float[0,l]  # xx
+                    Pi[1] += f_post[l] * _c_float[0,l] * _c_float[1,l]  # xy
+                    if _d==3:
+                        Pi[2] += f_post[l] * _c_float[0,l] * _c_float[2,l]  # xz
+                        Pi[3] += f_post[l] * _c_float[1,l] * _c_float[1,l]  # yy
+                        Pi[4] += f_post[l] * _c_float[1,l] * _c_float[2,l]  # yz
+                        Pi[5] += f_post[l] * _c_float[2,l] * _c_float[2,l]  # zz
+                    else:
+                        Pi[2] += f_post[l] * _c_float[1,l] * _c_float[1,l]  # yy
+            
+      
+            
+            # Compute Pi_eq with rho and u
+            Pi_eq = _pi_vec()
+            Pi_eq[0] = rho * (u[0] * u[0] + _cs2)
+            Pi_eq[1] = rho * u[0] * u[1]
+            if _d==3:
+                Pi_eq[2] = rho * u[0] * u[2]
+                Pi_eq[3] = rho * (u[1] * u[1] + _cs2)
+                Pi_eq[4] = rho * u[1] * u[2]
+                Pi_eq[5] = rho * (u[2] * u[2] + _cs2)
+            else:
+                Pi_eq[2] = rho * (u[1] * u[1] + _cs2)
+            
+            # Pi_neq =  Pi - Pi_eq
+            Pi_neq = _pi_vec()
+            for t in range(_nt):
+                Pi_neq[t] = (Pi[t] - Pi_eq[t]) 
+            
+            # u_eff_sqr
+            u_eff_sqr = zero
+            for d in range(_d):
+                u_eff_sqr += u[d] * u[d]
+            
+            # Reconstruct missings with per-direction q adjustment (flipped q for stronger neq near wall)
+         
+            
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):                   
+                    # Fetch per-direction q_l if needed
+                    if needs_mesh_distance:
+                        q_l = compute_dtype(self.distance_decoder_function(f_1, index, l))  # 0<q_l<1
+                        neq_scale = one - q_l  # Flipped: stronger neq near wall (q_l large?), adjust based on q definition
+                    
+                    cu = zero
+                    for d in range(_d):
+                        cu += _c_float[d, l] * u[d]
+                    cu_sq = cu * cu
+                    QiPi_neq = zero
+                    for t in range(_nt):
+                        QiPi_neq += _qi[l, t] * Pi_neq[t]
+                    QiPi_neq *= neq_scale  # Apply q-adjusted scale
+
+                    f_post[l] = _w[l] * rho * (
+                        one 
+                        + three * cu 
+                        + four_pt_five * cu_sq 
+                        - one_pt_five * u_eff_sqr
+                        ) 
+                    + _w[l] * four_pt_five * QiPi_neq
+
+                    f_post[l] = wp.max(epsilon, f_post[l])
+             
+            return f_post
+                    
 
         @wp.func
         def moving_wall_fpop_correction(
@@ -351,6 +439,7 @@ class HelperFunctionsBC(object):
         self.bounceback_nonequilibrium = bounceback_nonequilibrium
         self.regularize_fpop = regularize_fpop
         self.grads_approximate_fpop = grads_approximate_fpop
+        self.grads_full_fpop = grads_full_fpop
         self.moving_wall_fpop_correction = moving_wall_fpop_correction
         self.interpolated_bounceback = interpolated_bounceback
         self.interpolated_nonequilibrium_bounceback = interpolated_nonequilibrium_bounceback
