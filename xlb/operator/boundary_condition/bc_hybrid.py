@@ -45,8 +45,9 @@ class HybridBC(BoundaryCondition):
         assert bc_method in [
             "bounceback_regularized",
             "bounceback_grads",
+            "bounceback_full_grads",
             "nonequilibrium_regularized",
-        ], f"type = {bc_method} not supported! Use 'bounceback_regularized', 'bounceback_grads' or 'nonequilibrium_regularized'."
+        ], f"type = {bc_method} not supported! Use 'bounceback_regularized', 'bounceback_grads', 'bounceback_full_grads' or 'nonequilibrium_regularized'."
         self.bc_method = bc_method
 
         # Call the parent constructor
