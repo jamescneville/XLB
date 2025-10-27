@@ -48,8 +48,7 @@ class HybridBC(BoundaryCondition):
             "bounceback_full_grads",
             "nonequilibrium_regularized",
         ], f"type = {bc_method} not supported! Use 'bounceback_regularized', 'bounceback_grads', 'bounceback_full_grads' or 'nonequilibrium_regularized'."
-        self.bc_method = bc_method
-
+        self.bc_method = bc_method       
         # Call the parent constructor
         super().__init__(
             ImplementationStep.STREAMING,
@@ -318,17 +317,14 @@ class HybridBC(BoundaryCondition):
                 
             )
             # Compute density, velocity using all f_post-streaming values
-            rho, u = self.macroscopic.warp_functional(f_post)
+            rho, u = self.macroscopic.warp_functional(f_post)            
 
             # Compute Grad's approximation using full equation as in Eq (10) of Dorschner et al.
             f_post = self.bc_helper.grads_full_fpop(
-                _missing_mask,                
-                f_post, 
+                _missing_mask,
                 rho,
                 u,
-                f_1,
-                index,
-                wp.static(self.needs_mesh_distance),
+                f_post,
                 )
             return f_post
 

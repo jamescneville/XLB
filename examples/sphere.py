@@ -35,24 +35,22 @@ wp.config.quiet = True
 # User Configuration
 # =================
 # Physical and simulation parameters
-voxel_size = 0.15/100.0 #0.0046875  # Finest voxel size in meters
-ulb = 0.05         # Lattice velocity
-flow_passes = 2    # Domain flow passes
+voxel_size = 0.15/50.0 #0.0046875  # Finest voxel size in meters
+ulb = 0.08         # Lattice velocity
+flow_passes = 5    # Domain flow passes
 kinematic_viscosity = 1.508e-5  # Kinematic viscosity of air in m^2/s
 
 # STL filename
 stl_filename = "examples/stl/sphere.stl"
-base_script_name = "Sphere 100D_NonEQ_Nodist"
+base_script_name = "Sphere 50D approx"
 
 # List of Reynolds numbers to simulate
-#reynolds_numbers = [30, 50, 100, 300, 500, 1000, 3000, 10000, 30000, 100000, 200000, 500000, 1000000]
 
-reynolds_numbers = [ 1000000]
-
+reynolds_numbers = [ 1000]
 
 # I/O settings
 print_interval_percentage = 1   # Print every 1% of iterations
-file_output_crossover_percentage = 80  # Crossover at 50% of iterations
+file_output_crossover_percentage = 90  # Crossover at 50% of iterations
 num_file_outputs_pre_crossover = 1    # Outputs before crossover
 num_file_outputs_post_crossover = 1   # Outputs after crossover
 
@@ -83,14 +81,16 @@ def generate_makemesh_mesh(stl_filename, voxel_size, ground_refinement_level=-1,
         "z": 5,
     }
 
-    padding_values = [
+    padding_values = [        
         [20, 20, 20, 20, 20, 20],
-        [20, 50, 20, 20, 20, 20],
-        [20, 50, 20, 20, 20, 20],
-        [20, 50, 20, 20, 20, 20],
-        [20, 50, 20, 20, 20, 20],
-        [20, 50, 20, 20, 20, 20],
-        ]
+		[20, 80, 20, 20, 20, 20],
+		[15, 30, 15, 15, 15, 15],
+		[10, 20, 15, 15, 15, 15],
+        [15, 15, 15, 15, 15, 15],
+		[20, 20, 20, 20, 20, 20],
+		[20, 30, 20, 20, 20, 20],
+		[20, 20, 20, 20, 20, 20]
+		]
 
     # Load the mesh
     mesh = trimesh.load_mesh(stl_filename, process=False)
@@ -240,35 +240,6 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
             [list(coords) for coords in zip(*filtered_bottom_set)] if filtered_bottom_set else []
         )
 
-    # Turbulent Flow Profile
-    def bc_profile(taper_fraction=0.05):
-        assert compute_backend == ComputeBackend.NEON
-        _, ny, nz = grid_shape_zip
-        dtype = precision_policy.compute_precision.wp_dtype
-        H_y = dtype(ny // 2 ** (num_levels - 1) - 1)
-        H_z = dtype(nz // 2 ** (num_levels - 1) - 1)
-        two = dtype(2.0)
-        ulb_wp = dtype(ulb)
-        taper_frac = dtype(taper_fraction)
-        core_frac = dtype(1.0 - 2.0 * taper_fraction)
-
-        @wp.func
-        def bc_profile_warp(index: wp.vec3i):
-            y = dtype(index[1])
-            z = dtype(index[2])
-            y_center = wp.abs(y - (H_y / two))
-            z_center = wp.abs(z - (H_z / two))
-            y_norm = two * y_center / H_y
-            z_norm = two * z_center / H_z
-            max_norm = wp.max(y_norm, z_norm)
-            velocity = ulb_wp
-            if max_norm > core_frac:
-                velocity = ulb_wp * (dtype(1.0) - (max_norm - core_frac) / taper_frac)
-            velocity = wp.max(dtype(0.0), velocity)
-            return wp.vec(velocity, length=1)
-
-        return bc_profile_warp
-
     bc_inlet = RegularizedBC(
         "velocity",
         #profile=bc_profile_taper(),
@@ -278,21 +249,16 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
 
     bc_outlet = DoNothingBC(indices=right_indices)
 
-    #bc_top = FullwayBounceBackBC(indices=top_indices)
-    bc_top = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=top_indices)
-    
-    bc_bottom = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=bottom_indices)
-    #bc_bottom = FullwayBounceBackBC(indices=bottom_indices)
-    #bc_front = FullwayBounceBackBC(indices=filtered_front_indices)
+    bc_top = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=top_indices)   
+    bc_bottom = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=bottom_indices) 
     bc_front = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=filtered_front_indices)
-    #bc_back = FullwayBounceBackBC(indices=filtered_back_indices)
     bc_back = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=filtered_back_indices)
 
     bc_body = HybridBC(
-        bc_method="nonequilibrium_regularized",
+        bc_method="bounceback_grads",
         mesh_vertices=body_vertices,
         voxelization_method=MeshVoxelizationMethod("AABB_CLOSE", close_voxels=1),
-        use_mesh_distance=False,
+        use_mesh_distance=True,
     )
 
     return [bc_top, bc_bottom, bc_front, bc_back, bc_inlet, bc_outlet, bc_body] # Body must be last. Outlet must be second to last
@@ -329,7 +295,7 @@ def print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_siz
     if np.isnan(cd) or np.isnan(cl):
         raise ValueError(f"NaN detected in coefficients at step {step}: Cd={cd}, Cl={cl}")
     drag_values.append([cd, cl])
-    print(f"CD={cd:.3f}, CL={cl:.3f}, Drag Force (lattice units)={drag:.6f}")
+    print(f"\nCD={cd:.3f}, CL={cl:.3f}, Drag Force (lattice units)={drag:.6f}")
 
 def plot_drag_lift(drag_values, output_dir, print_interval, script_name, percentile_range=(15, 85), use_log_scale=False):
     """
@@ -578,6 +544,11 @@ for Re in reynolds_numbers:
     print(f"Reynolds number: {Re:,.2f}")
     # print(f"Lattice viscosity: {nu_lattice:.5f}")
     print(f"Relaxation parameter (omega): {omega:.5f}")
+    time_remaining =(total_lattice_updates_per_step * num_steps) / (100 * 1e6)
+    hours, rem = divmod(time_remaining, 3600)
+    minutes, seconds = divmod(rem, 60)
+    time_remaining_str = f"{int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s"
+    print(f"Approx Runtime (assuming 100mlups): {time_remaining_str} \n")
     print("\n" + "=" * 50 + "\n")
 
     # -------------------------- Simulation Loop --------------------------
@@ -595,21 +566,21 @@ for Re in reynolds_numbers:
         steps_since_last_print += 1
         if step % print_interval == 0 or step == num_steps - 1:
             sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-            wp.synchronize()
-            print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
+            wp.synchronize()            
             filename = os.path.join(output_dir, f"{script_name}_{step:04d}")
-            h5exporter.to_slice_image(
-                filename,
-                {"velocity": sim.u},
-                plane_point=(1, 0, 0),
-                plane_normal=(0, 1, 0),
-                grid_res=1500,
-                bounds=(0, 1, 0, 1),
-                show_axes=False,
-                show_colorbar=False,
-                slice_thickness=delta_x_coarse, #needed when using model units
-                normalize = u_physical*1.75, #eventually we could have the 1.5 read from json as we did before
-            )
+            # h5exporter.to_slice_image(
+            #     filename,
+            #     {"velocity": sim.u},
+            #     plane_point=(1, 0, 0),
+            #     plane_normal=(0, 1, 0),
+            #     grid_res=1500,
+            #     bounds=(0, 1, 0, 1),
+            #     show_axes=False,
+            #     show_colorbar=False,
+            #     slice_thickness=delta_x_coarse, #needed when using model units
+            #     normalize = u_physical*1.75, 
+            # )
+            print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
             end_time = time.time()
             elapsed = end_time - start_time
             total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
@@ -653,12 +624,12 @@ for Re in reynolds_numbers:
     # Calculate and print average Cd and Cl for the last 50%
     drag_values_array = np.array(drag_values)
     if len(drag_values) > 0:
-        start_index = len(drag_values) // 2
+        start_index = int(len(drag_values) * (file_output_crossover_percentage / 100.0))
         last_half = drag_values_array[start_index:, :]
         avg_cd = np.mean(last_half[:, 0])
         avg_cl = np.mean(last_half[:, 1])
-        print(f"Average Drag Coefficient (Cd) for last 50%: {avg_cd:.6f}")
-        print(f"Average Lift Coefficient (Cl) for last 50%: {avg_cl:.6f}")
+        print(f"\nAverage Drag Coefficient (Cd) for last {100-file_output_crossover_percentage}: {avg_cd:.6f}")
+        print(f"Average Lift Coefficient (Cl) for last {100-file_output_crossover_percentage}%: {avg_cl:.6f}\n")
         # Store the average Cd for this Re
         simulated_cds[Re] = avg_cd
     else:
@@ -678,4 +649,4 @@ for Re in reynolds_numbers:
     comparison_plot_path = os.path.join(current_dir, f"{base_script_name.replace(' ', '_')}_comparison_plot.png")
     plt.savefig(comparison_plot_path)
     plt.close()
-    print(f"Updated comparison plot saved to {comparison_plot_path}")
+    print(f"Updated comparison plot saved to {comparison_plot_path}\n\n")

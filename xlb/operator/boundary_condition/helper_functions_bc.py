@@ -218,38 +218,190 @@ class HelperFunctionsBC(object):
                     f_post[l] = wp.max(epsilon, f_post[l])
 
             return f_post
+   
+        @wp.func
+        def grads_full_fpop2(
+            _missing_mask: Any,
+            rho: Any,
+            u: Any,
+            f_post: Any,
+        ):
+            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
+            # Dirichlet BCs [2]
+            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
+            #   simulations", Europhys. Lett. 74, 215 (2006).
+            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
+            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
+            
+            # Note: See also self.regularize_fpop function which is somewhat similar.
+
+            # Compute pressure tensor Pi using all f_post-streaming values
+            Pi = momentum_flux.warp_functional(f_post)
+            epsilon = compute_dtype(1e-8)            
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)            
+            one_pt_five = compute_dtype(1.5) 
+            three = compute_dtype(3.0)
+            four_pt_five = compute_dtype(4.5)
+            feq = _f_vec()
+            grad_correction = _f_vec()
+            s_limit = one   
+          
+            # Remove convective portion of Pi
+            Pi[0] -= rho * u[0] * u[0]
+            Pi[1] -= rho * u[0] * u[1]
+            Pi[2] -= rho * u[0] * u[2]
+            Pi[3] -= rho * u[1] * u[1]
+            Pi[4] -= rho * u[1] * u[2]
+            Pi[5] -= rho * u[2] * u[2]
+            
+
+            u_sqr = zero
+            for d in range(_d):
+                u_sqr += u[d] * u[d]
+            
+            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    QiPi = zero
+                    for t in range(_nt):                        
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi += _qi[l, t] * (Pi[t] - rho / three)
+                        else:
+                            QiPi += _qi[l, t] * Pi[t]
+                    
+                    grad_correction[l] = _w[l] * four_pt_five * QiPi                     
+
+
+                    # Compute c.u
+                    cu = zero
+                    for d in range(_d):
+                        cu += _c_float[d, l] * u[d]
+                    
+                    cu_sq = cu * cu
+
+                    # Compute Feq using Grad's approximation with full quadratic                    
+                    feq[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) 
+
+                    # Stability check
+                    if grad_correction[l] < zero:
+                        if feq[l] + grad_correction[l] < epsilon:                           
+                            s_candidate = (epsilon - feq[l]) / grad_correction[l]
+                            s_limit = wp.min(s_limit, s_candidate)
+            
+            # Ensure s_limit is in [0, 1]
+            s_limit = wp.max(zero, wp.min(one, s_limit))
+            
+            # 2nd pass: apply the limited correction
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    f_post[l] = feq[l] + s_limit * grad_correction[l]
+                else:
+                    # Non-missing directions: keep streamed values but ensure positivity
+                    f_post[l] = wp.max(epsilon, f_post[l])
+            
+            return f_post
 
         @wp.func
         def grads_full_fpop(
             _missing_mask: Any,
+            rho: Any,
+            u: Any,
+            f_post: Any,
+        ):
+            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
+            # Dirichlet BCs [2]
+            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
+            #   simulations", Europhys. Lett. 74, 215 (2006).
+            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
+            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
+            
+            # Note: See also self.regularize_fpop function which is somewhat similar.
+
+            # Compute pressure tensor Pi using all f_post-streaming values
+            Pi = momentum_flux.warp_functional(f_post)
+            epsilon = compute_dtype(1e-8)            
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)            
+            one_pt_five = compute_dtype(1.5) 
+            three = compute_dtype(3.0)
+            four_pt_five = compute_dtype(4.5)
+
+            missing_count = zero
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    missing_count += one
+            scale = one - (missing_count / compute_dtype(_q))             
+            
+          
+            # # Remove convective portion of Pi
+            # Pi[0] -= rho * u[0] * u[0]
+            # Pi[1] -= rho * u[0] * u[1]
+            # Pi[2] -= rho * u[0] * u[2]
+            # Pi[3] -= rho * u[1] * u[1]
+            # Pi[4] -= rho * u[1] * u[2]
+            # Pi[5] -= rho * u[2] * u[2]
+            
+
+            u_sqr = zero
+            for d in range(_d):
+                u_sqr += u[d] * u[d]
+
+            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    QiPi = zero
+                    for t in range(_nt):                        
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi += _qi[l, t] * (Pi[t] - rho / three)
+                        else:
+                            QiPi += _qi[l, t] * Pi[t]
+                    
+                    # Compute c.u
+                    cu = zero
+                    for d in range(_d):
+                        cu += _c_float[d, l] * u[d]
+                    
+                    cu_sq = cu * cu
+
+                    # change f_post using the Grad's approximation with full quadratic                    
+                    f_post[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) + _w[l] * four_pt_five * QiPi * scale
+                    
+                    f_post[l] = wp.max(epsilon, f_post[l])
+                else:
+                    f_post[l] = wp.max(epsilon, f_post[l])
+
+            return f_post
+        
+        @wp.func
+        def grads_full_fpop3(
+            _missing_mask: Any,
+            f_pre: Any,
             f_post: Any,
             rho: Any,
             u: Any,
-            f_1: Any,  # For q if needs_mesh_distance
+            u_wall: Any,
+            f_1: Any,  
             index: Any,
             needs_mesh_distance: bool,
         ):
+            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
+            # Dirichlet BCs [2]
+            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
+            #   simulations", Europhys. Lett. 74, 215 (2006).
+            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
+            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
+
             epsilon = compute_dtype(1e-7)
             zero = compute_dtype(0.0)
             one = compute_dtype(1.0)
+            two = compute_dtype(2.0)
             three = compute_dtype(3.0)
             four_pt_five = compute_dtype(4.5)
             one_pt_five = compute_dtype(1.5)   
-            
-            # Compute Pi
-            Pi = _pi_vec()
-            for l in range(_q):              
-                    Pi[0] += f_post[l] * _c_float[0,l] * _c_float[0,l]  # xx
-                    Pi[1] += f_post[l] * _c_float[0,l] * _c_float[1,l]  # xy
-                    if _d==3:
-                        Pi[2] += f_post[l] * _c_float[0,l] * _c_float[2,l]  # xz
-                        Pi[3] += f_post[l] * _c_float[1,l] * _c_float[1,l]  # yy
-                        Pi[4] += f_post[l] * _c_float[1,l] * _c_float[2,l]  # yz
-                        Pi[5] += f_post[l] * _c_float[2,l] * _c_float[2,l]  # zz
-                    else:
-                        Pi[2] += f_post[l] * _c_float[1,l] * _c_float[1,l]  # yy
-            
       
+            # Compute Pi
+            Pi = momentum_flux.warp_functional(f_post)
             
             # Compute Pi_eq with rho and u
             Pi_eq = _pi_vec()
@@ -266,40 +418,55 @@ class HelperFunctionsBC(object):
             # Pi_neq =  Pi - Pi_eq
             Pi_neq = _pi_vec()
             for t in range(_nt):
-                Pi_neq[t] = (Pi[t] - Pi_eq[t]) 
-            
-            # u_eff_sqr
-            u_eff_sqr = zero
-            for d in range(_d):
-                u_eff_sqr += u[d] * u[d]
-            
-            # Reconstruct missings with per-direction q adjustment (flipped q for stronger neq near wall)
+                Pi_neq[t] = (Pi[t] - Pi_eq[t])             
          
             
+            
+            # Compute double dot product Qi:Pi1            
             for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):                   
-                    # Fetch per-direction q_l if needed
+                if _missing_mask[l] == wp.uint8(1):      
+                    u_eff = _u_vec()
                     if needs_mesh_distance:
-                        q_l = compute_dtype(self.distance_decoder_function(f_1, index, l))  # 0<q_l<1
-                        neq_scale = one - q_l  # Flipped: stronger neq near wall (q_l large?), adjust based on q definition
-                    
+                        q_l = compute_dtype(self.distance_decoder_function(f_1, index, l))  
+                        neq_scale = one - q_l  # Flipped: stronger neq near wall
+                        #neq_scale = wp.sqrt(neq_scale)
+                        neq_scale = one                        
+                        for d in range(_d):
+                            u_eff[d] = u_wall[d] * (one - q_l) + u[d] * q_l
+                    else:
+                        neq_scale = one                    
+                        for d in range(_d):
+                            u_eff[d] = (u_wall[d] + u[d]) / two
+
+                    u_sqr = zero
+                    for d in range(_d):
+                        u_sqr += u_eff[d] * u_eff[d]
+
                     cu = zero
                     for d in range(_d):
-                        cu += _c_float[d, l] * u[d]
+                        cu += _c_float[d, l] * u_eff[d]
                     cu_sq = cu * cu
+
                     QiPi_neq = zero
-                    for t in range(_nt):
-                        QiPi_neq += _qi[l, t] * Pi_neq[t]
-                    QiPi_neq *= neq_scale  # Apply q-adjusted scale
+                    trace = (Pi_neq[0] + Pi_neq[3] + Pi_neq[5]) / three
+                    for t in range(_nt): 
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi_neq += _qi[l, t] * (Pi_neq[t] - trace)
+                        else:                            
+                            QiPi_neq += _qi[l, t] * Pi_neq[t]                   
+
+
 
                     f_post[l] = _w[l] * rho * (
                         one 
                         + three * cu 
                         + four_pt_five * cu_sq 
-                        - one_pt_five * u_eff_sqr
+                        - one_pt_five * u_sqr
                         ) 
-                    + _w[l] * four_pt_five * QiPi_neq
+                    + _w[l] * four_pt_five * QiPi_neq * neq_scale
 
+                    f_post[l] = wp.max(epsilon, f_post[l])
+                else:
                     f_post[l] = wp.max(epsilon, f_post[l])
              
             return f_post
