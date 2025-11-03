@@ -150,7 +150,8 @@ class HelperFunctionsBC(object):
             epsilon = compute_dtype(1e-7)
             zero = compute_dtype(0.0)            
             one = compute_dtype(1.0)  
-            three = compute_dtype(5.0)
+            three = compute_dtype(3.0)
+            five = compute_dtype(5.0)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
@@ -165,7 +166,7 @@ class HelperFunctionsBC(object):
                 # assign all populations based on eq 45 of Latt et al (2008)
                 # fneq ~ f^1
                 fpop1 = compute_dtype(4.5) * _w[l] * QiPi
-                fpop1 = wp.clamp(fpop1, (epsilon-one)*feq[l], three*feq[l])
+                fpop1 = wp.clamp(fpop1, (epsilon-one)*feq[l], five*feq[l])
                 fpop[l] = feq[l] + fpop1
                 #fpop[l] = wp.max(epsilon, fpop[l])
             return fpop
