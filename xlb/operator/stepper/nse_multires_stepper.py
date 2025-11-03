@@ -511,7 +511,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                         has_ngh_at_same_level = wp.bool(False)
                         accumulated = wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.compute_dtype(0), has_ngh_at_same_level)
-
+                        accumulated = wp.max(self.compute_dtype(0), accumulated)
                         # if (!pin.hasChildren(cell, dir)) {
                         if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
                             # NO finer ngh. in the pull direction (opposite of l)
@@ -780,7 +780,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                         has_ngh_at_same_level = wp.bool(False)
                         accumulated = wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.compute_dtype(0), has_ngh_at_same_level)
-
+                        accumulated = wp.max(self.compute_dtype(0), accumulated)
                         # NO finer ngh. in the pull direction (opposite of l)
                         if not has_ngh_at_same_level:
                             # NO ngh. at the same level

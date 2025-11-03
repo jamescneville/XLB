@@ -148,6 +148,40 @@ class HelperFunctionsBC(object):
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
             epsilon = compute_dtype(1e-7)
+            zero = compute_dtype(0.0)            
+            one = compute_dtype(1.0)  
+            three = compute_dtype(5.0)
+
+            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
+            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+            for l in range(_q):
+                QiPi = zero
+                for t in range(_nt):
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi += _qi[l, t] * (PiNeq[t] - trace)
+                        else:
+                            QiPi += _qi[l, t] * PiNeq[t]
+
+                # assign all populations based on eq 45 of Latt et al (2008)
+                # fneq ~ f^1
+                fpop1 = compute_dtype(4.5) * _w[l] * QiPi
+                fpop1 = wp.clamp(fpop1, (epsilon-one)*feq[l], three*feq[l])
+                fpop[l] = feq[l] + fpop1
+                #fpop[l] = wp.max(epsilon, fpop[l])
+            return fpop
+        
+        @wp.func
+        def regularize_fpop0(
+            fpop: Any,
+            feq: Any,
+        ):
+            """
+            Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
+            """
+            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
+            f_neq = fpop - feq
+            PiNeq = momentum_flux.warp_functional(f_neq)
+            epsilon = compute_dtype(1e-7)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             nt = _d * (_d + 1) // 2
@@ -334,13 +368,13 @@ class HelperFunctionsBC(object):
             scale = one - (missing_count / compute_dtype(_q))             
             
           
-            # # Remove convective portion of Pi
-            # Pi[0] -= rho * u[0] * u[0]
-            # Pi[1] -= rho * u[0] * u[1]
-            # Pi[2] -= rho * u[0] * u[2]
-            # Pi[3] -= rho * u[1] * u[1]
-            # Pi[4] -= rho * u[1] * u[2]
-            # Pi[5] -= rho * u[2] * u[2]
+            # Remove convective portion of Pi
+            Pi[0] -= rho * u[0] * u[0]
+            Pi[1] -= rho * u[0] * u[1]
+            Pi[2] -= rho * u[0] * u[2]
+            Pi[3] -= rho * u[1] * u[1]
+            Pi[4] -= rho * u[1] * u[2]
+            Pi[5] -= rho * u[2] * u[2]
             
 
             u_sqr = zero
@@ -519,7 +553,7 @@ class HelperFunctionsBC(object):
                     # The normalized distance to the mesh or "weights" have been stored in known directions of f_1
                     if needs_mesh_distance:
                         # use weights associated with curved boundaries that are properly stored in f_1.
-                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))
+                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))                    
 
                         # Use differentiable interpolated BB to find f_missing:
                         f_post[l] = ((one - weight) * f_post[_opp_indices[l]] + weight * (f_pre[l] + f_pre[_opp_indices[l]])) / (one + weight)

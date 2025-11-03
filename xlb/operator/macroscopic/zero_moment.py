@@ -23,6 +23,7 @@ class ZeroMoment(Operator):
         def neumaier_sum(f: _f_vec):
             total = self.compute_dtype(0.0)
             compensation = self.compute_dtype(0.0)
+            epsilon = self.compute_dtype(1e-8)
             for l in range(self.velocity_set.q):
                 x = f[l]
                 t = total + x
@@ -32,7 +33,8 @@ class ZeroMoment(Operator):
                 else:
                     compensation = compensation + ((x - t) + total)
                 total = t
-            return total + compensation
+            _rho = total + compensation
+            return wp.max(epsilon, _rho)
 
         @wp.func
         def functional(f: _f_vec):

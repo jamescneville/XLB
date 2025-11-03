@@ -33,6 +33,7 @@ class QuadraticEquilibrium(Equilibrium):
     def _construct_warp(self):
         # Set local constants TODO: This is a hack and should be fixed with warp update
         _c = self.velocity_set.c
+        _c_float = self.velocity_set.c_float
         _w = self.velocity_set.w
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
@@ -51,10 +52,8 @@ class QuadraticEquilibrium(Equilibrium):
                 # Compute cu
                 cu = self.compute_dtype(0.0)
                 for d in range(self.velocity_set.d):
-                    if _c[d, l] == 1:
-                        cu += u[d]
-                    elif _c[d, l] == -1:
-                        cu -= u[d]
+                    cu += u[d] * _c_float[d, l]
+                    
                 cu *= self.compute_dtype(3.0)
 
                 # Compute usqr
