@@ -22,8 +22,8 @@ class HelperFunctionsBC(object):
         self.velocity_set = velocity_set or DefaultConfig.velocity_set
         self.precision_policy = precision_policy or DefaultConfig.default_precision_policy
         self.compute_backend = compute_backend or DefaultConfig.default_backend
-        self.distance_decoder_function = distance_decoder_function
-
+        self.distance_decoder_function = distance_decoder_function  
+        
         # Set the compute and Store dtypes
         compute_dtype = self.precision_policy.compute_precision.wp_dtype
         store_dtype = self.precision_policy.store_precision.wp_dtype
@@ -34,14 +34,12 @@ class HelperFunctionsBC(object):
         _opp_indices = self.velocity_set.opp_indices
         _w = self.velocity_set.w
         _c = self.velocity_set.c
-        _cs2 = compute_dtype(self.velocity_set.cs2)
         _c_float = self.velocity_set.c_float
         _qi = self.velocity_set.qi
         _u_vec = wp.vec(_d, dtype=compute_dtype)
         _f_vec = wp.vec(_q, dtype=compute_dtype)
         _missing_mask_vec = wp.vec(_q, dtype=wp.uint8)  # TODO fix vec bool
         _nt = _d * (_d + 1) // 2
-        _pi_vec = wp.vec(_nt, dtype=compute_dtype)
 
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
@@ -51,6 +49,12 @@ class HelperFunctionsBC(object):
 
         # Define the operator needed for computing the momentum flux
         momentum_flux = MomentumFlux(velocity_set, precision_policy, compute_backend)
+
+        # Wall model constants
+        _kappa = compute_dtype(0.41)  # von Karman constant
+        _B = compute_dtype(5.2)       # Log-law constant
+        _A_plus = compute_dtype(26.0)  # van Driest damping constant
+        _cs2 = compute_dtype(self.velocity_set.cs2)
 
         @wp.func
         def get_bc_thread_data(
@@ -113,6 +117,69 @@ class HelperFunctionsBC(object):
             return fsum_known + fsum_middle
 
         @wp.func
+        def get_known_fsum(fpop: Any, _missing_mask: Any):
+            fsum = compute_dtype(0.0)
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(0):
+                    fsum += fpop[l]
+            return fsum
+
+        @wp.func
+        def estimate_from_known(
+            fpop: Any, 
+            _missing_mask: Any,
+            normal: Any,
+        ):
+            zero = compute_dtype(0.0)
+            
+            # Density estimation with direction-weighted mirroring
+            rho_known = zero
+            rho_mirrored = zero
+            
+            # Initialize momentum vector (only from known populations)
+            momentum = _u_vec(zero, zero, zero)
+            
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(0):  # Known
+                    rho_known += fpop[l]
+                    # Add to momentum from known directions only
+                    for d in range(_d):
+                        momentum[d] += _c_float[d, l] * fpop[l]
+                else:  # Missing
+                    opp = _opp_indices[l]
+                    if _missing_mask[opp] == wp.uint8(0):  # Opposite is known
+                        # Weight based on how aligned this direction is with normal
+                        c_dot_n = zero
+                        for d in range(_d):
+                            c_dot_n += _c_float[d, l] * normal[d]
+                        weight = wp.abs(c_dot_n)
+                        
+                        # Mirror for density only
+                        rho_mirrored += weight * fpop[opp]
+                        
+                        # DON'T add momentum from missing directions - this causes mass leakage
+                        # Instead, we could optionally add a reflected momentum contribution
+                        # but for stability, it's better to only use known populations
+            
+            _rho = wp.max(rho_known + rho_mirrored, compute_dtype(1e-6))
+            
+            # Compute u from momentum / rho (only from known directions)
+            _u = _u_vec(zero, zero, zero)
+            if _rho > zero:
+                for d in range(_d):
+                    _u[d] = momentum[d] / _rho
+                    
+                # Optional: Apply normal velocity correction to ensure no penetration
+                # This helps with stability near walls
+                u_dot_n = _u[0]*normal[0] + _u[1]*normal[1] + _u[2]*normal[2]
+                if u_dot_n < zero:  # Flow into wall
+                    # Remove normal component pointing into wall
+                    for d in range(_d):
+                        _u[d] -= u_dot_n * normal[d]
+            
+            return _rho, _u
+        
+        @wp.func
         def get_normal_vectors(
             _missing_mask: Any,
         ):
@@ -124,6 +191,170 @@ class HelperFunctionsBC(object):
                 for l in range(_q):
                     if _missing_mask[l] == wp.uint8(1) and wp.abs(_c[0, l]) + wp.abs(_c[1, l]) == 1:
                         return -_u_vec(_c_float[0, l], _c_float[1, l])
+                    
+        @wp.func
+        def get_avg_normal_vectors(
+            _missing_mask: Any,
+        ):
+            normal = _u_vec(0.0, 0.0, 0.0)
+            weight_sum = compute_dtype(0.0)            
+         
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
+                    c_mag = wp.length(c_l)                    
+               
+                    c_unit = wp.vec3(c_l[0] / c_mag, c_l[1] / c_mag, c_l[2] / c_mag)
+                    
+                
+                    # Weighted by lattice weight (prioritizes orthogonal directions)
+                    weight = _w[l] / c_mag
+                    
+                    normal[0] += c_unit[0] * weight
+                    normal[1] += c_unit[1] * weight
+                    normal[2] += c_unit[2] * weight
+                    weight_sum += weight
+            
+            if weight_sum > compute_dtype(0.0):
+                normal[0] /= weight_sum
+                normal[1] /= weight_sum
+                normal[2] /= weight_sum
+            
+            # Unit normalize
+            mag = wp.sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+            if mag > compute_dtype(0.0):
+                normal[0] /= mag
+                normal[1] /= mag
+                normal[2] /= mag
+            
+            return -normal  # Points into fluid
+
+        @wp.func
+        def get_wall_distance(
+            _missing_mask: Any,
+            f_1: Any,
+            index: Any,
+        ):
+            """
+            Compute wall distance using weighted average of all missing directions.
+            This provides more accurate distance estimation for curved boundaries.
+            """
+            zero = compute_dtype(0.0)
+            y_distance = zero
+            weight_sum = zero            
+            
+            # Set to True for even (equal) weighting; False for distance-based (inverse magnitude)
+            use_even_weighting = wp.static(False)  # Toggle this to test; recompile after change
+            test_dist = compute_dtype(1.0)
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    dist = compute_dtype(self.distance_decoder_function(f_1, index, l))  # q_l (0-1 fraction)
+                    
+                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
+                    c_mag = wp.length(c_l)                    
+                    along_dist = dist * c_mag  # Physical along-link distance
+                    proj = wp.max(zero, wp.dot())
+                   
+                     # Distance-based weighting: Lattice weight / link magnitude
+                    weight = _w[l] / c_mag
+                    
+                    y_distance += along_dist * weight
+                    weight_sum += weight
+                    test_dist = wp.min(along_dist, test_dist)
+            
+            # Normalize by total weight
+            if weight_sum > compute_dtype(0.0):
+                y_distance /= weight_sum
+            
+            return test_dist
+     
+        @wp.func
+        def get_normal_and_distance(
+            _missing_mask: Any,
+            f_1: Any,
+            index: Any,
+        ):
+            """
+            Compute both the surface normal vector and normal distance based on
+            actual distances from voxel center to mesh surface.
+            """
+            normal = _u_vec(0.0, 0.0, 0.0)
+            normal_distance = compute_dtype(0.0)
+            weight_sum = compute_dtype(0.0)
+            
+            # First pass: Compute weighted normal based on actual distances
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    # Get distance fraction (0-1) from distance decoder
+                    dist_fraction = compute_dtype(self.distance_decoder_function(f_1, index, l))
+                    
+                    # Get lattice vector
+                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
+                    c_mag = wp.length(c_l)
+                    
+                    # Actual distance from voxel center to mesh along this direction
+                    actual_distance = dist_fraction * c_mag
+                    
+                    # Unit vector in this direction
+                    c_unit = wp.vec3(c_l[0] / c_mag, c_l[1] / c_mag, c_l[2] / c_mag)
+                    
+                    # Weight by inverse of actual distance (closer surfaces have more influence)
+                    # Add small epsilon to avoid division by zero
+                    epsilon = compute_dtype(1e-10)
+                    weight = compute_dtype(1.0) / (actual_distance + epsilon)
+                    
+                    # Accumulate weighted normal vector
+                    normal[0] += c_unit[0] * weight
+                    normal[1] += c_unit[1] * weight
+                    normal[2] += c_unit[2] * weight
+                    weight_sum += weight
+            
+            # Normalize the weighted normal
+            if weight_sum > compute_dtype(0.0):
+                normal[0] /= weight_sum
+                normal[1] /= weight_sum
+                normal[2] /= weight_sum
+            
+            # Unit normalize the normal vector
+            mag = wp.sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+            if mag > compute_dtype(0.0):
+                normal[0] /= mag
+                normal[1] /= mag
+                normal[2] /= mag
+            
+            # Invert normal to point into fluid
+            normal = -normal
+            
+            # Second pass: Project actual distances onto normal and average
+            distance_weight_sum = compute_dtype(0.0)
+            
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    # Get distance fraction and actual distance again
+                    dist_fraction = compute_dtype(self.distance_decoder_function(f_1, index, l))
+                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
+                    c_mag = wp.length(c_l)
+                    actual_distance = dist_fraction * c_mag
+                    
+                    # Unit vector in this direction
+                    c_unit = wp.vec3(c_l[0] / c_mag, c_l[1] / c_mag, c_l[2] / c_mag)
+                    
+                    # Project this distance vector onto the normal
+                    # (dot product gives projection length, negative because normal points into fluid)
+                    projection = -wp.dot(c_unit, normal) * actual_distance
+                    
+                    # Weight by inverse distance for averaging
+                    epsilon = compute_dtype(1e-10)
+                    weight = compute_dtype(1.0) / (actual_distance + epsilon)
+                    
+                    normal_distance += projection * weight
+                    distance_weight_sum += weight
+            
+            # Normalize the distance
+            if distance_weight_sum > compute_dtype(0.0):
+                normal_distance /= distance_weight_sum
+            
+            return normal, normal_distance
 
         @wp.func
         def bounceback_nonequilibrium(
@@ -149,12 +380,15 @@ class HelperFunctionsBC(object):
             PiNeq = momentum_flux.warp_functional(f_neq)
             epsilon = compute_dtype(1e-7)
             zero = compute_dtype(0.0)            
-            one = compute_dtype(1.0)  
+            one = compute_dtype(1.0) 
             three = compute_dtype(3.0)
             five = compute_dtype(5.0)
+            ten = compute_dtype(10.0)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+            #trace = zero
+
             for l in range(_q):
                 QiPi = zero
                 for t in range(_nt):
@@ -165,38 +399,73 @@ class HelperFunctionsBC(object):
 
                 # assign all populations based on eq 45 of Latt et al (2008)
                 # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi
-                fpop1 = wp.clamp(fpop1, (epsilon-one)*feq[l], five*feq[l])
+                fpop1 = compute_dtype(4.5) * _w[l] * QiPi                
                 fpop[l] = feq[l] + fpop1
-                #fpop[l] = wp.max(epsilon, fpop[l])
+                fpop[l] = wp.max(epsilon, fpop[l])
+
             return fpop
-        
+
         @wp.func
-        def regularize_fpop0(
-            fpop: Any,
-            feq: Any,
+        def regularize_bounceback(
+            _missing_mask: Any,
+            rho: Any,
+            u: Any,
+            f_post: Any,
         ):
             """
             Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
             """
-            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
-            f_neq = fpop - feq
-            PiNeq = momentum_flux.warp_functional(f_neq)
-            epsilon = compute_dtype(1e-7)
+
+            # Compute pressure tensor Pi using all f_post-streaming values
+            Pi = momentum_flux.warp_functional(f_post)
+            epsilon = compute_dtype(1e-7)            
+            zero = compute_dtype(0.0)
+            scale = compute_dtype(1.0)
+            one = compute_dtype(1.0)            
+            one_pt_five = compute_dtype(1.5) 
+            three = compute_dtype(3.0)
+            four_pt_five = compute_dtype(4.5)
+
+            missing_count = zero
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    missing_count += one
+            scale = one - scale * (missing_count / compute_dtype(_q))             
+            
+          
+            # Remove convective portion of Pi
+            Pi[0] -= rho * u[0] * u[0]
+            Pi[1] -= rho * u[0] * u[1]
+            Pi[2] -= rho * u[0] * u[2]
+            Pi[3] -= rho * u[1] * u[1]
+            Pi[4] -= rho * u[1] * u[2]
+            Pi[5] -= rho * u[2] * u[2]
+            
+
+            u_sqr = zero
+            for d in range(_d):
+                u_sqr += u[d] * u[d]
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            nt = _d * (_d + 1) // 2
             for l in range(_q):
-                QiPi1 = compute_dtype(0.0)
-                for t in range(nt):
-                    QiPi1 += _qi[l, t] * PiNeq[t]
+                QiPi = zero
+                for t in range(_nt):                        
+                    if t == 0 or t == 3 or t == 5:
+                        QiPi += _qi[l, t] * (Pi[t] - rho / three)
+                    else:
+                        QiPi += _qi[l, t] * Pi[t]
+                
+                # Compute c.u
+                cu = zero
+                for d in range(_d):
+                    cu += _c_float[d, l] * u[d]
+                
+                cu_sq = cu * cu                               
+                f_post[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) + _w[l] * four_pt_five * QiPi * scale
+                f_post[l] = wp.max(epsilon, f_post[l])
+                
 
-                # assign all populations based on eq 45 of Latt et al (2008)
-                # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi1
-                fpop[l] = feq[l] + fpop1
-                fpop[l] = wp.max(epsilon, fpop[l])
-            return fpop
+            return f_post
 
         @wp.func
         def grads_approximate_fpop(
@@ -222,18 +491,19 @@ class HelperFunctionsBC(object):
             three = compute_dtype(3.0)
             four_pt_five = compute_dtype(4.5)
             missing_count = zero
-
+            # Scale on QiPi helps stability at Re1e6+ not required for Re1e5 and below
             for l in range(_q):
                 if _missing_mask[l] == wp.uint8(1):
                     missing_count += one
-            scale = one - (missing_count / compute_dtype(_q)) 
+            scale = one - ((one + missing_count) / compute_dtype(_q)) 
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
+            nt = _d * (_d + 1) // 2
             for l in range(_q):
                 if _missing_mask[l] == wp.uint8(1):
                     # compute dot product of qi and Pi
                     QiPi = zero
-                    for t in range(_nt):
+                    for t in range(nt):
                         if t == 0 or t == 3 or t == 5:
                             QiPi += _qi[l, t] * (Pi[t] - rho / three)
                         else:
@@ -253,260 +523,7 @@ class HelperFunctionsBC(object):
                     f_post[l] = wp.max(epsilon, f_post[l])
 
             return f_post
-   
-        @wp.func
-        def grads_full_fpop2(
-            _missing_mask: Any,
-            rho: Any,
-            u: Any,
-            f_post: Any,
-        ):
-            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
-            # Dirichlet BCs [2]
-            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
-            #   simulations", Europhys. Lett. 74, 215 (2006).
-            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
-            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
-            
-            # Note: See also self.regularize_fpop function which is somewhat similar.
-
-            # Compute pressure tensor Pi using all f_post-streaming values
-            Pi = momentum_flux.warp_functional(f_post)
-            epsilon = compute_dtype(1e-8)            
-            zero = compute_dtype(0.0)
-            one = compute_dtype(1.0)            
-            one_pt_five = compute_dtype(1.5) 
-            three = compute_dtype(3.0)
-            four_pt_five = compute_dtype(4.5)
-            feq = _f_vec()
-            grad_correction = _f_vec()
-            s_limit = one   
-          
-            # Remove convective portion of Pi
-            Pi[0] -= rho * u[0] * u[0]
-            Pi[1] -= rho * u[0] * u[1]
-            Pi[2] -= rho * u[0] * u[2]
-            Pi[3] -= rho * u[1] * u[1]
-            Pi[4] -= rho * u[1] * u[2]
-            Pi[5] -= rho * u[2] * u[2]
-            
-
-            u_sqr = zero
-            for d in range(_d):
-                u_sqr += u[d] * u[d]
-            
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    QiPi = zero
-                    for t in range(_nt):                        
-                        if t == 0 or t == 3 or t == 5:
-                            QiPi += _qi[l, t] * (Pi[t] - rho / three)
-                        else:
-                            QiPi += _qi[l, t] * Pi[t]
-                    
-                    grad_correction[l] = _w[l] * four_pt_five * QiPi                     
-
-
-                    # Compute c.u
-                    cu = zero
-                    for d in range(_d):
-                        cu += _c_float[d, l] * u[d]
-                    
-                    cu_sq = cu * cu
-
-                    # Compute Feq using Grad's approximation with full quadratic                    
-                    feq[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) 
-
-                    # Stability check
-                    if grad_correction[l] < zero:
-                        if feq[l] + grad_correction[l] < epsilon:                           
-                            s_candidate = (epsilon - feq[l]) / grad_correction[l]
-                            s_limit = wp.min(s_limit, s_candidate)
-            
-            # Ensure s_limit is in [0, 1]
-            s_limit = wp.max(zero, wp.min(one, s_limit))
-            
-            # 2nd pass: apply the limited correction
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    f_post[l] = feq[l] + s_limit * grad_correction[l]
-                else:
-                    # Non-missing directions: keep streamed values but ensure positivity
-                    f_post[l] = wp.max(epsilon, f_post[l])
-            
-            return f_post
-
-        @wp.func
-        def grads_full_fpop(
-            _missing_mask: Any,
-            rho: Any,
-            u: Any,
-            f_post: Any,
-        ):
-            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
-            # Dirichlet BCs [2]
-            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
-            #   simulations", Europhys. Lett. 74, 215 (2006).
-            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
-            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
-            
-            # Note: See also self.regularize_fpop function which is somewhat similar.
-
-            # Compute pressure tensor Pi using all f_post-streaming values
-            Pi = momentum_flux.warp_functional(f_post)
-            epsilon = compute_dtype(1e-8)            
-            zero = compute_dtype(0.0)
-            one = compute_dtype(1.0)            
-            one_pt_five = compute_dtype(1.5) 
-            three = compute_dtype(3.0)
-            four_pt_five = compute_dtype(4.5)
-
-            missing_count = zero
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    missing_count += one
-            scale = one - (missing_count / compute_dtype(_q))             
-            
-          
-            # Remove convective portion of Pi
-            Pi[0] -= rho * u[0] * u[0]
-            Pi[1] -= rho * u[0] * u[1]
-            Pi[2] -= rho * u[0] * u[2]
-            Pi[3] -= rho * u[1] * u[1]
-            Pi[4] -= rho * u[1] * u[2]
-            Pi[5] -= rho * u[2] * u[2]
-            
-
-            u_sqr = zero
-            for d in range(_d):
-                u_sqr += u[d] * u[d]
-
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    QiPi = zero
-                    for t in range(_nt):                        
-                        if t == 0 or t == 3 or t == 5:
-                            QiPi += _qi[l, t] * (Pi[t] - rho / three)
-                        else:
-                            QiPi += _qi[l, t] * Pi[t]
-                    
-                    # Compute c.u
-                    cu = zero
-                    for d in range(_d):
-                        cu += _c_float[d, l] * u[d]
-                    
-                    cu_sq = cu * cu
-
-                    # change f_post using the Grad's approximation with full quadratic                    
-                    f_post[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) + _w[l] * four_pt_five * QiPi * scale
-                    
-                    f_post[l] = wp.max(epsilon, f_post[l])
-                else:
-                    f_post[l] = wp.max(epsilon, f_post[l])
-
-            return f_post
         
-        @wp.func
-        def grads_full_fpop3(
-            _missing_mask: Any,
-            f_pre: Any,
-            f_post: Any,
-            rho: Any,
-            u: Any,
-            u_wall: Any,
-            f_1: Any,  
-            index: Any,
-            needs_mesh_distance: bool,
-        ):
-            # Purpose: Using Grad's approximation to represent fpop based on macroscopic inputs used for outflow [1] and
-            # Dirichlet BCs [2]
-            # [1] S. Chikatax`marla, S. Ansumali, and I. Karlin, "Grad's approximation for missing data in lattice Boltzmann
-            #   simulations", Europhys. Lett. 74, 215 (2006).
-            # [2] Dorschner, B., Chikatamarla, S. S., Bösch, F., & Karlin, I. V. (2015). Grad's approximation for moving and
-            #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
-
-            epsilon = compute_dtype(1e-7)
-            zero = compute_dtype(0.0)
-            one = compute_dtype(1.0)
-            two = compute_dtype(2.0)
-            three = compute_dtype(3.0)
-            four_pt_five = compute_dtype(4.5)
-            one_pt_five = compute_dtype(1.5)   
-      
-            # Compute Pi
-            Pi = momentum_flux.warp_functional(f_post)
-            
-            # Compute Pi_eq with rho and u
-            Pi_eq = _pi_vec()
-            Pi_eq[0] = rho * (u[0] * u[0] + _cs2)
-            Pi_eq[1] = rho * u[0] * u[1]
-            if _d==3:
-                Pi_eq[2] = rho * u[0] * u[2]
-                Pi_eq[3] = rho * (u[1] * u[1] + _cs2)
-                Pi_eq[4] = rho * u[1] * u[2]
-                Pi_eq[5] = rho * (u[2] * u[2] + _cs2)
-            else:
-                Pi_eq[2] = rho * (u[1] * u[1] + _cs2)
-            
-            # Pi_neq =  Pi - Pi_eq
-            Pi_neq = _pi_vec()
-            for t in range(_nt):
-                Pi_neq[t] = (Pi[t] - Pi_eq[t])             
-         
-            
-            
-            # Compute double dot product Qi:Pi1            
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):      
-                    u_eff = _u_vec()
-                    if needs_mesh_distance:
-                        q_l = compute_dtype(self.distance_decoder_function(f_1, index, l))  
-                        neq_scale = one - q_l  # Flipped: stronger neq near wall
-                        #neq_scale = wp.sqrt(neq_scale)
-                        neq_scale = one                        
-                        for d in range(_d):
-                            u_eff[d] = u_wall[d] * (one - q_l) + u[d] * q_l
-                    else:
-                        neq_scale = one                    
-                        for d in range(_d):
-                            u_eff[d] = (u_wall[d] + u[d]) / two
-
-                    u_sqr = zero
-                    for d in range(_d):
-                        u_sqr += u_eff[d] * u_eff[d]
-
-                    cu = zero
-                    for d in range(_d):
-                        cu += _c_float[d, l] * u_eff[d]
-                    cu_sq = cu * cu
-
-                    QiPi_neq = zero
-                    trace = (Pi_neq[0] + Pi_neq[3] + Pi_neq[5]) / three
-                    for t in range(_nt): 
-                        if t == 0 or t == 3 or t == 5:
-                            QiPi_neq += _qi[l, t] * (Pi_neq[t] - trace)
-                        else:                            
-                            QiPi_neq += _qi[l, t] * Pi_neq[t]                   
-
-
-
-                    f_post[l] = _w[l] * rho * (
-                        one 
-                        + three * cu 
-                        + four_pt_five * cu_sq 
-                        - one_pt_five * u_sqr
-                        ) 
-                    + _w[l] * four_pt_five * QiPi_neq * neq_scale
-
-                    f_post[l] = wp.max(epsilon, f_post[l])
-                else:
-                    f_post[l] = wp.max(epsilon, f_post[l])
-             
-            return f_post
-                    
-
         @wp.func
         def moving_wall_fpop_correction(
             u_wall: Any,
@@ -548,16 +565,25 @@ class HelperFunctionsBC(object):
             # in: 41st aerospace sciences meeting and exhibit, p. 953.
 
             one = compute_dtype(1.0)
+            two = compute_dtype(2.0)
+            three = compute_dtype(3.0)
             for l in range(_q):
                 # If the mask is missing then take the opposite index
                 if _missing_mask[l] == wp.uint8(1):
                     # The normalized distance to the mesh or "weights" have been stored in known directions of f_1
                     if needs_mesh_distance:
                         # use weights associated with curved boundaries that are properly stored in f_1.
-                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))                    
+                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))                   
+                        weight = wp.clamp(weight, compute_dtype(0.05), compute_dtype(1.0))
 
                         # Use differentiable interpolated BB to find f_missing:
-                        f_post[l] = ((one - weight) * f_post[_opp_indices[l]] + weight * (f_pre[l] + f_pre[_opp_indices[l]])) / (one + weight)
+                        #f_post[l] = ((one - weight) * f_post[_opp_indices[l]] + weight * (f_pre[l] + f_pre[_opp_indices[l]])) / (one + weight)
+                        f_near = two * weight * f_pre[_opp_indices[l]] + (one - two * weight) * f_post[_opp_indices[l]]
+                        f_far = (one/ (two * weight)) * f_pre[_opp_indices[l]] + ((two * weight - one) / (two * weight)) * f_pre[l]
+                        blend = three * wp.pow(weight, two) - two * wp.pow(weight, three)
+
+                        f_post[l] = (one - blend)*f_near + blend*f_far
+                        
                     else:
                         # Use regular halfway bounceback
                         f_post[l] = f_pre[_opp_indices[l]]
@@ -584,6 +610,7 @@ class HelperFunctionsBC(object):
             needs_mesh_distance: bool,
         ):
             # Compute density, velocity using all f_post-collision values
+            epsilon = compute_dtype(1e-7)
             rho, u = macroscopic.warp_functional(f_pre)
             feq = equilibrium.warp_functional(rho, u)
 
@@ -593,8 +620,10 @@ class HelperFunctionsBC(object):
             else:
                 feq_wall = _f_vec()
 
+            
             # Apply method in Tao et al (2018) [1] to find missing populations at the boundary
             one = compute_dtype(1.0)
+            half = compute_dtype(0.5)
             for l in range(_q):
                 # If the mask is missing then take the opposite index
                 if _missing_mask[l] == wp.uint8(1):
@@ -603,7 +632,7 @@ class HelperFunctionsBC(object):
                         # use weights associated with curved boundaries that are properly stored in f_1.
                         weight = compute_dtype(self.distance_decoder_function(f_1, index, l))
                     else:
-                        weight = compute_dtype(0.5)
+                        weight = half
 
                     # Use non-equilibrium bounceback to find f_missing:
                     fneq = f_pre[_opp_indices[l]] - feq[_opp_indices[l]]
@@ -617,7 +646,195 @@ class HelperFunctionsBC(object):
                     f_wall = feq_wall[l] + fneq
                     f_post[l] = (f_wall + weight * f_pre[l]) / (one + weight)
 
+                    f_post[l] = wp.max(epsilon, f_post[l])
+                else:
+                    f_post[l] = wp.max(epsilon, f_post[l])
+
             return f_post
+
+        # ============================================================================
+        # Wall Model Functions (Spalding's Law)
+        # ============================================================================
+        
+        @wp.func
+        def spalding_law(u_plus: Any) -> Any:
+            """
+            Spalding's law: y+ = u+ + e^(-κB) * [e^(κu+) - 1 - κu+ - (κu+)^2/2 - (κu+)^3/6]
+            
+            This provides a continuous formulation valid across viscous sublayer, buffer layer, and log layer.
+            
+            References:
+            [1] Spalding, D. B. (1961). A single formula for the law of the wall. 
+                Journal of Applied Mechanics, 28(3), 455-458.
+            """
+            exp_kB = wp.exp(-_kappa * _B)
+            ku = _kappa * u_plus
+            exp_ku = wp.exp(ku)
+            
+            y_plus = u_plus + exp_kB * (exp_ku - compute_dtype(1.0) - ku - 
+                                        ku * ku / compute_dtype(2.0) - 
+                                        ku * ku * ku / compute_dtype(6.0))
+            return y_plus
+        
+        @wp.func
+        def spalding_derivative(u_plus: Any) -> Any:
+            """
+            Derivative of Spalding's law with respect to u+: dy+/du+
+            
+            Used in Newton-Raphson iteration for solving u+ given y+.
+            """
+            exp_kB = wp.exp(-_kappa * _B)
+            ku = _kappa * u_plus
+            exp_ku = wp.exp(ku)
+            
+            dy_du = compute_dtype(1.0) + exp_kB * _kappa * (exp_ku - compute_dtype(1.0) - 
+                                                            ku - ku * ku / compute_dtype(2.0))
+            return dy_du
+        
+        @wp.func
+        def solve_spalding(K: Any) -> Any:  
+            """
+            Solve for u+ given K = u_parallel * y / nu using Newton-Raphson on spalding(u+) - K / u+ = 0.
+            """
+            # NEW: Better initial guess: Use log-law for K >= 11*u+ (approx y+>11), viscous otherwise
+            if K < compute_dtype(11.0):
+                u_plus = wp.sqrt(K)  # Viscous: u+ ≈ sqrt(K), since y+ ≈ u+^2 in pure linear (but Spalding blends)
+            else:
+                # Log-law approx: u+ ≈ (1/κ) ln(K / u+) + B, but iterative init: Start with (1/κ) ln(K) + B
+                u_plus = (compute_dtype(1.0) / _kappa) * wp.log(K) + _B
+                # Quick fixed-point refinement for better start (helps convergence at high K)
+                for i in range(15):
+                    u_plus = (compute_dtype(1.0) / _kappa) * wp.log(K / u_plus) + _B
+            
+            # Newton-Raphson iteration
+            max_iter = wp.int32(10)  # Increased for high Re/K
+            tolerance = compute_dtype(1e-6)
+            epsilon = compute_dtype(1e-6)  # For div safety
+            
+            for iter in range(max_iter):
+                # NEW: Correct residual: spalding(u+) - K / u+
+                residual = spalding_law(u_plus) - K / wp.max(u_plus, epsilon)
+                
+                if wp.abs(residual) < tolerance:
+                    break
+                
+                # NEW: Correct derivative: d/du [spalding(u+) - K / u+] = dy_du + K / u+^2
+                dy_du = spalding_derivative(u_plus)
+                df_du = dy_du + K / (u_plus * u_plus)
+                u_plus -= residual / wp.max(df_du, epsilon)  # Avoid div0
+                
+                # Clamp for stability (prevents negatives/overshoot at transients)
+                u_plus = wp.max(compute_dtype(0.001), u_plus)
+            
+            return u_plus
+
+        @wp.func
+        def compute_wall_modeled_velocity(
+            index: Any,
+            _missing_mask: Any,
+            f_0: Any,
+            f_1: Any,
+            f_pre: Any,
+            f_post: Any,
+            u_wall: Any,
+            nu: Any, 
+        ):
+            zero = compute_dtype(0.0)
+            epsilon = compute_dtype(1e-7)
+            scale = compute_dtype(0.01)
+            y_limit = compute_dtype(150.0)
+            u_wall_physical = u_wall
+            # Get wall geometry info               
+            normal, y_distance = get_normal_and_distance(_missing_mask, f_1, index) 
+            
+            # Estimate flow state from known populations          
+            rho, u_est = macroscopic.warp_functional(f_pre)
+                
+            
+            # Decompose estimated velocity into normal and parallel components
+            dot = u_est[0] * normal[0] + u_est[1] * normal[1] + u_est[2] * normal[2]
+            u_normal = _u_vec(
+                normal[0] * dot,
+                normal[1] * dot,
+                normal[2] * dot
+            )
+            u_parallel = _u_vec(
+                u_est[0] - u_normal[0],
+                u_est[1] - u_normal[1],
+                u_est[2] - u_normal[2]
+            )
+            u_parallel_mag = compute_dtype(wp.len(u_parallel))
+            
+            u_wall_effective = u_wall_physical  # Default to physical if no modeling needed
+            
+            
+            # Compute K = u_parallel_mag * y_distance / nu (unchanged)
+            K = u_parallel_mag * y_distance / nu
+            
+            # Clamp K for safety (avoids div0 or exp overflow at transients/low nu)
+            K = wp.max(compute_dtype(0.01), K)
+            
+            # Solve for u+
+            u_plus = solve_spalding(K)                
+            u_tau = u_parallel_mag / wp.max(u_plus, epsilon)
+            
+            # Compute wall shear stress magnitude
+            tau_wall = u_tau * u_tau  # In lattice units (assuming ρ=1)
+            
+            # Nonlinear adjustment: effective viscosity including turbulent part from log-law
+            y_plus = scale * y_distance * u_tau / nu  # Final y+
+            
+            if u_parallel_mag > epsilon and y_plus > epsilon:
+                #wp.print(y_plus)
+                # Compute damping factor
+                vd_damp = compute_dtype(1.0) - wp.exp(-y_plus / _A_plus)
+                nu_t_B = _kappa * u_tau * y_distance * (vd_damp * vd_damp)  # van Driest damping
+                nu_eff = nu + nu_t_B
+                
+                # Effective velocity gradient incorporating nonlinearity
+                velocity_gradient = tau_wall / nu_eff
+                
+                # Slip magnitude: subtract to increase effective shear
+                u_slip_mag = u_parallel_mag - velocity_gradient * y_distance
+                
+                # Clamp for stability: prevent excessively negative
+                u_slip_mag = wp.max(u_slip_mag, -u_parallel_mag * compute_dtype(0.25))
+                
+                # Reconstruct slip velocity vector
+                if u_parallel_mag > epsilon:
+                    u_parallel_unit = _u_vec(
+                        u_parallel[0] / u_parallel_mag,
+                        u_parallel[1] / u_parallel_mag,
+                        u_parallel[2] / u_parallel_mag
+                    )
+                    
+                    u_slip = _u_vec(
+                        u_parallel_unit[0] * u_slip_mag,
+                        u_parallel_unit[1] * u_slip_mag,
+                        u_parallel_unit[2] * u_slip_mag
+                    )
+                else:
+                    u_slip = _u_vec(0.0, 0.0, 0.0)
+                
+                # Effective wall velocity: add slip to physical
+                u_wall_effective = _u_vec(
+                    u_wall_physical[0] + u_slip[0],
+                    u_wall_physical[1] + u_slip[1],
+                    u_wall_physical[2] + u_slip[2]
+                )
+                # Enforce zero normal component (no penetration)
+                dot = u_wall_effective[0]*normal[0] + u_wall_effective[1]*normal[1] + u_wall_effective[2]*normal[2]
+                u_wall_effective = wp.vec3(
+                    u_wall_effective[0] - dot*normal[0],
+                    u_wall_effective[1] - dot*normal[1],
+                    u_wall_effective[2] - dot*normal[2]
+                )
+            
+            else:
+                # Fall back to physical wall velocity
+                u_wall_effective = u_wall_physical
+            
+            return u_wall_effective
 
         @wp.func
         def neon_index_to_warp(neon_field_hdl: Any, index: Any):
@@ -635,20 +852,34 @@ class HelperFunctionsBC(object):
             index_wp = wp.vec3i(gx, gy, gz)
             return index_wp
 
+        # Store all functions as class attributes
         self.get_bc_thread_data = get_bc_thread_data
         self.get_bc_fsum = get_bc_fsum
         self.get_normal_vectors = get_normal_vectors
+        self.get_wall_distance = get_wall_distance
         self.bounceback_nonequilibrium = bounceback_nonequilibrium
         self.regularize_fpop = regularize_fpop
+        self.regularize_bounceback = regularize_bounceback
         self.grads_approximate_fpop = grads_approximate_fpop
-        self.grads_full_fpop = grads_full_fpop
         self.moving_wall_fpop_correction = moving_wall_fpop_correction
         self.interpolated_bounceback = interpolated_bounceback
         self.interpolated_nonequilibrium_bounceback = interpolated_nonequilibrium_bounceback
         self.neon_get_bc_thread_data = neon_get_bc_thread_data
         self.neon_index_to_warp = neon_index_to_warp
+        
+        # Wall model functions 
+        self.get_known_fsum = get_known_fsum
+        self.estimate_from_known = estimate_from_known
+        self.get_avg_normal_vectors = get_avg_normal_vectors
+        self.spalding_law = spalding_law
+        self.spalding_derivative = spalding_derivative
+        self.solve_spalding = solve_spalding
+        self.compute_wall_modeled_velocity = compute_wall_modeled_velocity        
+        self.get_normal_and_distance = get_normal_and_distance
+        
 
 
+# Keep all the encoding classes unchanged
 class EncodeAuxiliaryData(Operator):
     """
     Operator for encoding boundary auxiliary data during initialization.

@@ -35,18 +35,18 @@ wp.config.quiet = True
 # User Configuration
 # =================
 # Physical and simulation parameters
-voxel_size = 0.15/50.0 #0.0046875  # Finest voxel size in meters
+voxel_size = 0.15/100.0 #0.0046875  # Finest voxel size in meters
 ulb = 0.08         # Lattice velocity
-flow_passes = 5    # Domain flow passes
+flow_passes = 3    # Domain flow passes
 kinematic_viscosity = 1.508e-5  # Kinematic viscosity of air in m^2/s
 
 # STL filename
 stl_filename = "examples/stl/sphere.stl"
-base_script_name = "Sphere 50D approx"
+base_script_name = "Sphere 100D WM_MinDist"
 
 # List of Reynolds numbers to simulate
 
-reynolds_numbers = [ 1000]
+reynolds_numbers = [ 10000]
 
 # I/O settings
 print_interval_percentage = 1   # Print every 1% of iterations
@@ -69,16 +69,16 @@ def generate_makemesh_mesh(stl_filename, voxel_size, ground_refinement_level=-1,
     Generate a makemesh mesh based on the provided voxel size in meters, domain multipliers, and padding values.
     """
     # Number of requested refinement levels
-    num_levels = 4
+    num_levels = 5
 
     # Domain multipliers for the full domain
     domainMultiplier = {
         "-x": 3,
-        "x": 6,
-        "-y": 5,
-        "y": 5,
-        "-z": 5,
-        "z": 5,
+        "x": 5,
+        "-y": 4,
+        "y": 4,
+        "-z": 4,
+        "z": 4,
     }
 
     padding_values = [        
@@ -240,12 +240,13 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
             [list(coords) for coords in zip(*filtered_bottom_set)] if filtered_bottom_set else []
         )
 
-    bc_inlet = RegularizedBC(
-        "velocity",
-        #profile=bc_profile_taper(),
-        prescribed_value=(ulb, 0.0, 0.0),
-       indices=left_indices,
-    )
+    # bc_inlet = RegularizedBC(
+    #     "velocity",
+    #     #profile=bc_profile_taper(),
+    #     prescribed_value=(ulb, 0.0, 0.0),
+    #    indices=left_indices,
+    # )
+    bc_inlet = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=left_indices)   
 
     bc_outlet = DoNothingBC(indices=right_indices)
 
@@ -255,14 +256,16 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
     bc_back = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=filtered_back_indices)
 
     bc_body = HybridBC(
-        bc_method="bounceback_grads",
+        bc_method="nonequilibrium_regularized",
         mesh_vertices=body_vertices,
         voxelization_method=MeshVoxelizationMethod("AABB_CLOSE", close_voxels=1),
         use_mesh_distance=True,
+        use_wall_model=True,
+        kinematic_viscosity=nu_lattice,
     )
 
     return [bc_top, bc_bottom, bc_front, bc_back, bc_inlet, bc_outlet, bc_body] # Body must be last. Outlet must be second to last
-    # return [bc_walls, bc_inlet, bc_outlet, bc_body]
+   
 
 
 # Simulation Initialization
@@ -568,18 +571,18 @@ for Re in reynolds_numbers:
             sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
             wp.synchronize()            
             filename = os.path.join(output_dir, f"{script_name}_{step:04d}")
-            # h5exporter.to_slice_image(
-            #     filename,
-            #     {"velocity": sim.u},
-            #     plane_point=(1, 0, 0),
-            #     plane_normal=(0, 1, 0),
-            #     grid_res=1500,
-            #     bounds=(0, 1, 0, 1),
-            #     show_axes=False,
-            #     show_colorbar=False,
-            #     slice_thickness=delta_x_coarse, #needed when using model units
-            #     normalize = u_physical*1.75, 
-            # )
+            h5exporter.to_slice_image(
+                filename,
+                {"velocity": sim.u},
+                plane_point=(1, 0, 0),
+                plane_normal=(0, 1, 0),
+                grid_res=1500,
+                bounds=(0, 1, 0, 1),
+                show_axes=False,
+                show_colorbar=False,
+                slice_thickness=delta_x_coarse, #needed when using model units
+                normalize = u_physical*1.75, 
+            )
             print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
             end_time = time.time()
             elapsed = end_time - start_time
