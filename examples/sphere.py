@@ -35,14 +35,14 @@ wp.config.quiet = True
 # User Configuration
 # =================
 # Physical and simulation parameters
-voxel_size = 0.15/100.0 #0.0046875  # Finest voxel size in meters
+voxel_size = 0.15/120.0 #0.0046875  # Finest voxel size in meters
 ulb = 0.08         # Lattice velocity
 flow_passes = 3    # Domain flow passes
 kinematic_viscosity = 1.508e-5  # Kinematic viscosity of air in m^2/s
 
 # STL filename
 stl_filename = "examples/stl/sphere.stl"
-base_script_name = "Sphere 100D WM_MinDist"
+base_script_name = "Sphere 120D WM_noneq"
 
 # List of Reynolds numbers to simulate
 
@@ -545,7 +545,7 @@ for Re in reynolds_numbers:
     print(f"Computed reference area (bc_mask): {reference_area} lattice units")
     print(f"Physical reference area (bc_mask): {reference_area_physical:.6f} m^2")
     print(f"Reynolds number: {Re:,.2f}")
-    # print(f"Lattice viscosity: {nu_lattice:.5f}")
+    print(f"Lattice viscosity: {nu_lattice:.5f}")
     print(f"Relaxation parameter (omega): {omega:.5f}")
     time_remaining =(total_lattice_updates_per_step * num_steps) / (100 * 1e6)
     hours, rem = divmod(time_remaining, 3600)
@@ -553,7 +553,7 @@ for Re in reynolds_numbers:
     time_remaining_str = f"{int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s"
     print(f"Approx Runtime (assuming 100mlups): {time_remaining_str} \n")
     print("\n" + "=" * 50 + "\n")
-
+    
     # -------------------------- Simulation Loop --------------------------
     wp.synchronize()
     start_time = time.time()
@@ -582,7 +582,7 @@ for Re in reynolds_numbers:
                 show_colorbar=False,
                 slice_thickness=delta_x_coarse, #needed when using model units
                 normalize = u_physical*1.75, 
-            )
+            ) 
             print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
             end_time = time.time()
             elapsed = end_time - start_time

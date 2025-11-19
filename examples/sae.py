@@ -41,18 +41,17 @@ voxel_size = 0.003 # Finest voxel size in meters
 ulb = 0.08         # Lattice velocity
 u_physical = 38.0  # Physical inlet velocity in m/s (user input)
 flow_passes = 4    # Domain flow passes
-kinematic_viscosity = 1.508e-3  # Kinematic viscosity of air in m^2/s 1.508e-5
+kinematic_viscosity = 1.508e-5  # Kinematic viscosity of air in m^2/s 1.508e-5
 
 trim = True
 trim_voxels = 3
 
 # STL filename
 stl_filename = "examples/stl/sae.stl"
-script_name = "SAE_3mm_grad_stability_witRho"
-
+script_name = "SAE_3mm_wm2"
 # I/O settings
 print_interval_percentage = 1   # Print every 1% of iterations
-file_output_crossover_percentage = 85  # Crossover at 50% of iterations
+file_output_crossover_percentage = 90  # Crossover at 50% of iterations
 num_file_outputs_pre_crossover = 1    # Outputs before crossover
 num_file_outputs_post_crossover = 2  # Outputs after crossover
 
@@ -279,12 +278,8 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
         )
 
 
-    bc_inlet = RegularizedBC(
-        "velocity",
-        #profile=bc_profile_taper(),
-        prescribed_value=(ulb, 0.0, 0.0),
-       indices=left_indices,
-    )
+    #bc_inlet = RegularizedBC("velocity", prescribed_value=(ulb, 0.0, 0.0), indices=left_indices, )
+    bc_inlet = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=left_indices)
 
     bc_outlet = DoNothingBC(indices=right_indices)
 
@@ -295,14 +290,16 @@ def setup_boundary_conditions(grid, level_data, body_vertices, ulb, nu_lattice, 
     bc_back = HybridBC(bc_method="nonequilibrium_regularized",prescribed_value=(ulb, 0.0, 0.0),indices=filtered_back_indices)
 
     bc_body = HybridBC(
-        bc_method="bounceback_full_grads",
+        bc_method="nonequilibrium_regularized",
         mesh_vertices=body_vertices,
         voxelization_method=MeshVoxelizationMethod("AABB_CLOSE", close_voxels=1),
         use_mesh_distance=True,
+        use_wall_model=True,
+        kinematic_viscosity=nu_lattice,
     )
 
     return [bc_top, bc_bottom, bc_front, bc_back, bc_inlet, bc_outlet, bc_body] # Body must be last. Outlet must be second to last
-    # return [bc_walls, bc_inlet, bc_outlet, bc_body]
+
 
 
 # Simulation Initialization
@@ -706,13 +703,12 @@ drag_values = []
 
 for step in range(num_steps):
     step_start = time.time()
-    sim.step()
-    wp.synchronize()
+    sim.step()   
     compute_time += time.time() - step_start
     steps_since_last_print += 1
     if step % print_interval == 0 or step == num_steps - 1:
         sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-        wp.synchronize()        
+               
         filename = os.path.join(output_dir, f"{script_name}_{step:04d}")
         h5exporter.to_slice_image(
            filename,
@@ -727,6 +723,7 @@ for step in range(num_steps):
            slice_thickness=delta_x_coarse, #needed when using model units
            normalize = u_physical*1.5, #eventually we could have the 1.5 read from json as we did before
         )
+        wp.synchronize() 
         cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
         end_time = time.time()
         elapsed = end_time - start_time
@@ -748,16 +745,15 @@ for step in range(num_steps):
         compute_time = 0.0
         steps_since_last_print = 0
     file_output_interval = file_output_interval_pre_crossover if step < crossover_step else file_output_interval_post_crossover
-    if step % file_output_interval == 0 or step == num_steps - 1:
-        wp.synchronize()
+    if step % file_output_interval == 0 or step == num_steps - 1:        
         sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
         filename = os.path.join(output_dir, f"{script_name}_{step:04d}")
         h5exporter.to_hdf5(filename, {"velocity": sim.u, "density": sim.rho}, compression="gzip", compression_opts=1)
+        wp.synchronize()
            
         
     if step >= crossover_step and step % final_print_interval ==0 :
-        sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-        wp.synchronize()        
+        sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)        
         filename = os.path.join(output_dir, f"{script_name}_{step:04d}")
         percent_complete = (step + 1) / num_steps * 100
         print(f"Completed step {step}/{num_steps} ({percent_complete:.2f}% complete)")
@@ -774,6 +770,7 @@ for step in range(num_steps):
             slice_thickness=delta_x_coarse, #needed when using model units
             normalize = u_physical*1.5, #eventually we could have the 1.5 read from json as we did before
         )
+        wp.synchronize()        
         cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, ulb, reference_area, voxel_size)
         print(f"  Cd= {cd:.3f}, Cl= {cl:.3f}, Drag Force (lattice units)={drag:.3f}")
         
@@ -791,7 +788,7 @@ if len(drag_values) > 0:
 # Calculate and print average Cd and Cl for the last 50%
 drag_values_array = np.array(drag_values)
 if len(drag_values) > 0:
-    start_index = len(drag_values) // 2
+    start_index = int(len(drag_values) * (file_output_crossover_percentage / 100.0))
     last_half = drag_values_array[start_index:, :]
     avg_cd = np.mean(last_half[:, 0])
     avg_cl = np.mean(last_half[:, 1])

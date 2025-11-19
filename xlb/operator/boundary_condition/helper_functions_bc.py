@@ -52,8 +52,8 @@ class HelperFunctionsBC(object):
 
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
-        _B = compute_dtype(5.2)       # Log-law constant
-        _A_plus = compute_dtype(26.0)  # van Driest damping constant
+        _B = compute_dtype(8.2)       # Log-law constant
+        _A_plus = compute_dtype(50.0)  # van Driest damping constant
         _cs2 = compute_dtype(self.velocity_set.cs2)
 
         @wp.func
@@ -281,6 +281,7 @@ class HelperFunctionsBC(object):
             normal = _u_vec(0.0, 0.0, 0.0)
             normal_distance = compute_dtype(0.0)
             weight_sum = compute_dtype(0.0)
+            epsilon = compute_dtype(1e-8)
             
             # First pass: Compute weighted normal based on actual distances
             for l in range(_q):
@@ -300,27 +301,22 @@ class HelperFunctionsBC(object):
                     
                     # Weight by inverse of actual distance (closer surfaces have more influence)
                     # Add small epsilon to avoid division by zero
-                    epsilon = compute_dtype(1e-10)
-                    weight = compute_dtype(1.0) / (actual_distance + epsilon)
+                    
+                    weight = _w[l] * compute_dtype(1.0) / (actual_distance + epsilon)
                     
                     # Accumulate weighted normal vector
-                    normal[0] += c_unit[0] * weight
-                    normal[1] += c_unit[1] * weight
-                    normal[2] += c_unit[2] * weight
+                    normal += c_unit * weight
                     weight_sum += weight
             
             # Normalize the weighted normal
             if weight_sum > compute_dtype(0.0):
-                normal[0] /= weight_sum
-                normal[1] /= weight_sum
-                normal[2] /= weight_sum
+                normal /= weight_sum
+                
             
             # Unit normalize the normal vector
-            mag = wp.sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+            mag = wp.length(normal)
             if mag > compute_dtype(0.0):
-                normal[0] /= mag
-                normal[1] /= mag
-                normal[2] /= mag
+                normal /= mag
             
             # Invert normal to point into fluid
             normal = -normal
@@ -343,8 +339,7 @@ class HelperFunctionsBC(object):
                     # (dot product gives projection length, negative because normal points into fluid)
                     projection = -wp.dot(c_unit, normal) * actual_distance
                     
-                    # Weight by inverse distance for averaging
-                    epsilon = compute_dtype(1e-10)
+                    # Weight by inverse distance for averaging                    
                     weight = compute_dtype(1.0) / (actual_distance + epsilon)
                     
                     normal_distance += projection * weight
@@ -379,15 +374,12 @@ class HelperFunctionsBC(object):
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
             epsilon = compute_dtype(1e-7)
-            zero = compute_dtype(0.0)            
-            one = compute_dtype(1.0) 
+            zero = compute_dtype(0.0)   
             three = compute_dtype(3.0)
-            five = compute_dtype(5.0)
-            ten = compute_dtype(10.0)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
-            #trace = zero
+            #trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+            trace = zero
 
             for l in range(_q):
                 QiPi = zero
@@ -401,7 +393,46 @@ class HelperFunctionsBC(object):
                 # fneq ~ f^1
                 fpop1 = compute_dtype(4.5) * _w[l] * QiPi                
                 fpop[l] = feq[l] + fpop1
-                fpop[l] = wp.max(epsilon, fpop[l])
+                if fpop[l] < epsilon:
+                    fpop[l] = feq[l]
+
+            return fpop
+
+        @wp.func
+        def regularize_wallModel(
+            fpop: Any,
+            feq: Any,
+            y_plus: Any,
+        ):
+            """
+            Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
+            """
+            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
+            f_neq = fpop - feq
+            PiNeq = momentum_flux.warp_functional(f_neq)
+            epsilon = compute_dtype(1e-7)
+            zero = compute_dtype(0.0)  
+            three = compute_dtype(3.0)
+            scale = wp.clamp(y_plus / compute_dtype(30.0), compute_dtype(0.0), compute_dtype(1.0))
+
+            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
+            #trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+            trace = zero
+
+            for l in range(_q):
+                QiPi = zero
+                for t in range(_nt):
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi += _qi[l, t] * (PiNeq[t] - trace)
+                        else:
+                            QiPi += _qi[l, t] * PiNeq[t]
+
+                # assign all populations based on eq 45 of Latt et al (2008)
+                # fneq ~ f^1
+                fpop1 = compute_dtype(4.5) * _w[l] * QiPi                
+                fpop[l] = feq[l] + fpop1 * scale
+                if fpop[l] < epsilon:
+                    fpop[l] = feq[l]
 
             return fpop
 
@@ -631,6 +662,7 @@ class HelperFunctionsBC(object):
                     if needs_mesh_distance:
                         # use weights associated with curved boundaries that are properly stored in f_1.
                         weight = compute_dtype(self.distance_decoder_function(f_1, index, l))
+                       # weight = wp.clamp(weight, compute_dtype(0.001), compute_dtype(1.0))
                     else:
                         weight = half
 
@@ -724,10 +756,81 @@ class HelperFunctionsBC(object):
                 u_plus -= residual / wp.max(df_du, epsilon)  # Avoid div0
                 
                 # Clamp for stability (prevents negatives/overshoot at transients)
-                u_plus = wp.max(compute_dtype(0.001), u_plus)
+                u_plus = wp.max(compute_dtype(0.0001), u_plus)
             
             return u_plus
 
+        @wp.func
+        def musker_u_from_y(y_plus: Any) -> Any:
+            """Forward Musker: Given y⁺, return u⁺ (for applying wall BCs)"""
+            a1 = compute_dtype( 5.43304476)
+            a2 = compute_dtype(-2.69469647e-1)
+            a3 = compute_dtype( 9.06392720e-2)
+            a4 = compute_dtype(-1.37518637e-2)
+            a5 = compute_dtype( 1.05789855e-3)
+            a6 = compute_dtype(-4.49275492e-5)
+            a7 = compute_dtype( 9.35634096e-7)
+            a8 = compute_dtype(-7.53851505e-9)
+
+            log_term = wp.log(y_plus + compute_dtype(11.0))
+            u_plus = (
+                a1 * log_term +
+                a2 +
+                a3 * y_plus +
+                a4 * y_plus * y_plus +
+                a5 * y_plus * y_plus * y_plus +
+                a6 * y_plus * y_plus * y_plus * y_plus +
+                a7 * y_plus * y_plus * y_plus * y_plus * y_plus +
+                a8 * y_plus * y_plus * y_plus * y_plus * y_plus * y_plus
+            )
+            return u_plus
+
+        @wp.func
+        def musker_y_from_u(u_plus: Any) -> Any:
+            """Inverse Musker: Given u⁺, return y⁺ (for solving wall model)"""
+            b1 = compute_dtype(0.18394189)
+            b2 = compute_dtype(-2.01702635e-2)
+            b3 = compute_dtype(1.96943917e-2)
+            b4 = compute_dtype(-8.98701033e-3)
+            b5 = compute_dtype(2.11896938e-3)
+            b6 = compute_dtype(-2.73136397e-4)
+            b7 = compute_dtype(1.83406310e-5)
+            b8 = compute_dtype(-5.08426253e-7)
+
+            y_plus = (
+                wp.exp(b1 * (u_plus - compute_dtype(5.0))) +
+                b2 * u_plus +
+                b3 +
+                b4 * u_plus * u_plus +
+                b5 * u_plus * u_plus * u_plus +
+                b6 * u_plus * u_plus * u_plus * u_plus +
+                b7 * u_plus * u_plus * u_plus * u_plus * u_plus +
+                b8 * u_plus * u_plus * u_plus * u_plus * u_plus * u_plus
+            )
+            return y_plus
+
+        @wp.func
+        def solve_musker(K: Any) -> Any:
+            """
+            Solve for u⁺ given K = u_parallel * y / ν
+            Pure explicit - no iteration needed!
+            """
+            # Handle viscous sublayer
+            if K < compute_dtype(1e-8):
+                return wp.sqrt(K)
+            
+            # Initial guess from log-law
+            u_plus_init = (compute_dtype(1.0) / _kappa) * wp.log(K) + _B
+            
+            # Iteratively refine initial guess (still explicit, just improving starting point)
+            for _ in range(3):
+                y_plus = musker_y_from_u(u_plus_init)  # ← Now using correct function!
+                if y_plus > compute_dtype(1e-8):
+                    u_plus_init = K / y_plus  # Direct solution: u⁺ = K / y⁺
+            
+            return wp.max(u_plus_init, compute_dtype(0.01))
+
+        
         @wp.func
         def compute_wall_modeled_velocity(
             index: Any,
@@ -740,9 +843,9 @@ class HelperFunctionsBC(object):
             nu: Any, 
         ):
             zero = compute_dtype(0.0)
-            epsilon = compute_dtype(1e-7)
+            epsilon = compute_dtype(1e-8)
             scale = compute_dtype(0.01)
-            y_limit = compute_dtype(150.0)
+            y_limit = compute_dtype(30.0)
             u_wall_physical = u_wall
             # Get wall geometry info               
             normal, y_distance = get_normal_and_distance(_missing_mask, f_1, index) 
@@ -752,89 +855,63 @@ class HelperFunctionsBC(object):
                 
             
             # Decompose estimated velocity into normal and parallel components
-            dot = u_est[0] * normal[0] + u_est[1] * normal[1] + u_est[2] * normal[2]
-            u_normal = _u_vec(
-                normal[0] * dot,
-                normal[1] * dot,
-                normal[2] * dot
-            )
-            u_parallel = _u_vec(
-                u_est[0] - u_normal[0],
-                u_est[1] - u_normal[1],
-                u_est[2] - u_normal[2]
-            )
-            u_parallel_mag = compute_dtype(wp.len(u_parallel))
-            
-            u_wall_effective = u_wall_physical  # Default to physical if no modeling needed
-            
+            dot = wp.dot(u_est, normal)
+            u_normal = normal * dot
+            u_parallel = u_est - u_normal
+
+            u_parallel_mag = compute_dtype(wp.length(u_parallel))           
             
             # Compute K = u_parallel_mag * y_distance / nu (unchanged)
             K = u_parallel_mag * y_distance / nu
             
             # Clamp K for safety (avoids div0 or exp overflow at transients/low nu)
-            K = wp.max(compute_dtype(0.01), K)
+            K = wp.max(epsilon, K)
             
             # Solve for u+
-            u_plus = solve_spalding(K)                
+            #u_plus = solve_spalding(K)   
+            u_plus = solve_musker(K)             
             u_tau = u_parallel_mag / wp.max(u_plus, epsilon)
             
             # Compute wall shear stress magnitude
-            tau_wall = u_tau * u_tau  # In lattice units (assuming ρ=1)
+            tau_wall = u_tau * u_tau * rho # In lattice units (assuming ρ=1)
             
             # Nonlinear adjustment: effective viscosity including turbulent part from log-law
-            y_plus = scale * y_distance * u_tau / nu  # Final y+
+            y_plus = y_distance * u_tau / nu  # Final y+
+            y_plus += epsilon
             
-            if u_parallel_mag > epsilon and y_plus > epsilon:
-                #wp.print(y_plus)
-                # Compute damping factor
-                vd_damp = compute_dtype(1.0) - wp.exp(-y_plus / _A_plus)
-                nu_t_B = _kappa * u_tau * y_distance * (vd_damp * vd_damp)  # van Driest damping
-                nu_eff = nu + nu_t_B
-                
-                # Effective velocity gradient incorporating nonlinearity
-                velocity_gradient = tau_wall / nu_eff
-                
-                # Slip magnitude: subtract to increase effective shear
-                u_slip_mag = u_parallel_mag - velocity_gradient * y_distance
-                
-                # Clamp for stability: prevent excessively negative
-                u_slip_mag = wp.max(u_slip_mag, -u_parallel_mag * compute_dtype(0.25))
-                
-                # Reconstruct slip velocity vector
-                if u_parallel_mag > epsilon:
-                    u_parallel_unit = _u_vec(
-                        u_parallel[0] / u_parallel_mag,
-                        u_parallel[1] / u_parallel_mag,
-                        u_parallel[2] / u_parallel_mag
-                    )
-                    
-                    u_slip = _u_vec(
-                        u_parallel_unit[0] * u_slip_mag,
-                        u_parallel_unit[1] * u_slip_mag,
-                        u_parallel_unit[2] * u_slip_mag
-                    )
-                else:
-                    u_slip = _u_vec(0.0, 0.0, 0.0)
-                
-                # Effective wall velocity: add slip to physical
-                u_wall_effective = _u_vec(
-                    u_wall_physical[0] + u_slip[0],
-                    u_wall_physical[1] + u_slip[1],
-                    u_wall_physical[2] + u_slip[2]
-                )
-                # Enforce zero normal component (no penetration)
-                dot = u_wall_effective[0]*normal[0] + u_wall_effective[1]*normal[1] + u_wall_effective[2]*normal[2]
-                u_wall_effective = wp.vec3(
-                    u_wall_effective[0] - dot*normal[0],
-                    u_wall_effective[1] - dot*normal[1],
-                    u_wall_effective[2] - dot*normal[2]
-                )
             
+            # Compute damping factor
+            vd_damp = compute_dtype(1.0) - wp.exp(-y_plus / _A_plus)
+            nu_t_B = _kappa * u_tau * y_distance #* vd_damp * vd_damp # van Driest damping
+            nu_eff = nu + nu_t_B
+            
+            # Effective velocity gradient incorporating nonlinearity
+            velocity_gradient = tau_wall / nu_eff
+            
+            # Slip magnitude: subtract to increase effective shear
+            u_slip_mag = u_parallel_mag - velocity_gradient * y_distance
+
+            #wp.printf(" yplus: %f, nu: %f, nu_eff: %f, u_slip_mag: %f, uParallel: %f vel_Grad: %f", y_plus, nu, nu_eff, u_slip_mag, u_parallel_mag, velocity_gradient)   
+            # Clamp for stability: prevent excessively negative
+            u_slip_mag = wp.max(u_slip_mag, -u_parallel_mag * compute_dtype(1.0))
+            
+            # Reconstruct slip velocity vector
+            if u_parallel_mag > epsilon:
+                u_parallel_unit = u_parallel / u_parallel_mag
+                
+                u_slip = u_parallel_unit * u_slip_mag
+    
             else:
-                # Fall back to physical wall velocity
-                u_wall_effective = u_wall_physical
+                u_slip = _u_vec(0.0, 0.0, 0.0)
+                
+            # Effective wall velocity: add slip to physical
+            u_wall_effective = u_wall_physical + u_slip
             
-            return u_wall_effective
+            # Enforce zero normal component (no penetration)
+            dot = wp.dot(u_wall_effective, normal)
+            u_wall_effective = u_wall_effective - dot*normal
+            
+            return u_wall_effective, y_plus
 
         @wp.func
         def neon_index_to_warp(neon_field_hdl: Any, index: Any):
@@ -868,6 +945,10 @@ class HelperFunctionsBC(object):
         self.neon_index_to_warp = neon_index_to_warp
         
         # Wall model functions 
+        self.regularize_wallModel = regularize_wallModel
+        self.solve_musker = solve_musker
+        self.musker_y_from_u = musker_y_from_u
+        self.musker_u_from_y = musker_u_from_y
         self.get_known_fsum = get_known_fsum
         self.estimate_from_known = estimate_from_known
         self.get_avg_normal_vectors = get_avg_normal_vectors
