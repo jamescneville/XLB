@@ -352,7 +352,7 @@ class HybridBC(BoundaryCondition):
 
             # Compute effective wall velocity from wall model
             if wp.static(self.use_wall_model):                           
-                u_wall, y_plus = self.bc_helper.compute_wall_modeled_velocity(
+                u_wall = self.bc_helper.compute_wall_modeled_velocity(
                     index,
                     _missing_mask,
                     f_0,
@@ -381,10 +381,8 @@ class HybridBC(BoundaryCondition):
             # Regularize the resulting populations
             feq = self.equilibrium.warp_functional(rho, u)
 
-            if wp.static(self.use_wall_model):  
-                f_post = self.bc_helper.regularize_wallModel(f_post, feq, y_plus)
-            else:
-                f_post = self.bc_helper.regularize_fpop(f_post, feq)
+           
+            f_post = self.bc_helper.regularize_fpop(f_post, feq)
             return f_post
 
         if self.bc_method == "bounceback_regularized":
