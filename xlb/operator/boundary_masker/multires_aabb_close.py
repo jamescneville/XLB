@@ -99,15 +99,19 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                         max_length = wp.length(dir_vec)
                         # Avoid division by zero for any pathological dir (shouldn't happen)
                         norm_dir = dir_vec / (max_length if max_length > 0.0 else 1.0)
-                        query = wp.mesh_query_ray(mesh_id, cell_center, norm_dir, 1.5 * max_length)
+                        query = wp.mesh_query_ray(mesh_id, cell_center, norm_dir, 2.5 * max_length) #was 1.5 added 1voxel more
                         if query.result:
                             pos_mesh = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-                            dist = wp.length(pos_mesh - cell_center) - 0.5 * max_length
+                            dist = wp.length(pos_mesh - cell_center)# - 0.5 * max_length                            
+                            dist = wp.max(dist, 0.0)
                             weight = dist / (max_length if max_length > 0.0 else 1.0)
+                            weight = (wp.round(weight * 1000.0))/1000.0 #Smooth to nearest 0.001
+                            #weight = wp.clamp(weight, 0.001, 1.0)
+                            weight = wp.max(weight,0.0)
                             # distances has cardinality _q; store into this channel
                             self.write_field(distances_pn, index, direction_idx, self.store_dtype(weight))
                         else:
-                            self.write_field(distances_pn, index, direction_idx, self.store_dtype(1.0))
+                            self.write_field(distances_pn, index, direction_idx, self.store_dtype(5.0))
 
         # Containers
 
