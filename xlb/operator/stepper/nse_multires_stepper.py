@@ -89,6 +89,7 @@ from xlb.operator.boundary_masker import (
     MultiresMeshMaskerAABBClose,
     MultiresIndicesBoundaryMasker,
     MultiresMeshMaskerRay,
+    MultiresMeshMaskerTrapped,
 )
 from xlb.operator.boundary_condition.helper_functions_bc import MultiresEncodeAuxiliaryData
 from xlb.cell_type import BC_SFV, BC_SOLID
@@ -360,6 +361,17 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     raise ValueError(f"Unsupported voxelization method for multi-res: {bc.voxelization_method}")
                 # Apply the mesh masker to the boundary condition
                 f_1, bc_mask, missing_mask = mesh_masker(bc, f_1, bc_mask, missing_mask)
+
+            # Run Trapped Masker looking for sandwich voxels
+            trapped_masker = MultiresMeshMaskerTrapped(
+                    velocity_set=DefaultConfig.velocity_set,
+                    precision_policy=DefaultConfig.default_precision_policy,
+                    compute_backend=DefaultConfig.default_backend,
+            )
+            
+            f_1, bc_mask, missing_mask = trapped_masker(bc_with_vertices[0], f_1, bc_mask, missing_mask)
+
+
 
         return f_1, bc_mask, missing_mask
 
