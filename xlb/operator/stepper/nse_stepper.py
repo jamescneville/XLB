@@ -31,6 +31,7 @@ from xlb.operator.boundary_masker import (
     MeshMaskerRay,
     MeshMaskerWinding,
     MeshMaskerAABBClose,
+    MeshMaskerTrapped,
 )
 from xlb.helper import check_bc_overlaps
 from xlb.helper.nse_fields import create_nse_fields
@@ -203,6 +204,16 @@ class IncompressibleNavierStokesStepper(Stepper):
                     raise ValueError(f"Unsupported voxelization method: {bc.voxelization_method}")
                 # Apply the mesh masker to the boundary condition
                 f_1, bc_mask, missing_mask = mesh_masker(bc, f_1, bc_mask, missing_mask)
+            
+            # Run Trapped Masker looking for sandwich voxels
+            trapped_masker = MeshMaskerTrapped(
+                    velocity_set=DefaultConfig.velocity_set,
+                    precision_policy=DefaultConfig.default_precision_policy,
+                    compute_backend=DefaultConfig.default_backend,
+            )
+            
+            f_1, bc_mask, missing_mask = trapped_masker(bc_with_vertices[0], f_1, bc_mask, missing_mask)
+
 
         return f_1, bc_mask, missing_mask
 
