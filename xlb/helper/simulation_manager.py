@@ -52,8 +52,9 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         force_vector=None,
         initializer=None,
         mres_perf_opt: MresPerfOptimizationType = MresPerfOptimizationType.NAIVE_COLLIDE_STREAM,
+        smagorinsky_constant = 0.0
     ):
-        super().__init__(grid, boundary_conditions, collision_type, forcing_scheme, force_vector)
+        super().__init__(grid, boundary_conditions, collision_type, forcing_scheme, force_vector, smagorinsky_constant)
 
         self.initializer = initializer
         self.count_levels = grid.count_levels
@@ -62,15 +63,25 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         # Create fields
         self.rho = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
         self.u = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.rho0 = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
+        self.u0 = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.rho1 = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
+        self.u1 = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.relax = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
         self.coalescence_factor = grid.create_field(cardinality=self.velocity_set.q, dtype=self.precision_policy.store_precision)
 
         for level in range(self.count_levels):
             self.u.fill_run(level, 0.0, 0)
             self.rho.fill_run(level, 1.0, 0)
+            self.u0.fill_run(level, 0.0, 0)
+            self.rho0.fill_run(level, 1.0, 0)
+            self.u1.fill_run(level, 0.0, 0)
+            self.rho1.fill_run(level, 1.0, 0)
+            self.relax.fill_run(level, 0.0, 0)
             self.coalescence_factor.fill_run(level, 0.0, 0)
 
         # Prepare fields
-        self.f_0, self.f_1, self.bc_mask, self.missing_mask = self.prepare_fields(self.rho, self.u, self.initializer)
+        self.f_0, self.f_1, self.bc_mask, self.missing_mask, self.normal_vector, self.normal_distance = self.prepare_fields(self.rho, self.u, self.initializer)
         self.prepare_coalescence_count(coalescence_factor=self.coalescence_factor, bc_mask=self.bc_mask)
 
         self.iteration_idx = -1
@@ -148,8 +159,8 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             return
 
         omega = self.omega_list[level]
-        fields = dict(f_0_fd=self.f_0, f_1_fd=self.f_1, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask)
-        fields_swapped = dict(f_0_fd=self.f_1, f_1_fd=self.f_0, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask)
+        fields = dict(f_0_fd=self.f_0, f_1_fd=self.f_1, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask, _rho0=self.rho0, _u0=self.u0, _rho1=self.rho1, _u1=self.u1, _relax=self.relax,normal_vector = self.normal_vector, normal_distance = self.normal_distance)
+        fields_swapped = dict(f_0_fd=self.f_1, f_1_fd=self.f_0, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask, _rho0=self.rho1, _u0=self.u1, _rho1=self.rho0, _u1=self.u0, _relax=self.relax,normal_vector = self.normal_vector, normal_distance = self.normal_distance)
 
         if level == 0 and config["finest_ops"] is not None:
             for op_name, swap, extra in config["finest_ops"]:
@@ -229,12 +240,14 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         # Pre-recursion SFV mask setup
         if self.mres_perf_opt == MresPerfOptimizationType.FUSION_AT_FINEST_SFV:
             wp.synchronize()
-            self.neon_container["SFV_reset_bc_mask"](0, self.f_0, self.f_1, self.bc_mask, self.bc_mask).run(0)
+            self.neon_container["SFV_reset_bc_mask"](0, self.f_0, self.f_1, self.bc_mask, self.bc_mask,
+                    self.rho0, self.u0, self.rho1, self.u1,self.relax,self.normal_vector,self.normal_distance).run(0)
             wp.synchronize()
         elif self.mres_perf_opt == MresPerfOptimizationType.FUSION_AT_FINEST_SFV_ALL:
             wp.synchronize()
             for l in range(self.f_0.get_grid().num_levels):
-                self.neon_container["SFV_reset_bc_mask"](l, self.f_0, self.f_1, self.bc_mask, self.bc_mask).run(0)
+                self.neon_container["SFV_reset_bc_mask"](l, self.f_0, self.f_1, self.bc_mask, self.bc_mask,
+                    self.rho0, self.u0, self.rho1, self.u1,self.relax,self.normal_vector,self.normal_distance).run(0)
             wp.synchronize()
 
         self._build_recursion(self.count_levels - 1, self.app, config)

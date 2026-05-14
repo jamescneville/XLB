@@ -43,6 +43,8 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
             bc_mask: Any,
             missing_mask: Any,
             needs_mesh_distance: Any,
+            normal_vector: Any,
+            normal_distance: Any,
             level: Any,
         ):
             def ray_launcher(loader: neon.Loader):
@@ -50,6 +52,9 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
                 distances_pn = loader.get_mres_write_handle(distances)
                 bc_mask_pn = loader.get_mres_write_handle(bc_mask)
                 missing_mask_pn = loader.get_mres_write_handle(missing_mask)
+                norm_vec_pn = loader.get_write_handle(normal_vector)
+                norm_dist_pn = loader.get_write_handle(normal_distance)
+
 
                 @wp.func
                 def ray_kernel(index: Any):
@@ -62,6 +67,8 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
                         bc_mask_pn,
                         missing_mask_pn,
                         needs_mesh_distance,
+                        norm_vec_pn,
+                        norm_dist_pn
                     )
 
                 loader.declare_kernel(ray_kernel)
@@ -77,6 +84,8 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
         distances,
         bc_mask,
         missing_mask,
+        normal_vector,
+        normal_distance,
         stream=0,
     ):
         import neon
@@ -87,6 +96,6 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
         grid = bc_mask.get_grid()
         for level in range(grid.num_levels):
             # Launch the neon container
-            c = self.neon_container(mesh_id, bc_id, distances, bc_mask, missing_mask, wp.static(bc.needs_mesh_distance), level)
+            c = self.neon_container(mesh_id, bc_id, distances, bc_mask, missing_mask, wp.static(bc.needs_mesh_distance), normal_vector, normal_distance, level)
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
-        return distances, bc_mask, missing_mask
+        return distances, bc_mask, missing_mask, normal_vector, normal_distance

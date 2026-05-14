@@ -3,7 +3,8 @@ from xlb.operator import Operator
 from xlb.operator.stepper import IncompressibleNavierStokesStepper
 from xlb.operator.boundary_condition.boundary_condition import ImplementationStep
 from jax import lax
-from jax import shard_map
+#from jax import shard_map
+from jax.experimental.shard_map import shard_map
 from jax import jit
 
 
