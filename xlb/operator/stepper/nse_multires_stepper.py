@@ -125,7 +125,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
     boundary_conditions : list of BoundaryCondition
         Boundary conditions to apply.
     collision_type : str
-        Collision operator type: ``"BGK"`` or ``"KBC"`` or ``"SmagorinskyLESBGK"``.
+        Collision operator type: ``"BGK"`` or ``"KBC"`` or ``"SmagorinskyLESBGK"`` or ``"SmagorinskyLESKBC"``.
     forcing_scheme : str
         Forcing scheme name (only used when *force_vector* is given).
     force_vector : array-like, optional
@@ -149,6 +149,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             self.collision = KBC(self.velocity_set, self.precision_policy, self.compute_backend)
         elif collision_type == "SmagorinskyLESBGK":
             self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
+        elif collision_type == "SmagorinskyLESKBC":
+            self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
+
 
         if force_vector is not None:
             self.collision = ForcedCollision(collision_operator=self.collision, forcing_scheme=forcing_scheme, force_vector=force_vector)
