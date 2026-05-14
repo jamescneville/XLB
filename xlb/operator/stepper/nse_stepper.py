@@ -82,6 +82,8 @@ class IncompressibleNavierStokesStepper(Stepper):
             self.collision = KBC(self.velocity_set, self.precision_policy, self.compute_backend)
         elif collision_type == "SmagorinskyLESBGK":
             self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
+        elif collision_type == "SmagorinskyLESKBC":
+            self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
 
         if force_vector is not None:
             self.collision = ForcedCollision(collision_operator=self.collision, forcing_scheme=forcing_scheme, force_vector=force_vector)
