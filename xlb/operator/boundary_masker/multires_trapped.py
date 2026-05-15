@@ -3,16 +3,14 @@ from typing import Any
 from xlb.velocity_set.velocity_set import VelocitySet
 from xlb.precision_policy import PrecisionPolicy
 from xlb.compute_backend import ComputeBackend
-from xlb.operator.boundary_masker import MeshMaskerRay
+from xlb.operator.boundary_masker import MeshMaskerTrapped
 from xlb.operator.operator import Operator
 import neon
 
 
-class MultiresMeshMaskerRay(MeshMaskerRay):
+class MultiresMeshMaskerTrapped(MeshMaskerTrapped):
     """
-    Operator for creating a boundary missing_mask from an STL file in multiresolution simulations.
-
-    This implementation uses warp.mesh_query_ray for efficient mesh-voxel intersection testing.
+    Operator for finding BC voxels that are trepped / adjacent a different BC to mark missing. 
     """
 
     def __init__(
@@ -30,7 +28,7 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
         # Use the warp functional for the NEON backend
         functional, _ = self._construct_warp()
 
-        @neon.Container.factory(name="MeshMaskerRay")
+        @neon.Container.factory(name="MeshMaskerTrapped")
         def container(
             mesh_id: Any,
             id_number: Any,
@@ -38,20 +36,16 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
             bc_mask: Any,
             missing_mask: Any,
             needs_mesh_distance: Any,
-            normal_vector: Any,
-            normal_distance: Any,
             level: Any,
         ):
-            def ray_launcher(loader: neon.Loader):
+            def trapped_launcher(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask.get_grid(), level)
                 distances_pn = loader.get_mres_write_handle(distances)
                 bc_mask_pn = loader.get_mres_write_handle(bc_mask)
                 missing_mask_pn = loader.get_mres_write_handle(missing_mask)
-                norm_vec_pn = loader.get_mres_write_handle(normal_vector)
-                norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 @wp.func
-                def ray_kernel(index: Any):
+                def trapped_kernel(index: Any):
                     # apply the functional
                     functional(
                         index,
@@ -61,13 +55,11 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
                         bc_mask_pn,
                         missing_mask_pn,
                         needs_mesh_distance,
-                        norm_vec_pn,
-                        norm_dist_pn
                     )
 
-                loader.declare_kernel(ray_kernel)
+                loader.declare_kernel(trapped_kernel)
 
-            return ray_launcher
+            return trapped_launcher
 
         return functional, container
 
@@ -78,16 +70,13 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
         distances,
         bc_mask,
         missing_mask,
-        normal_vector, 
-        normal_distance,
         stream=0,
     ):
-        # Prepare inputs
-        mesh_id, bc_id = self._prepare_kernel_inputs(bc, bc_mask)
-
+        mesh_id = wp.uint64(0)
+        bc_id = wp.uint8(255)
         grid = bc_mask.get_grid()
         for level in range(grid.num_levels):
             # Launch the neon container
-            c = self.neon_container(mesh_id, bc_id, distances, bc_mask, missing_mask, wp.static(bc.needs_mesh_distance), normal_vector, normal_distance, level)
+            c = self.neon_container(mesh_id, bc_id, distances, bc_mask, missing_mask, wp.static(bc.needs_mesh_distance), level)
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
-        return distances, bc_mask, missing_mask, normal_vector, normal_distance
+        return distances, bc_mask, missing_mask

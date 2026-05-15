@@ -179,6 +179,7 @@ class RegularizedBC(ZouHeBC):
             f_1: Any,
             f_pre: Any,
             f_post: Any,
+            nu_wm: Any,
         ):
             # Post-streaming values are only modified at missing direction
             _f = f_post

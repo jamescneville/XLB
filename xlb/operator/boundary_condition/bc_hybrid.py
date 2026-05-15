@@ -40,7 +40,7 @@ class HybridBC(BoundaryCondition):
         indices=None,
         mesh_vertices=None,
         voxelization_method: MeshVoxelizationMethod = None,
-        use_mesh_distance=False,        
+        use_mesh_distance=False,
         use_wall_model=False,
         kinematic_viscosity=None,
     ):
@@ -48,13 +48,19 @@ class HybridBC(BoundaryCondition):
             "bounceback_regularized",
             "bounceback_grads",
             "nonequilibrium_regularized",
-        ], f"type = {bc_method} not supported! Use 'bounceback_regularized', 'bounceback_grads', or 'nonequilibrium_regularized'."
-        self.bc_method = bc_method   
+        ], (
+            f"type = {bc_method} not supported! Use 'bounceback_regularized', 'bounceback_grads', "
+            f"or 'nonequilibrium_regularized'."
+        )
+        self.bc_method = bc_method
+
+        # Wall model settings
         self.use_wall_model = use_wall_model
         if self.use_wall_model:
             assert kinematic_viscosity is not None, "kinematic_viscosity must be provided when use_wall_model=True"
             assert use_mesh_distance, "use_mesh_distance must be True when using wall model"
-        self.kinematic_viscosity = kinematic_viscosity if kinematic_viscosity is not None else 0.0        
+        self.kinematic_viscosity = kinematic_viscosity if kinematic_viscosity is not None else 0.0
+
         # Call the parent constructor
         super().__init__(
             ImplementationStep.STREAMING,
@@ -91,7 +97,6 @@ class HybridBC(BoundaryCondition):
 
         if (profile is not None) or (prescribed_value is not None) or (self.use_wall_model is True):
             self.needs_moving_wall_treatment = True
-            print('Moving wall treatment')
 
         # Handle no-slip BCs if neither prescribed_value or profile are provided.
         if prescribed_value is None and profile is None:
@@ -208,7 +213,7 @@ class HybridBC(BoundaryCondition):
         return profile_functional_warp if self.compute_backend == ComputeBackend.WARP else profile_functional_neon
 
     def _construct_warp(self):
-        # Construct the functionals for this BC
+        # Capture wall model parameters
         compute_dtype = self.precision_policy.compute_precision.wp_dtype
         nu = compute_dtype(self.kinematic_viscosity)
 
@@ -221,29 +226,22 @@ class HybridBC(BoundaryCondition):
             f_1: Any,
             f_pre: Any,
             f_post: Any,
+            _rho: Any, 
+            _u: Any,
+            _relax:Any,
+            _norm_vec:Any,
+            _norm_dist:Any,
         ):
-            # Using regularization technique [1] to represent fpop using macroscopic values derived from interpolated bounceback scheme of [2].
-            # missing data in lattice Boltzmann.
-            # [1] Latt, J., Chopard, B., Malaspinas, O., Deville, M., Michler, A., 2008. Straight velocity
-            #     boundaries in the lattice Boltzmann method. Physical Review E 77, 056703.
-            # [2] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
-            #     in: 41st aerospace sciences meeting and exhibit, p. 953.
+            u_wall_physical = self.profile_functional(f_1, index, timestep)
 
-            # Apply interpolated bounceback first to find missing populations at the boundary
-            u_wall = self.profile_functional(f_1, index, timestep)
-
-            # Compute effective wall velocity from wall model
-            if wp.static(self.use_wall_model):                           
-                u_wall = self.bc_helper.compute_wall_modeled_velocity(
-                    index,
-                    _missing_mask,
-                    f_0,
-                    f_1,
-                    f_pre,
-                    f_post,
-                    u_wall,
-                    nu,     
-                )  
+            if wp.static(self.use_wall_model):                
+                relax = compute_dtype(wp.neon_read(_relax, index, 0))
+                u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
+                    index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
+                )
+                wp.neon_write(_relax, index, 0, relax_new)
+            else:
+                u_wall_effective = u_wall_physical
 
             f_post = self.bc_helper.interpolated_bounceback(
                 index,
@@ -252,25 +250,17 @@ class HybridBC(BoundaryCondition):
                 f_1,
                 f_pre,
                 f_post,
-                u_wall,
+                u_wall_effective,
                 wp.static(self.needs_moving_wall_treatment),
                 wp.static(self.needs_mesh_distance),
+                _rho,
             )
 
-            # Compute density, velocity using all f_post-streaming values
             rho, u = self.macroscopic.warp_functional(f_post)
-
-            # Regularize the resulting populations
             feq = self.equilibrium.warp_functional(rho, u)
             f_post = self.bc_helper.regularize_fpop(f_post, feq)
-            # f_post = self.bc_helper.regularize_bounceback(
-            #     _missing_mask,
-            #     rho,
-            #     u,
-            #     f_post,
-            #     )
+
             return f_post
-            
 
         @wp.func
         def hybrid_bounceback_grads(
@@ -281,6 +271,11 @@ class HybridBC(BoundaryCondition):
             f_1: Any,
             f_pre: Any,
             f_post: Any,
+            _rho: Any, 
+            _u: Any,
+            _relax:Any,
+            _norm_vec:Any,
+            _norm_dist:Any,
         ):
             # Using Grad's approximation [1] to represent fpop using macroscopic values derived from interpolated bounceback scheme of [2].
             # missing data in lattice Boltzmann.
@@ -288,22 +283,16 @@ class HybridBC(BoundaryCondition):
             #    stationary walls in entropic lattice Boltzmann simulations. Journal of Computational Physics, 295, 340-354.
             # [2] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
             #     in: 41st aerospace sciences meeting and exhibit, p. 953.
+            u_wall_physical = self.profile_functional(f_1, index, timestep)
 
-            # Apply interpolated bounceback first to find missing populations at the boundary
-            u_wall = self.profile_functional(f_1, index, timestep)
-
-            # Compute effective wall velocity from wall model
-            if wp.static(self.use_wall_model):                           
-                u_wall = self.bc_helper.compute_wall_modeled_velocity(
-                    index,
-                    _missing_mask,
-                    f_0,
-                    f_1,
-                    f_pre,
-                    f_post,
-                    u_wall,
-                    nu,     
-                )  
+            if wp.static(self.use_wall_model):                
+                relax = compute_dtype(wp.neon_read(_relax, index, 0))
+                u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
+                    index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
+                )
+                wp.neon_write(_relax, index, 0, relax_new)
+            else:
+                u_wall_effective = u_wall_physical
 
             f_post = self.bc_helper.interpolated_bounceback(
                 index,
@@ -312,24 +301,18 @@ class HybridBC(BoundaryCondition):
                 f_1,
                 f_pre,
                 f_post,
-                u_wall,
+                u_wall_effective,
                 wp.static(self.needs_moving_wall_treatment),
                 wp.static(self.needs_mesh_distance),
-                
+                _rho,
             )
-            # Compute density, velocity using all f_post-streaming values
-            rho, u = self.macroscopic.warp_functional(f_post)
 
+            rho, u = self.macroscopic.warp_functional(f_post)
             # Compute Grad's approximation using full equation as in Eq (10) of Dorschner et al.
-            f_post = self.bc_helper.grads_approximate_fpop(
-                _missing_mask,                                
-                rho,
-                u,
-                f_post,
-                
-                )
+            f_post = self.bc_helper.grads_approximate_fpop(_missing_mask, rho, u, f_post)
+
             return f_post
-        
+
         @wp.func
         def hybrid_nonequilibrium_regularized(
             index: Any,
@@ -339,30 +322,29 @@ class HybridBC(BoundaryCondition):
             f_1: Any,
             f_pre: Any,
             f_post: Any,
+            _rho: Any, 
+            _u: Any,
+            _relax:Any,
+            _norm_vec:Any,
+            _norm_dist:Any,
         ):
-            # This boundary condition uses the method of Tao et al (2018) [1] to get unknown populations on curved boundaries (denoted here by
-            # interpolated_nonequilibrium_bounceback method). To further stabilize this BC, we add regularization technique of [2].
-            # [1] Tao, Shi, et al. "One-point second-order curved boundary condition for lattice Boltzmann simulation of suspended particles."
-            #     Computers & Mathematics with Applications 76.7 (2018): 1593-1607.
-            # [2] Latt, J., Chopard, B., Malaspinas, O., Deville, M., Michler, A., 2008. Straight velocity
-            #     boundaries in the lattice Boltzmann method. Physical Review E 77, 056703.
+            # This boundary condition uses the method of Tao et al (2018) [1] to get unknown
+            # populations on curved boundaries, with regularization technique of [2].
+            # [1] Tao, Shi, et al. Computers & Mathematics with Applications 76.7 (2018): 1593-1607.
+            # [2] Latt, J., et al. Physical Review E 77, 056703.
 
-            # Apply interpolated bounceback first to find missing populations at the boundary
-            u_wall = self.profile_functional(f_1, index, timestep)
+            u_wall_physical = self.profile_functional(f_1, index, timestep)
 
-            # Compute effective wall velocity from wall model
-            if wp.static(self.use_wall_model):                           
-                u_wall = self.bc_helper.compute_wall_modeled_velocity(
-                    index,
-                    _missing_mask,
-                    f_0,
-                    f_1,
-                    f_pre,
-                    f_post,
-                    u_wall,
-                    nu,     
-                )   
-                
+            if wp.static(self.use_wall_model):                
+                #u_wall_effective = u_wall_physical
+                relax = compute_dtype(wp.neon_read(_relax, index, 0))
+                u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
+                    index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
+                )
+                wp.neon_write(_relax, index, 0, relax_new)
+            else:
+                u_wall_effective = u_wall_physical
+
             f_post = self.bc_helper.interpolated_nonequilibrium_bounceback(
                 index,
                 _missing_mask,
@@ -370,19 +352,15 @@ class HybridBC(BoundaryCondition):
                 f_1,
                 f_pre,
                 f_post,
-                u_wall,
+                u_wall_effective,
                 wp.static(self.needs_moving_wall_treatment),
                 wp.static(self.needs_mesh_distance),
             )
-
-            # Compute density, velocity using all f_post-streaming values
+            
             rho, u = self.macroscopic.warp_functional(f_post)
-
-            # Regularize the resulting populations
-            feq = self.equilibrium.warp_functional(rho, u)
-
-           
+            feq = self.equilibrium.warp_functional(rho, u)          
             f_post = self.bc_helper.regularize_fpop(f_post, feq)
+
             return f_post
 
         if self.bc_method == "bounceback_regularized":

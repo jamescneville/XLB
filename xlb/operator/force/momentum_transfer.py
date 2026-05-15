@@ -79,6 +79,11 @@ class FetchPopulations(Operator):
             f_0: Any,
             f_1: Any,
             _missing_mask: Any,
+            _rho: Any,
+            _u: Any,
+            _relax: Any, 
+            _norm_vec_pn: Any,
+            _norm_dist_pn: Any,
         ):
             # Get the distribution function
             f_post_collision = _f_vec()
@@ -88,7 +93,7 @@ class FetchPopulations(Operator):
             # Apply streaming (pull method)
             timestep = 0
             f_post_stream = self.stream_functional(f_0, index)
-            f_post_stream = self.bc_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream)
+            f_post_stream = self.bc_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
             return f_post_collision, f_post_stream
 
         @wp.func
@@ -97,6 +102,11 @@ class FetchPopulations(Operator):
             f_0: Any,
             f_1: Any,
             _missing_mask: Any,
+            _rho: Any,
+            _u: Any,
+            _relax:Any, 
+            _norm_vec_pn: Any,
+            _norm_dist_pn: Any,
         ):
             # Get the distribution function
             f_post_collision = _f_vec()
@@ -229,7 +239,12 @@ class MomentumTransfer(Operator):
             f_1: Any,
             bc_mask: Any,
             missing_mask: Any,
-            force: Any,
+            force: Any,            
+            _rho: Any,
+            _u: Any,
+            _relax: Any,
+            _norm_vec_pn: Any,
+            _norm_dist_pn: Any,
         ):
             # Get the boundary id
             _boundary_id = self.read_field(bc_mask, index, 0)
@@ -247,7 +262,7 @@ class MomentumTransfer(Operator):
             m = _u_vec()
             if is_edge:
                 # fetch the post-collision and post-streaming populations
-                f_post_collision, f_post_stream = self.fetcher_functional(index, f_0, f_1, _missing_mask)
+                f_post_collision, f_post_stream = self.fetcher_functional(index, f_0, f_1, _missing_mask, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
 
                 # Compute the momentum transfer
                 for d in range(self.velocity_set.d):
@@ -270,6 +285,11 @@ class MomentumTransfer(Operator):
             bc_mask: wp.array4d(dtype=wp.uint8),
             missing_mask: wp.array4d(dtype=wp.uint8),
             force: wp.array(dtype=Any),
+            _rho: wp.array(dtype=Any),
+            _u: wp.array(dtype=Any),
+            _relax: wp.array(dtype=Any),
+            _norm_vec_pn: wp.array4d(dtype=Any),
+            _norm_dist_pn: wp.array4d(dtype=Any),
         ):
             # Get the global index
             i, j, k = wp.tid()
@@ -283,12 +303,17 @@ class MomentumTransfer(Operator):
                 bc_mask,
                 missing_mask,
                 force,
+                _rho,
+                _u,
+                _relax,
+                _norm_vec_pn,
+                _norm_dist_pn
             )
 
         return functional, kernel
 
     @Operator.register_backend(ComputeBackend.WARP)
-    def warp_implementation(self, f_0, f_1, bc_mask, missing_mask):
+    def warp_implementation(self, f_0, f_1, bc_mask, missing_mask, _rho, _u, _relax,_norm_vec_pn,_norm_dist_pn):
         # Ensure the force is initialized to zero
         self.force *= 0.0
 
@@ -298,7 +323,7 @@ class MomentumTransfer(Operator):
         # Launch the warp kernel
         wp.launch(
             self.warp_kernel,
-            inputs=[f_0, f_1, bc_mask, missing_mask, self.force],
+            inputs=[f_0, f_1, bc_mask, missing_mask, self.force, _rho, _u, _relax,_norm_vec_pn,_norm_dist_pn],
             dim=f_0.shape[1:],
         )
         return self.force.numpy()[0]
@@ -313,7 +338,12 @@ class MomentumTransfer(Operator):
             f_1: Any,
             bc_mask: Any,
             missing_mask: Any,
-            force: Any,
+            force: Any,            
+            _rho: Any,
+            _u: Any,
+            _relax:Any,             
+            _norm_vec: Any,
+            _norm_dist: Any,
         ):
             def container_launcher(loader: neon.Loader):
                 loader.set_grid(bc_mask.get_grid())
@@ -321,6 +351,11 @@ class MomentumTransfer(Operator):
                 missing_mask_pn = loader.get_write_handle(missing_mask)
                 f_0_pn = loader.get_write_handle(f_0)
                 f_1_pn = loader.get_write_handle(f_1)
+                _rho0_pn = loader.get_mres_read_handle(_rho)
+                _u0_pn = loader.get_mres_read_handle(_u)
+                _relax_pn = loader.get_mres_read_handle(_relax)
+                _norm_vec_pn = loader.get_mres_read_handle(_norm_vec)
+                _norm_dist_pn = loader.get_mres_read_handle(_norm_dist)
 
                 @wp.func
                 def container_kernel(index: Any):
@@ -332,6 +367,11 @@ class MomentumTransfer(Operator):
                         bc_mask_pn,
                         missing_mask_pn,
                         force,
+                        _rho0_pn,
+                        _u0_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn
                     )
 
                 loader.declare_kernel(container_kernel)
@@ -347,6 +387,11 @@ class MomentumTransfer(Operator):
         f_1,
         bc_mask,
         missing_mask,
+        _rho,
+        _u,
+        _relax,
+        _norm_vec_pn,
+        _norm_dist_pn,
         stream=0,
     ):
         # Ensure the force is initialized to zero
@@ -356,6 +401,6 @@ class MomentumTransfer(Operator):
         self.fetcher_functional = self.fetcher.neon_functional
 
         # Launch the neon container
-        c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force)
+        c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, _rho, _u, _relax,_norm_vec_pn,_norm_dist_pn)
         c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
         return self.force.numpy()[0]

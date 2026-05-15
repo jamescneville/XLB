@@ -64,6 +64,11 @@ class MultiresMomentumTransfer(MomentumTransfer):
             bc_mask: Any,
             missing_mask: Any,
             force: Any,
+            _rho: Any,
+            _u: Any,
+            _relax: Any,           
+            _norm_vec: Any,
+            _norm_dist: Any,
             level: Any,
         ):
             def container_launcher(loader: neon.Loader):
@@ -72,6 +77,13 @@ class MultiresMomentumTransfer(MomentumTransfer):
                 missing_mask_pn = loader.get_mres_write_handle(missing_mask)
                 f_0_pn = loader.get_mres_write_handle(f_0)
                 f_1_pn = loader.get_mres_write_handle(f_1)
+                _rho0_pn = loader.get_mres_read_handle(_rho)
+                _u0_pn = loader.get_mres_read_handle(_u)
+                _relax_pn = loader.get_mres_read_handle(_relax)
+                _norm_vec_pn = loader.get_mres_read_handle(_norm_vec)
+                _norm_dist_pn = loader.get_mres_read_handle(_norm_dist)
+
+
 
                 @wp.func
                 def container_kernel(index: Any):
@@ -83,6 +95,11 @@ class MultiresMomentumTransfer(MomentumTransfer):
                         bc_mask_pn,
                         missing_mask_pn,
                         force,
+                        _rho0_pn,
+                        _u0_pn,
+                        _relax_pn,                        
+                        _norm_vec_pn,
+                        _norm_dist_pn
                     )
 
                 loader.declare_kernel(container_kernel)
@@ -98,8 +115,16 @@ class MultiresMomentumTransfer(MomentumTransfer):
         f_1,
         bc_mask,
         missing_mask,
+        _rho=None,
+        _u=None,
+        _relax=None,
+        _norm_vec_pn=None,
+        _norm_dist_pn=None,
         stream=0,
     ):
+        if _rho is None or _u is None:
+            raise TypeError("rho and u must be provided: momentum_transfer(f_0, f_1, bc_mask, missing_mask, rho, u)")
+
         # Ensure the force is initialized to zero
         self.force *= self.compute_dtype(0.0)
 
@@ -109,6 +134,6 @@ class MultiresMomentumTransfer(MomentumTransfer):
         grid = bc_mask.get_grid()
         for level in range(grid.num_levels):
             # Launch the neon container
-            c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, level)
+            c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, _rho, _u,_relax, _norm_vec_pn, _norm_dist_pn, level)
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
         return self.force.numpy()[0]

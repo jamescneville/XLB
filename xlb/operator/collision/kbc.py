@@ -27,9 +27,16 @@ class KBC(Collision):
         velocity_set: VelocitySet = None,
         precision_policy=None,
         compute_backend=None,
+        smagorinsky_constant = 0.0
     ):
         self.momentum_flux = MomentumFlux()
-        self.epsilon = 1e-8
+        self.epsilon = 1e-7
+        # Smagorinsky constant - tuned for automotive aero applications
+        # Typical values: 0.1 (light), 0.15 (moderate), 0.2 (strong damping)
+        self.smagorinsky_constant = smagorinsky_constant
+        print(f" Smagorinsky Constant: {smagorinsky_constant}")
+        # Precompute (C_s * delta)^2, assuming delta = 1 in lattice units
+        self.cs2_delta2 = self.smagorinsky_constant ** 2
 
         super().__init__(
             velocity_set=velocity_set,
@@ -188,34 +195,38 @@ class KBC(Collision):
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _epsilon = wp.constant(self.compute_dtype(self.epsilon))
+        _cs2_delta2 = wp.constant(self.compute_dtype(self.cs2_delta2))
+        _inv_cs2 = wp.constant(self.compute_dtype(self.velocity_set.inv_cs2))
 
         @wp.func
-        def decompose_shear_d2q9(fneq: Any):
-            pi = self.momentum_flux.warp_functional(fneq)
-            N = pi[0] - pi[2]
+        def decompose_shear_d2q9(pineq: Any):
+            #pi = self.momentum_flux.warp_functional(fneq)
+            N = pineq[0] - pineq[2]
             s = _f_vec()
             s[3] = N
             s[6] = N
             s[2] = -N
             s[1] = -N
-            s[8] = pi[1]
-            s[4] = -pi[1]
-            s[5] = -pi[1]
-            s[7] = pi[1]
+            s[8] = pineq[1]
+            s[4] = -pineq[1]
+            s[5] = -pineq[1]
+            s[7] = pineq[1]
             return s
 
         # Construct functional for decomposing shear
         @wp.func
         def decompose_shear_d3q27(
-            fneq: Any,
+            pineq: Any,
         ):
             # Get momentum flux
-            pi = self.momentum_flux.warp_functional(fneq)
-            nxz = pi[0] - pi[5]
-            nyz = pi[3] - pi[5]
+            #pineq = self.momentum_flux.warp_functional(fneq)
+            nxz = pineq[0] - pineq[5]
+            nyz = pineq[3] - pineq[5]
 
             # set shear components
             s = _f_vec()
+            # for i in range(self.velocity_set.q):
+            #     s[i] = self.compute_dtype(0.0)
 
             # For c = (i, 0, 0), c = (0, j, 0) and c = (0, 0, k)
             two = self.compute_dtype(2.0)
@@ -230,53 +241,206 @@ class KBC(Collision):
             s[2] = (-nxz - nyz) * six
 
             # For c = (i, j, 0)
-            s[12] = pi[1] * four
-            s[24] = pi[1] * four
-            s[21] = -pi[1] * four
-            s[15] = -pi[1] * four
+            s[12] = pineq[1] * four
+            s[24] = pineq[1] * four
+            s[21] = -pineq[1] * four
+            s[15] = -pineq[1] * four
 
             # For c = (i, 0, k)
-            s[10] = pi[2] * four
-            s[20] = pi[2] * four
-            s[19] = -pi[2] * four
-            s[11] = -pi[2] * four
+            s[10] = pineq[2] * four
+            s[20] = pineq[2] * four
+            s[19] = -pineq[2] * four
+            s[11] = -pineq[2] * four
 
             # For c = (0, j, k)
-            s[8] = pi[4] * four
-            s[4] = pi[4] * four
-            s[7] = -pi[4] * four
-            s[5] = -pi[4] * four
+            s[8] = pineq[4] * four
+            s[4] = pineq[4] * four
+            s[7] = -pineq[4] * four
+            s[5] = -pineq[4] * four
 
             return s
 
-        # Construct functional for computing entropic scalar products
+        
         @wp.func
-        def compute_entropic_scalar_products(
+        def fused_entropic_products_and_gamma_bounds(
+            f: Any,
+            feq: Any,
             delta_s: Any,
             delta_h: Any,
-            feq: Any,
+            beta: Any,
+            f_floor: Any,   # e.g. _epsilon
         ):
-            temp = wp.cw_div(delta_h, feq)
-            # Neumaeir Summation of scalar products
+            """
+            Single-pass over q:
+            - compute entropic scalar products sp1, sp2 (with Neumaier compensation)
+            - compute gamma feasibility bounds [gamma_min, gamma_max] from fout >= f_floor
+
+            Returns: (sp1, sp2, gamma_min, gamma_max)
+            """
+            # Neumaier/Kahan-style compensated sums
             sp1 = self.compute_dtype(0.0)
             sp2 = self.compute_dtype(0.0)
-            c1 = self.compute_dtype(0.0)
-            c2 = self.compute_dtype(0.0)
+            c1  = self.compute_dtype(0.0)
+            c2  = self.compute_dtype(0.0)
 
-            for i in range(self.velocity_set.q):
-                x1 = temp[i] * delta_s[i]
+            # Wide initial bounds
+            gamma_min = self.compute_dtype(-1.0e6)
+            gamma_max = self.compute_dtype( 1.0e6)
+
+            # constants
+            zero = self.compute_dtype(0.0)
+            two  = self.compute_dtype(2.0)
+
+            _feq_floor = _epsilon
+            _ratio_max = self.compute_dtype(1e4)
+
+            for i in range(wp.static(self.velocity_set.q)):
+                # -------- entropic scalar products (sp1/sp2) --------
+                # Floor feq to prevent catastrophic division
+                feq_safe = wp.max(feq[i], _feq_floor)
+
+                temp_i = delta_h[i] / feq_safe
+                temp_i = wp.clamp(temp_i, -_ratio_max, _ratio_max)
+
+                # sp1 += temp_i * delta_s[i]  (compensated)
+                x1 = temp_i * delta_s[i]
                 y1 = x1 - c1
                 t1 = sp1 + y1
                 c1 = (t1 - sp1) - y1
                 sp1 = t1
 
-                x2 = temp[i] * delta_h[i]
+                # sp2 += temp_i * delta_h[i]  (compensated)
+                x2 = temp_i * delta_h[i]
                 y2 = x2 - c2
                 t2 = sp2 + y2
                 c2 = (t2 - sp2) - y2
                 sp2 = t2
 
-            return sp1, sp2
+                # -------- gamma feasibility bounds from positivity --------
+                # pre_i = f[i] - 2*beta*delta_s[i]
+                pre_i = f[i] - two * beta * delta_s[i]
+                headroom = pre_i - f_floor   # must keep >= 0 after gamma term
+
+                # fout_i = pre_i - beta*gamma*delta_h[i] >= f_floor
+                # => headroom - gamma*(beta*delta_h[i]) >= 0
+                coeff = beta * delta_h[i]
+
+                if coeff > _epsilon:
+                    # gamma <= headroom/coeff
+                    gamma_max = wp.min(gamma_max, headroom / coeff)
+                elif coeff < -_epsilon:
+                    # gamma >= headroom/coeff
+                    gamma_min = wp.max(gamma_min, headroom / coeff)
+                # else: no constraint
+            
+            return sp1, sp2, gamma_min, gamma_max
+
+        @wp.func
+        def apply_gamma_bounds(
+            gamma: Any,
+            gamma_min: Any,
+            gamma_max: Any,
+        ):
+            """
+            Clamp gamma to [gamma_min, gamma_max] if feasible;
+            otherwise fall back to gamma=2 (BGK-like).
+            Also applies your physics bounds [0, 20].
+            """
+            zero = self.compute_dtype(0.0)
+            two  = self.compute_dtype(2.0)
+
+            if gamma_min <= gamma_max:
+                gamma = wp.clamp(gamma, gamma_min, gamma_max)
+                gamma = wp.clamp(gamma, zero, self.compute_dtype(20.0))
+            else:
+                gamma = two
+            return gamma
+
+        @wp.func
+        def compute_smagorinsky_omega_d3q27(
+            omega: Any,
+            rho: Any,
+            pineq: Any,
+        ):
+            """Compute effective omega with Smagorinsky SGS for D3Q27."""
+            # Get momentum flux (Pi_neq)
+            #pi_neq = self.momentum_flux.warp_functional(fneq)
+            
+            # Extract stress components: [Pi_xx, Pi_xy, Pi_xz, Pi_yy, Pi_yz, Pi_zz]
+            Pi_xx = pineq[0]
+            Pi_xy = pineq[1]
+            Pi_xz = pineq[2]
+            Pi_yy = pineq[3]
+            Pi_yz = pineq[4]
+            Pi_zz = pineq[5]
+            
+            # Compute |Pi_neq|
+            two = self.compute_dtype(2.0)
+            Pi_neq_magnitude_sq = (
+                Pi_xx * Pi_xx + Pi_yy * Pi_yy + Pi_zz * Pi_zz +
+                two * (Pi_xy * Pi_xy + Pi_xz * Pi_xz + Pi_yz * Pi_yz)
+            )
+            Pi_neq_magnitude = wp.sqrt(Pi_neq_magnitude_sq + _epsilon)
+            
+            # Base relaxation time
+            one = self.compute_dtype(1.0)
+            tau_0 = one / omega
+            
+            # Compute discriminant
+            eighteen = self.compute_dtype(18.0)
+            discriminant = tau_0 * tau_0 + eighteen * _cs2_delta2 * Pi_neq_magnitude / (rho + _epsilon)
+            
+            # Effective relaxation time
+            half = self.compute_dtype(0.5)
+            tau_eff = half * (tau_0 + wp.sqrt(discriminant + _epsilon))
+            
+            # Clamp for stability
+            tau_min = self.compute_dtype(0.5001)
+            tau_eff = wp.max(tau_eff, tau_min)
+            
+            # Convert to omega
+            omega_eff = one / tau_eff
+            
+            return omega_eff
+        
+        @wp.func
+        def compute_smagorinsky_omega_d2q9(
+            omega: Any,
+            rho: Any,
+            pi_neq: Any,
+        ):
+            """Compute effective omega with Smagorinsky SGS for D2Q9."""
+                       
+            # Extract stress components: [Pi_xx, Pi_xy, Pi_yy]
+            Pi_xx = pi_neq[0]
+            Pi_xy = pi_neq[1]
+            Pi_yy = pi_neq[2]
+            
+            # Compute |Pi_neq|
+            two = self.compute_dtype(2.0)
+            Pi_neq_magnitude_sq = Pi_xx * Pi_xx + two * Pi_xy * Pi_xy + Pi_yy * Pi_yy
+            Pi_neq_magnitude = wp.sqrt(Pi_neq_magnitude_sq + _epsilon)
+            
+            # Base relaxation time
+            one = self.compute_dtype(1.0)
+            tau_0 = one / omega
+            
+            # Compute discriminant
+            eighteen = self.compute_dtype(18.0)
+            discriminant = tau_0 * tau_0 + eighteen * _cs2_delta2 * Pi_neq_magnitude / (rho + _epsilon)
+            
+            # Effective relaxation time
+            half = self.compute_dtype(0.5)
+            tau_eff = half * (tau_0 + wp.sqrt(discriminant + _epsilon))
+            
+            # Clamp for stability
+            tau_min = self.compute_dtype(0.5001)
+            tau_eff = wp.max(tau_eff, tau_min)
+            
+            # Convert to omega
+            omega_eff = one / tau_eff
+            
+            return omega_eff
 
         # Construct the functional
         @wp.func
@@ -289,25 +453,34 @@ class KBC(Collision):
         ):
             # Compute shear and delta_s
             fneq = f - feq
+            pineq = self.momentum_flux.warp_functional(fneq)
             if wp.static(self.velocity_set.d == 3):
-                shear = decompose_shear_d3q27(fneq)
-                delta_s = shear * rho
+                shear = decompose_shear_d3q27(pineq)
+                delta_s = shear 
+                omega_eff = compute_smagorinsky_omega_d3q27(omega, rho, pineq)
             else:
-                shear = decompose_shear_d2q9(fneq)
-                delta_s = shear * rho / self.compute_dtype(4.0)
+                shear = decompose_shear_d2q9(pineq)
+                delta_s = shear  / self.compute_dtype(4.0)
+                omega_eff = compute_smagorinsky_omega_d2q9(omega, rho, pineq)
 
             # Compute required constants based on the input omega (omega is the inverse relaxation time)
-            _beta = self.compute_dtype(0.5) * self.compute_dtype(omega)
+            _beta = self.compute_dtype(0.5) * self.compute_dtype(omega_eff)
             _inv_beta = self.compute_dtype(1.0) / _beta
 
             # Perform collision
             delta_h = fneq - delta_s
             two = self.compute_dtype(2.0)
-            sp1, sp2 = compute_entropic_scalar_products(delta_s, delta_h, feq)
-            gamma = _inv_beta - (two - _inv_beta) * sp1 / (_epsilon + sp2)
+            sp1, sp2, gmin, gmax = fused_entropic_products_and_gamma_bounds(f, feq, delta_s, delta_h, _beta, _epsilon)
+             
+            gamma = _inv_beta - (two - _inv_beta) * sp1 / wp.max(sp2, _epsilon)
+            # Update Gamma based on Positivity Range enforcement
+            gamma = apply_gamma_bounds(gamma, gmin, gmax)
+            
             fout = f - _beta * (two * delta_s + gamma * delta_h)
-
+            
             return fout
+
+            
 
         # Construct the warp kernel
         @wp.kernel
@@ -367,3 +540,4 @@ class KBC(Collision):
             dim=f.shape[1:],
         )
         return fout
+

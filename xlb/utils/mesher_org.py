@@ -6,6 +6,7 @@ import neon
 import warp as wp
 from xlb.utils.utils import UnitConvertor
 from scipy.spatial import cKDTree
+import gc
 
 
 def adjust_bbox(cuboid_max, cuboid_min, voxel_size_up):
@@ -162,909 +163,103 @@ class MultiresIO(object):
         """
         Initialize the MultiresIO object.
 
-        Aggressive performance path:
-        - process_geometry now builds merged geometry directly.
-        - _merge_duplicates is no longer called.
-        - centroids are built lazily.
-        - KDTree is built lazily.
-        - WARP/NEON export fields are allocated lazily in get_fields_data().
+        Parameters
+        ----------
+        field_name_cardinality_dict : dict
+            A dictionary mapping field names to their cardinalities.
+            Example: {'velocity_x': 1, 'velocity_y': 1, 'velocity': 3, 'density': 1}
+        levels_data : list of tuples
+            Each tuple contains (data, voxel_size, origin, level).
+        unit_convertor : UnitConvertor
+            An instance of the UnitConvertor class for unit conversions.
+        offset : tuple, optional
+            Offset to be applied to the coordinates.
+        store_precision : str, optional
+            The precision policy for storing data.
         """
-        import time
-
-        start_time = time.time()
-
+        # Set the unit convertor object
         self.unit_convertor = unit_convertor
-        self.field_name_cardinality_dict = field_name_cardinality_dict
-        self.levels_data = levels_data
-
-        # Set precision policy early, before any lazy WARP allocation.
-        from xlb import DefaultConfig
-
-        if store_precision is None:
-            self.store_precision = DefaultConfig.default_precision_policy.store_precision
-        else:
-            self.store_precision = store_precision
-
-        self.store_dtype = self.store_precision.wp_dtype
-
-        # Builds already-deduplicated geometry.
+        start_time = time.time()
+        # Process the multires geometry and extract coordinates and connectivity in the coordinate system of the finest level
         coordinates, connectivity, level_id_field, total_cells = self.process_geometry(levels_data)
 
+        # Ensure that coordinates and connectivity are not empty
         assert coordinates.size != 0, "Error: No valid data to process. Check the input levels_data."
 
-        # Transform coordinates to physical units and apply offset.
+        # Merge duplicate points
+        coordinates, connectivity = self._merge_duplicates(coordinates, connectivity, levels_data)
+
+        # Transform coordinates to physical units and apply offset if provided
         coordinates = self._transform_coordinates(coordinates, offset)
 
+        # Assign to self
+        self.field_name_cardinality_dict = field_name_cardinality_dict
+        self.levels_data = levels_data
         self.coordinates = coordinates
         self.connectivity = connectivity
         self.level_id_field = level_id_field
         self.total_cells = total_cells
+        self.centroids = np.mean(coordinates[connectivity], axis=1)
+        self.kd_tree = cKDTree(self.centroids)
+        
 
-        # Lazy expensive geometry-derived state.
-        self._centroids = None
-        self._kd_tree = None
+        # Set the default precision policy if not provided
+        from xlb import DefaultConfig
 
-        # Lazy WARP/NEON state.
-        self.field_warp_dict = {}
-        self.origin_list = None
-        self.container = None
+        if store_precision is None:
+            self.store_precision = DefaultConfig.default_precision_policy.store_precision
+            self.store_dtype = DefaultConfig.default_precision_policy.store_precision.wp_dtype
 
+        # Prepare and allocate the inputs for the NEON container
+        self.field_warp_dict, self.origin_list = self._prepare_container_inputs()
+
+        # Construct the NEON container for exporting multi-resolution data
+        self.container = self._construct_neon_container()
         # ---- Time-averaging state ----
         self._avg_sum: Dict[str, np.ndarray] = {}
         self._avg_weight: float = 0.0
         self._avg_active: bool = False
-
-        # Cached finalized averages.
+        # Cached finalized averages (to avoid re-dividing for every export)
         self._avg_final_cache: Optional[Dict[str, np.ndarray]] = None
         self._avg_cache_weight: float = 0.0
         self._avg_cache: bool = False
 
-        # Optional cache for derived quantities.
+        # Optional cache for derived quantities (e.g. velocity_magnitude)
         self._avg_derived_cache: Dict[str, np.ndarray] = {}
 
-        print(f"MutliResIO initialized in {time.time() - start_time}sec ")
+        print(f"MutliResIO initialized in {time.time()-start_time}sec ")
 
-    @property
-    def centroids(self):
-        """
-        Lazily compute cell centroids.
-
-        Avoids the huge temporary from:
-
-            coordinates[connectivity]
-
-        which has shape:
-
-            (num_cells, 8, 3)
-
-        For axis-aligned hex cells, corner 0 and corner 6 are opposite corners,
-        so their midpoint is the cell centroid.
-        """
-        if self._centroids is None:
-            self._centroids = 0.5 * (
-                self.coordinates[self.connectivity[:, 0]] +
-                self.coordinates[self.connectivity[:, 6]]
-            )
-
-        return self._centroids
-
-
-    @property
-    def kd_tree(self):
-        """
-        Lazily build KDTree only when slice/line/surface operations need it.
-        Plain HDF5 export does not need this during initialization.
-        """
-        if self._kd_tree is None:
-            from scipy.spatial import cKDTree
-
-            self._kd_tree = cKDTree(self.centroids)
-
-        return self._kd_tree
-
-    def _ensure_container_inputs(self, needed_field_names=None):
-        """
-        Lazily allocate WARP dense fields and construct the NEON container.
-
-        This avoids paying initialization cost for:
-        - fields that are never exported
-        - WARP allocations before to_hdf5 / slice / line / surface export
-        """
-        from xlb.compute_backend import ComputeBackend
-        from xlb.grid import grid_factory
-
-        try:
-            wp_mod = wp
-        except NameError:
-            import warp as wp_mod
-
-        if needed_field_names is None:
-            needed_field_names = set(self.field_name_cardinality_dict.keys())
-        else:
-            needed_field_names = set(needed_field_names)
-
-        if self.origin_list is None:
-            self.origin_list = [
-                wp_mod.vec3i(*([int(x) for x in self.levels_data[level][2]]))
-                for level in range(len(self.levels_data))
-            ]
-
-        for field_name in needed_field_names:
-            if field_name in self.field_warp_dict:
-                continue
-
-            cardinality = self.field_name_cardinality_dict[field_name]
-            self.field_warp_dict[field_name] = []
-
-            for level in range(len(self.levels_data)):
-                box_shape = self.levels_data[level][0].shape
-                grid_dense = grid_factory(box_shape, compute_backend=ComputeBackend.WARP)
-
-                self.field_warp_dict[field_name].append(
-                    grid_dense.create_field(
-                        cardinality=cardinality,
-                        dtype=self.store_precision,
-                    )
-                )
-
-        if self.container is None:
-            self.container = self._construct_neon_container()
-    
-    def _make_touched_vertex_mask(self, mask):
-        """
-        Given a cell mask of shape (nx, ny, nz), return a bool vertex mask
-        of shape (nx + 1, ny + 1, nz + 1) marking all vertices touched by
-        active cells.
-        """
-        import numpy as np
-
-        mask = np.asarray(mask, dtype=np.bool_)
-        nx, ny, nz = mask.shape
-
-        vmask = np.zeros((nx + 1, ny + 1, nz + 1), dtype=np.bool_)
-
-        vmask[:-1, :-1, :-1] |= mask
-        vmask[1:,  :-1, :-1] |= mask
-        vmask[1:,  1:,  :-1] |= mask
-        vmask[:-1, 1:,  :-1] |= mask
-
-        vmask[:-1, :-1, 1:] |= mask
-        vmask[1:,  :-1, 1:] |= mask
-        vmask[1:,  1:,  1:] |= mask
-        vmask[:-1, 1:,  1:] |= mask
-
-        return vmask
-
-    def _count_touched_vertices(self, mask):
-        """
-        Count touched vertices for one level.
-        """
-        import numpy as np
-
-        vmask = self._make_touched_vertex_mask(mask)
-        n = int(np.count_nonzero(vmask))
-        del vmask
-        return n
-
-    def _vertex_keys_from_vflat_chunk(
-        self,
-        vflat,
-        vshape,
-        meta,
-        qmin_global,
-        sx,
-        sy,
-        key_dtype,
-        inv_finest,
-    ):
-        """
-        Convert a chunk of flat per-level vertex-grid indices into global
-        collision-free lattice keys.
-
-        This is chunked to avoid materializing vx/vy/vz/x/y/z for the entire level.
-        """
-        import numpy as np
-
-        nxp1, nyp1, nzp1 = vshape
-
-        vz = vflat % nzp1
-        tmp = vflat // nzp1
-        vy = tmp % nyp1
-        vx = tmp // nyp1
-        del tmp
-
-        if meta["integer_stride"]:
-            stride_i = int(meta["stride_i"])
-            origin_q = meta["origin_q"]
-
-            x = origin_q[0] + vx.astype(np.int64, copy=False) * stride_i - qmin_global[0]
-            y = origin_q[1] + vy.astype(np.int64, copy=False) * stride_i - qmin_global[1]
-            z = origin_q[2] + vz.astype(np.int64, copy=False) * stride_i - qmin_global[2]
-        else:
-            voxel_size_f = float(meta["voxel_size"])
-            origin_physical = meta["origin_physical"]
-
-            x = np.rint(
-                (origin_physical[0] + vx.astype(np.float64) * voxel_size_f) * inv_finest
-            ).astype(np.int64)
-            y = np.rint(
-                (origin_physical[1] + vy.astype(np.float64) * voxel_size_f) * inv_finest
-            ).astype(np.int64)
-            z = np.rint(
-                (origin_physical[2] + vz.astype(np.float64) * voxel_size_f) * inv_finest
-            ).astype(np.int64)
-
-            x -= qmin_global[0]
-            y -= qmin_global[1]
-            z -= qmin_global[2]
-
-        del vx, vy, vz
-
-        x = x.astype(key_dtype, copy=False)
-        y = y.astype(key_dtype, copy=False)
-        z = z.astype(key_dtype, copy=False)
-
-        keys = x + sx * (y + sy * z)
-
-        del x, y, z
-
-        return keys
-
-    def _fill_vertex_ids_from_rows(
-        self,
-        vertex_ids,
-        vmask,
-        meta,
-        unique_keys,
-        qmin_global,
-        sx,
-        sy,
-        key_dtype,
-        debug_validate=False,
-    ):
-        """
-        Fill the temporary per-level vertex_ids grid by mapping touched vertices
-        to global unique point ids row-by-row.
-
-        This avoids doing np.searchsorted(unique_keys, keys) over the full global
-        unique_keys array for every touched vertex.
-
-        Requires integer_stride=True, which is the normal path for voxel sizes
-        that are integer multiples of the finest voxel.
-        """
-        import numpy as np
-
-        if not meta["integer_stride"]:
-            return False
-
-        vmask = np.asarray(vmask, dtype=np.bool_)
-        nxp1, nyp1, nzp1 = vmask.shape
-
-        origin_q = meta["origin_q"]
-        stride_i = int(meta["stride_i"])
-
-        sx_int = int(sx)
-        sy_int = int(sy)
-
-        # Local x coordinates can be reused for every row.
-        local_x_all = np.arange(nxp1, dtype=np.int64)
-
-        for vz in range(nzp1):
-            qz = int(origin_q[2] + vz * stride_i - qmin_global[2])
-
-            for vy in range(nyp1):
-                row = vmask[:, vy, vz]
-
-                if not row.any():
-                    continue
-
-                xs = np.flatnonzero(row)
-                qx = origin_q[0] + local_x_all[xs] * stride_i - qmin_global[0]
-
-                qy = int(origin_q[1] + vy * stride_i - qmin_global[1])
-
-                line_id = qy + sy_int * qz
-                line_base = sx_int * line_id
-
-                row_start_key = key_dtype(line_base)
-                row_end_key = key_dtype(line_base + sx_int)
-
-                lo = int(np.searchsorted(unique_keys, row_start_key, side="left"))
-                hi = int(np.searchsorted(unique_keys, row_end_key, side="left"))
-
-                if hi <= lo:
-                    raise RuntimeError(
-                        "Internal error while filling vertex ids: empty global key row."
-                    )
-
-                row_unique_x = unique_keys[lo:hi] - key_dtype(line_base)
-
-                qx_key = qx.astype(key_dtype, copy=False)
-                pos = np.searchsorted(row_unique_x, qx_key, side="left")
-
-                ids = lo + pos
-
-                if debug_validate:
-                    if np.any(pos >= row_unique_x.size):
-                        raise RuntimeError("Vertex key lookup failed: position outside row.")
-                    if np.any(row_unique_x[pos] != qx_key):
-                        raise RuntimeError("Vertex key lookup failed: key mismatch.")
-
-                vflat = (xs.astype(np.int64) * nyp1 + vy) * nzp1 + vz
-                vertex_ids[vflat] = ids.astype(np.int32, copy=False)
-
-        return True
-
-    def _iter_touched_vertex_key_chunks(
-        self,
-        mask,
-        meta,
-        qmin_global,
-        sx,
-        sy,
-        key_dtype,
-        inv_finest,
-        flat_chunk_vertices=8_000_000,
-        vmask=None,
-    ):
-        """
-        Yield chunks of touched vertex keys for one level.
-
-        If vmask is provided, it is reused instead of rebuilt. This avoids
-        repeatedly materializing the same (nx + 1, ny + 1, nz + 1) bool array.
-        """
-        import numpy as np
-
-        owns_vmask = False
-
-        if vmask is None:
-            mask = np.asarray(mask, dtype=np.bool_)
-            nx, ny, nz = mask.shape
-            vshape = (nx + 1, ny + 1, nz + 1)
-            vmask = self._make_touched_vertex_mask(mask)
-            owns_vmask = True
-        else:
-            vmask = np.asarray(vmask, dtype=np.bool_)
-            vshape = vmask.shape
-
-        vmask_flat = vmask.ravel()
-        total_vertices = int(vmask_flat.size)
-
-        try:
-            for base in range(0, total_vertices, flat_chunk_vertices):
-                end = min(base + flat_chunk_vertices, total_vertices)
-
-                local = np.flatnonzero(vmask_flat[base:end])
-                if local.size == 0:
-                    continue
-
-                vflat = local.astype(np.int64, copy=False)
-                vflat += np.int64(base)
-
-                keys = self._vertex_keys_from_vflat_chunk(
-                    vflat=vflat,
-                    vshape=vshape,
-                    meta=meta,
-                    qmin_global=qmin_global,
-                    sx=sx,
-                    sy=sy,
-                    key_dtype=key_dtype,
-                    inv_finest=inv_finest,
-                )
-
-                yield keys, vflat, vshape
-
-                del keys, vflat, local
-
-        finally:
-            del vmask_flat
-            if owns_vmask:
-                del vmask
-    
-    def _fill_connectivity_from_level_vertices(
-        self,
-        connectivity,
-        dst0,
-        mask,
-        meta,
-        unique_keys,
-        qmin_global,
-        sx,
-        sy,
-        key_dtype,
-        inv_finest,
-        flat_chunk_vertices=16_000_000,
-        flat_chunk_cells=16_000_000,
-        vmask=None,
-    ):
-        """
-        Fill connectivity for one level.
-
-        Fast path:
-        - Reuse cached vmask.
-        - Fill vertex_ids row-by-row using the structured key layout.
-        - Avoid global np.searchsorted(unique_keys, keys) for every touched vertex.
-
-        Fallback:
-        - For non-integer voxel ratios, use the chunked key-generation path.
-        """
-        import time
-        import numpy as np
-
-        tic_total = time.perf_counter()
-
-        mask = np.asarray(mask, dtype=np.bool_)
-        nx, ny, nz = mask.shape
-
-        if vmask is not None:
-            vmask = np.asarray(vmask, dtype=np.bool_)
-            vshape = vmask.shape
-        else:
-            vshape = (nx + 1, ny + 1, nz + 1)
-            vmask = self._make_touched_vertex_mask(mask)
-
-        vertex_ids = np.full(int(np.prod(vshape)), -1, dtype=np.int32)
-
-        # ---------------------------------------------------------------------
-        # Fast integer-stride path.
-        # This is the important new optimization.
-        # ---------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        used_row_fast_path = self._fill_vertex_ids_from_rows(
-            vertex_ids=vertex_ids,
-            vmask=vmask,
-            meta=meta,
-            unique_keys=unique_keys,
-            qmin_global=qmin_global,
-            sx=sx,
-            sy=sy,
-            key_dtype=key_dtype,
-            debug_validate=False,
-        )
-
-        # ---------------------------------------------------------------------
-        # Fallback for non-integer voxel-size ratios.
-        # ---------------------------------------------------------------------
-        if not used_row_fast_path:
-            for keys, vflat, _ in self._iter_touched_vertex_key_chunks(
-                mask=mask,
-                meta=meta,
-                qmin_global=qmin_global,
-                sx=sx,
-                sy=sy,
-                key_dtype=key_dtype,
-                inv_finest=inv_finest,
-                flat_chunk_vertices=flat_chunk_vertices,
-                vmask=vmask,
-            ):
-                ids = np.searchsorted(unique_keys, keys).astype(np.int32)
-                vertex_ids[vflat] = ids
-                del ids
-
-        toc = time.perf_counter()
-        print(f"\t\tMapped level {meta['level']} vertex ids in {toc - tic:.2f} seconds")
-
-        # ---------------------------------------------------------------------
-        # Fill cell connectivity from the temporary vertex_ids grid.
-        # ---------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        mask_flat = mask.ravel()
-        total_flat_cells = int(mask_flat.size)
-
-        sy_v = nz + 1
-        sx_v = (ny + 1) * (nz + 1)
-
-        corner_offsets = np.array(
-            [
-                0,
-                sx_v,
-                sx_v + sy_v,
-                sy_v,
-                1,
-                sx_v + 1,
-                sx_v + sy_v + 1,
-                sy_v + 1,
-            ],
-            dtype=np.int64,
-        )
-
-        written = 0
-
-        for base_flat in range(0, total_flat_cells, flat_chunk_cells):
-            end_flat = min(base_flat + flat_chunk_cells, total_flat_cells)
-
-            local = np.flatnonzero(mask_flat[base_flat:end_flat])
-            if local.size == 0:
-                continue
-
-            cf = local.astype(np.int64, copy=False)
-            cf += np.int64(base_flat)
-
-            cz = cf % nz
-            tmp = cf // nz
-            cy = tmp % ny
-            cx = tmp // ny
-            del tmp, cf
-
-            base_vertex = cx * sx_v + cy * sy_v + cz
-
-            out0 = dst0 + written
-            out1 = out0 + int(local.size)
-
-            for c, off in enumerate(corner_offsets):
-                connectivity[out0:out1, c] = vertex_ids[base_vertex + off]
-
-            written += int(local.size)
-
-            del local, cx, cy, cz, base_vertex
-
-        toc = time.perf_counter()
-        print(f"\t\tFilled level {meta['level']} cell connectivity in {toc - tic:.2f} seconds")
-
-        del vertex_ids
-
-        toc_total = time.perf_counter()
-        print(f"\t\tFinished level {meta['level']} connectivity in {toc_total - tic_total:.2f} seconds")
-        
     def process_geometry(self, levels_data):
-        """
-        Low-peak-RAM touched-vertex geometry builder with cached per-level vmask.
+        num_voxels_per_level = [np.sum(data) for data, _, _, _ in levels_data]
+        num_points_per_level = [8 * nv for nv in num_voxels_per_level]
+        point_id_offsets = np.cumsum([0] + num_points_per_level[:-1])
 
-        Improvements over the previous chunked version:
-        - Builds each touched vertex mask once.
-        - Reuses cached vmask during key generation.
-        - Reuses cached vmask during connectivity construction.
-        - Frees each cached vmask after that level's connectivity is built.
-        """
-        import time
-        import numpy as np
-
-        tic_total = time.perf_counter()
-
-        # Tune these.
-        # Larger chunks are usually faster but use more transient memory.
-        flat_chunk_vertices = 8_000_000
-        flat_chunk_cells = 8_000_000
-
-        finest_voxel = min(float(voxel_size) for (_, voxel_size, _, _) in levels_data)
-        inv_finest = 1.0 / finest_voxel
-
-        num_levels = len(levels_data)
-
-        cells_per_level = [0] * num_levels
-        touched_vertices_per_level = [0] * num_levels
-        level_meta = [None] * num_levels
-
-        # Cached touched vertex masks.
-        # This intentionally keeps one bool vertex mask per non-empty level so we
-        # do not rebuild it in the second and third passes.
-        level_vmasks = [None] * num_levels
-
+        all_corners = []
+        all_connectivity = []
+        level_id_field = []
         total_cells = 0
 
-        qmin_global = np.full(3, np.iinfo(np.int64).max, dtype=np.int64)
-        qmax_global = np.full(3, np.iinfo(np.int64).min, dtype=np.int64)
-
-        tic = time.perf_counter()
-
-        # -------------------------------------------------------------------------
-        # First pass:
-        #   - count active cells
-        #   - compute active-cell bounding boxes
-        #   - compute global quantized vertex bounding box
-        #   - build and cache touched vertex mask once per level
-        # -------------------------------------------------------------------------
         for level_idx, (data, voxel_size, origin, level) in enumerate(levels_data):
-            mask = np.asarray(data, dtype=np.bool_)
-            shape = mask.shape
+            origin = origin * voxel_size
+            corners_list, conn_list = self._process_level(data, voxel_size, origin, point_id_offsets[level_idx])
 
-            n_cells = int(np.count_nonzero(mask))
-            cells_per_level[level_idx] = n_cells
-            total_cells += n_cells
-
-            voxel_size_f = float(voxel_size)
-            origin_arr = np.asarray(origin, dtype=np.float64)
-            origin_physical = origin_arr * voxel_size_f
-
-            stride_f = voxel_size_f / finest_voxel
-            stride_i = int(round(stride_f))
-            integer_stride = np.isclose(stride_f, stride_i, rtol=0.0, atol=1e-9)
-
-            origin_q = np.rint(origin_physical * inv_finest).astype(np.int64)
-
-            meta = {
-                "shape": shape,
-                "voxel_size": voxel_size_f,
-                "origin_physical": origin_physical,
-                "origin_q": origin_q,
-                "stride_i": stride_i,
-                "integer_stride": bool(integer_stride),
-                "level": level,
-            }
-            level_meta[level_idx] = meta
-
-            if n_cells == 0:
-                print(f"\tSkipping level {level} (no unique data)")
-                continue
-
-            # Bounding box via axis projections.
-            xs = np.flatnonzero(mask.any(axis=(1, 2)))
-            ys = np.flatnonzero(mask.any(axis=(0, 2)))
-            zs = np.flatnonzero(mask.any(axis=(0, 1)))
-
-            idx_min = np.array([xs[0], ys[0], zs[0]], dtype=np.int64)
-            idx_max = np.array([xs[-1], ys[-1], zs[-1]], dtype=np.int64)
-
-            del xs, ys, zs
-
-            if integer_stride:
-                level_qmin = origin_q + idx_min * stride_i
-                level_qmax = origin_q + (idx_max + 1) * stride_i
+            if corners_list:
+                print(f"\tProcessing level {level}: Voxel size {voxel_size}, Origin {origin}, Shape {data.shape}")
+                all_corners.extend(corners_list)
+                all_connectivity.extend(conn_list)
+                num_cells = sum(c.shape[0] for c in conn_list)
+                level_id_field.extend([level] * num_cells)
+                total_cells += num_cells
             else:
-                level_min_physical = origin_physical + idx_min.astype(np.float64) * voxel_size_f
-                level_max_physical = origin_physical + (idx_max.astype(np.float64) + 1.0) * voxel_size_f
+                print(f"\tSkipping level {level} (no unique data)")
 
-                level_qmin = np.rint(level_min_physical * inv_finest).astype(np.int64)
-                level_qmax = np.rint(level_max_physical * inv_finest).astype(np.int64)
-
-            qmin_global = np.minimum(qmin_global, level_qmin)
-            qmax_global = np.maximum(qmax_global, level_qmax)
-
-            # Build the touched vertex mask once and keep it.
-            vmask = self._make_touched_vertex_mask(mask)
-            n_touched_vertices = int(np.count_nonzero(vmask))
-
-            level_vmasks[level_idx] = vmask
-            touched_vertices_per_level[level_idx] = n_touched_vertices
-
-            print(
-                f"\tProcessing level {level}: "
-                f"Voxel size {voxel_size}, Origin {origin_physical}, "
-                f"Shape {shape}, Cells {n_cells:,}, "
-                f"Touched vertices {n_touched_vertices:,}"
-            )
-
-        toc = time.perf_counter()
-        print(f"\tGeometry first pass in {toc - tic:.2f} seconds")
-
-        if total_cells == 0:
-            self._cells_per_level = np.zeros(num_levels, dtype=np.int64)
-            self._level_cell_offsets = np.zeros(num_levels + 1, dtype=np.int64)
-            self._finest_voxel = finest_voxel
-
-            return (
-                np.empty((0, 3), dtype=np.float32),
-                np.empty((0, 8), dtype=np.int32),
-                np.empty((0,), dtype=np.uint8),
-                0,
-            )
-
-        cells_per_level_np = np.asarray(cells_per_level, dtype=np.int64)
-        level_cell_offsets = np.empty(num_levels + 1, dtype=np.int64)
-        level_cell_offsets[0] = 0
-        np.cumsum(cells_per_level_np, out=level_cell_offsets[1:])
-
-        self._cells_per_level = cells_per_level_np
-        self._level_cell_offsets = level_cell_offsets
-        self._finest_voxel = finest_voxel
-
-        spans = qmax_global - qmin_global + 1
-
-        if np.any(spans <= 0):
-            raise ValueError("Invalid quantized coordinate span while building merged geometry.")
-
-        total_span = int(spans[0]) * int(spans[1]) * int(spans[2])
-
-        if total_span <= np.iinfo(np.uint32).max:
-            key_dtype = np.uint32
-        elif total_span < 2**64:
-            key_dtype = np.uint64
-        else:
-            raise OverflowError(
-                "Quantized coordinate bounding box is too large for uint64 hashing. "
-                "Use a lexsort or structured-array fallback for this dataset."
-            )
-
-        sx = key_dtype(spans[0])
-        sy = key_dtype(spans[1])
-        plane = key_dtype(spans[0]) * key_dtype(spans[1])
-
-        total_touched_vertices = int(np.sum(np.asarray(touched_vertices_per_level, dtype=np.int64)))
-
-        print(
-            f"\tQuantized span {tuple(int(s) for s in spans)}, "
-            f"total span {total_span:,}, key dtype {np.dtype(key_dtype).name}"
-        )
-        print(
-            f"\tSorting touched vertex keys: {total_touched_vertices:,} candidate vertices "
-            f"instead of {total_cells * 8:,} raw cell corners"
-        )
-
-        # -------------------------------------------------------------------------
-        # Second pass:
-        #   - generate touched vertex keys only
-        #   - reuse cached vmask
-        # -------------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        all_vertex_keys = np.empty(total_touched_vertices, dtype=key_dtype)
-
-        write0 = 0
-
-        for level_idx, (data, voxel_size, origin, level) in enumerate(levels_data):
-            n_expected = int(touched_vertices_per_level[level_idx])
-            if n_expected == 0:
-                continue
-
-            wrote_level = 0
-
-            for keys, _, _ in self._iter_touched_vertex_key_chunks(
-                mask=data,
-                meta=level_meta[level_idx],
-                qmin_global=qmin_global,
-                sx=sx,
-                sy=sy,
-                key_dtype=key_dtype,
-                inv_finest=inv_finest,
-                flat_chunk_vertices=flat_chunk_vertices,
-                vmask=level_vmasks[level_idx],
-            ):
-                n = int(keys.size)
-                all_vertex_keys[write0:write0 + n] = keys
-                write0 += n
-                wrote_level += n
-
-            assert wrote_level == n_expected, (
-                f"Touched vertex count mismatch at level {level}: "
-                f"expected {n_expected}, wrote {wrote_level}"
-            )
-
-        assert write0 == total_touched_vertices
-
-        toc = time.perf_counter()
-        print(f"\tGenerated touched vertex keys in {toc - tic:.2f} seconds")
-
-        # -------------------------------------------------------------------------
-        # Sort and deduplicate global vertex keys.
-        # -------------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        all_vertex_keys.sort(kind="quicksort")
-
-        unique_mask = np.empty(total_touched_vertices, dtype=np.bool_)
-        unique_mask[0] = True
-        np.not_equal(all_vertex_keys[1:], all_vertex_keys[:-1], out=unique_mask[1:])
-
-        # Boolean indexing already returns a copy.
-        unique_keys = all_vertex_keys[unique_mask]
-
-        del all_vertex_keys, unique_mask
-
-        num_unique = int(unique_keys.size)
-
-        if num_unique > np.iinfo(np.int32).max:
-            raise OverflowError("Too many unique points for int32 connectivity.")
-
-        toc = time.perf_counter()
-        print(f"\tSorted and deduplicated to {num_unique:,} unique keys in {toc - tic:.2f} seconds")
-
-        # -------------------------------------------------------------------------
-        # Third pass:
-        #   - build final connectivity from per-level temporary vertex-id grids
-        #   - reuse cached vmask
-        #   - free each cached vmask once its level is done
-        # -------------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        connectivity = np.empty((total_cells, 8), dtype=np.int32)
-        level_id_field = np.empty(total_cells, dtype=np.uint8)
-
-        for level_idx, (data, voxel_size, origin, level) in enumerate(levels_data):
-            n_cells = int(cells_per_level[level_idx])
-            if n_cells == 0:
-                continue
-
-            cell_start = int(level_cell_offsets[level_idx])
-            cell_end = int(level_cell_offsets[level_idx + 1])
-
-            level_id_field[cell_start:cell_end] = np.uint8(level)
-
-            self._fill_connectivity_from_level_vertices(
-                connectivity=connectivity,
-                dst0=cell_start,
-                mask=data,
-                meta=level_meta[level_idx],
-                unique_keys=unique_keys,
-                qmin_global=qmin_global,
-                sx=sx,
-                sy=sy,
-                key_dtype=key_dtype,
-                inv_finest=inv_finest,
-                flat_chunk_vertices=flat_chunk_vertices,
-                flat_chunk_cells=flat_chunk_cells,
-                vmask=level_vmasks[level_idx],
-            )
-
-            # Free this level's cached vertex mask as soon as it is no longer needed.
-            level_vmasks[level_idx] = None
-
-        toc = time.perf_counter()
-        print(f"\tBuilt connectivity in {toc - tic:.2f} seconds")
-
-        # Optional debug check. Keep disabled for timing.
-        debug_validate_connectivity = False
-        if debug_validate_connectivity:
-            if np.any(connectivity < 0):
-                raise RuntimeError("Connectivity contains negative vertex ids.")
-            if int(connectivity.max()) >= num_unique:
-                raise RuntimeError("Connectivity contains vertex ids outside unique point range.")
-
-        # -------------------------------------------------------------------------
-        # Reconstruct unique coordinates from sorted unique integer lattice keys.
-        # -------------------------------------------------------------------------
-        tic = time.perf_counter()
-
-        z = unique_keys // plane
-        rem = unique_keys - z * plane
-        y = rem // sx
-        x = rem - y * sx
-
-        del unique_keys, rem
-
-        coordinates = np.empty((num_unique, 3), dtype=np.float32)
-
-        coordinates[:, 0] = x.astype(np.float32, copy=False)
-        coordinates[:, 0] += np.float32(qmin_global[0])
-        coordinates[:, 0] *= np.float32(finest_voxel)
-        del x
-
-        coordinates[:, 1] = y.astype(np.float32, copy=False)
-        coordinates[:, 1] += np.float32(qmin_global[1])
-        coordinates[:, 1] *= np.float32(finest_voxel)
-        del y
-
-        coordinates[:, 2] = z.astype(np.float32, copy=False)
-        coordinates[:, 2] += np.float32(qmin_global[2])
-        coordinates[:, 2] *= np.float32(finest_voxel)
-        del z
-
-        toc = time.perf_counter()
-        print(f"\tReconstructed coordinates in {toc - tic:.2f} seconds")
-
-        toc_total = time.perf_counter()
-
-        raw_points = total_cells * 8
-        reduction = 100.0 * (1.0 - float(num_unique) / float(raw_points))
-
-        print(
-            f"\tBuilt merged geometry: {total_cells:,} cells, "
-            f"{num_unique:,} unique points "
-            f"({reduction:.1f}% point reduction) in {toc_total - tic_total:.2f} seconds"
-        )
+        # Stacking coordinates and connectivity
+        coordinates = np.concatenate(all_corners, axis=0).astype(np.float32)
+        connectivity = np.concatenate(all_connectivity, axis=0).astype(np.int32)
+        level_id_field = np.array(level_id_field, dtype=np.uint8)
 
         return coordinates, connectivity, level_id_field, total_cells
-    
-    def _transform_coordinates(self, coordinates, offset):
-        """
-        Transform coordinates to physical units and apply offset.
 
-        Offset is applied in-place when possible to avoid an extra large
-        coordinates-sized allocation.
-        """
-        import numpy as np
-
-        if self.unit_convertor is not None:
-            coordinates = self.unit_convertor.length_to_physical(coordinates)
-
-        if offset is not None:
-            offset_arr = np.asarray(offset, dtype=coordinates.dtype)
-            if np.any(offset_arr):
-                coordinates += offset_arr
-
-        return coordinates
-    
     def _process_level(self, data, voxel_size, origin, point_id_offset):
         """
         Given a voxel grid, returns all corners and connectivity in NumPy for this resolution level.
@@ -1193,6 +388,39 @@ class MultiresIO(object):
             for fname, fdata in fields_data.items():
                 fg.create_dataset(fname, data=fdata.astype(np.float32), compression=compression, compression_opts=compression_opts, chunks=True)
 
+    def _merge_duplicates0(self, coordinates, connectivity, levels_data):
+        """Merge duplicate points using np.unique on quantized int32 grid.
+        Optimal balance for your 362M-point AMR mesh (finest grid (4256,2432,1280)).
+        """
+        
+        tic = time.perf_counter()
+        n = coordinates.shape[0]
+        finest_voxel = float(min(voxel_size for (_, voxel_size, _, _) in levels_data))
+        print(f"\tMerging duplicates from {n:,} points...")
+
+        # Quantize directly to int32 — guaranteed safe for your grid
+        inv = 1.0 / finest_voxel
+        qi = np.rint(coordinates * inv).astype(np.int32)          # ~4.3 GB temp
+
+        # np.unique does everything we need in one optimized call
+        _, unique_idx, inverse = np.unique(
+            qi, axis=0, return_index=True, return_inverse=True
+        )
+
+        unique_coordinates = coordinates[unique_idx].astype(np.float32, copy=False)
+        new_connectivity = inverse.astype(np.int32)[connectivity]   # safe cast
+
+        # Aggressive cleanup — important at this scale
+        del qi, inverse
+        gc.collect()
+
+        reduction = 100.0 * (1.0 - len(unique_coordinates) / n)
+        toc = time.perf_counter()
+        print(f"\tMerged to {len(unique_coordinates):,} unique points "
+            f"({reduction:.1f}% reduction) in {toc - tic:.2f} seconds")
+
+        return unique_coordinates, new_connectivity
+
     def _merge_duplicates(self, coordinates, connectivity, levels_data):
         """
         Merge duplicate points using parallel sorting.
@@ -1203,7 +431,7 @@ class MultiresIO(object):
         
         num_points = coordinates.shape[0]
         finest_voxel = min(voxel_size for (_, voxel_size, _, _) in levels_data)
-        print(f"\tMerging duplicates from {num_points:,} points (finest voxel={finest_voxel}m)...")
+        print(f"\tMerging duplicates from {num_points:,} points...")
         
         # Quantize coordinates to finest voxel grid
         inv = 1.0 / finest_voxel
@@ -1239,6 +467,12 @@ class MultiresIO(object):
         print(f"\tMerged to {len(unique_coordinates):,} unique points ({reduction:.1f}% reduction) in {toc - tic:.2f} seconds")
         
         return unique_coordinates, new_connectivity
+
+    def _transform_coordinates(self, coordinates, offset):
+        offset = np.array(offset, dtype=np.float32)
+        if self.unit_convertor is not None:
+            coordinates = self.unit_convertor.length_to_physical(coordinates)
+        return coordinates + offset
 
     def _prepare_container_inputs(self):
         # load necessary modules
@@ -1304,106 +538,69 @@ class MultiresIO(object):
 
     def get_fields_data(self, field_neon_dict):
         """
-        Extracts and prepares fields data from NEON fields for export.
-
-        Performance changes:
-        - WARP fields are allocated lazily only for requested fields.
-        - output arrays are preallocated to self.total_cells.
-        - avoids per-field list accumulation and final np.concatenate().
+        Extracts and prepares the fields data from the NEON fields for export.
         """
-        import numpy as np
-
-        try:
-            wp_mod = wp
-        except NameError:
-            import warp as wp_mod
-
+        # Check if the field_neon_dict is empty
         if not field_neon_dict:
             return {}
 
-        # Ensure that this operator is called on multires grids.
+        # Ensure that this operator is called on multires grids
         grid_mres = next(iter(field_neon_dict.values())).get_grid()
-        assert grid_mres.name == "mGrid", (
-            f"Operation {self.__class__.__name__} is only applicable to multi-resolution cases!"
-        )
+        assert grid_mres.name == "mGrid", f"Operation {self.__class__.__name} is only applicable to multi-resolution cases!"
 
         for field_name in field_neon_dict.keys():
             assert field_name in self.field_name_cardinality_dict.keys(), (
                 f"Field {field_name} is not provided in the instantiation of the MultiresIO class!"
             )
 
+        # number of levels
         num_levels = grid_mres.num_levels
         assert num_levels == len(self.levels_data), "Error: Inconsistent number of levels!"
 
-        needed_field_names = [
-            field_name
-            for field_name in field_neon_dict.keys()
-            if field_name in self.field_name_cardinality_dict
-        ]
-
-        self._ensure_container_inputs(needed_field_names)
-
+        # Prepare the fields dictionary to be written by transfering multi-res NEON fields into stacked warp fields and then numpy arrays
         fields_data = {}
-
         for field_name, cardinality in self.field_name_cardinality_dict.items():
             if field_name not in field_neon_dict:
                 continue
+            for card in range(cardinality):
+                fields_data[f"{field_name}_{card}"] = []
 
-            allocated = False
-
+        # Iterate over each field and level to fill the dictionary with numpy fields
+        for field_name, cardinality in self.field_name_cardinality_dict.items():
+            if field_name not in field_neon_dict:
+                continue
             for level in range(num_levels):
-                dst0 = int(self._level_cell_offsets[level])
-                dst1 = int(self._level_cell_offsets[level + 1])
-
-                if dst1 == dst0:
-                    continue
-
-                c = self.container(
-                    field_neon_dict[field_name],
-                    self.field_warp_dict[field_name][level],
-                    self.origin_list[level],
-                    level,
-                )
+                # Create the container and run it to fill the warp fields
+                c = self.container(field_neon_dict[field_name], self.field_warp_dict[field_name][level], self.origin_list[level], level)
                 c.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
 
-                wp_mod.synchronize()
+                # Ensure all operations are complete before converting to JAX and Numpy arrays
+                wp.synchronize()
 
+                # Convert the warp fields to numpy arrays and use level's mask to filter the data
                 mask = self.levels_data[level][0]
                 field_np = self.field_warp_dict[field_name][level].numpy()
-
-                if not allocated:
-                    for card in range(cardinality):
-                        fields_data[f"{field_name}_{card}"] = np.empty(
-                            self.total_cells,
-                            dtype=field_np.dtype,
-                        )
-                    allocated = True
-
                 for card in range(cardinality):
-                    key = f"{field_name}_{card}"
-                    fields_data[key][dst0:dst1] = field_np[card][mask]
+                    field_np_card = field_np[card][mask]
+                    fields_data[f"{field_name}_{card}"].append(field_np_card)
 
-            for card in range(cardinality):
-                key = f"{field_name}_{card}"
-                if key in fields_data:
-                    assert fields_data[key].size == self.total_cells, (
-                        f"Error: Field {key} size mismatch!"
-                    )
+        # Concatenate all field data
+        for field_name in fields_data.keys():
+            fields_data[field_name] = np.concatenate(fields_data[field_name])
+            assert fields_data[field_name].size == self.total_cells, f"Error: Field {field_name} size mismatch!"
 
-        # Unit conversion if applicable.
-        if self.unit_convertor is not None:
-            for field_name in list(fields_data.keys()):
-                lower = field_name.lower()
-
-                if "velocity" in lower:
+            # Unit conversion if applicable
+            if self.unit_convertor is not None:
+                if "velocity" in field_name.lower():
                     fields_data[field_name] = self.unit_convertor.velocity_to_physical(fields_data[field_name])
-                elif "density" in lower:
+                elif "density" in field_name.lower():
                     fields_data[field_name] = self.unit_convertor.density_to_physical(fields_data[field_name])
-                elif "pressure" in lower:
+                elif "pressure" in field_name.lower():
                     fields_data[field_name] = self.unit_convertor.pressure_to_physical(fields_data[field_name])
+                # Add more physical quantities as needed
 
         return fields_data
-    
+
     def to_hdf5(self, output_filename, field_neon_dict, compression="gzip", compression_opts=0):
         """
         Export the multi-resolution mesh data to an HDF5 file.
@@ -2020,6 +1217,38 @@ class MultiresIO(object):
         )
         print(f"\tTime-averaged line CSV for field {field_name} saved as {output_filename}.csv")
 
+    def _orient_normals_away_from_point(self, surface_points, normal_axes, reference_point):
+        """
+        Orient sign-ambiguous normal axes so they point away from a reference point.
+
+        Parameters
+        ----------
+        surface_points : (N,3) float array
+            Surface sample positions (usually vertices)
+        normal_axes : (N,3) float array
+            Local normal axes; sign may be arbitrary
+        reference_point : array_like, shape (3,)
+            A point assumed to lie inside the body
+
+        Returns
+        -------
+        oriented_normals : (N,3) float32 array
+            Normals with sign chosen so dot(n, x - p_ref) >= 0
+        """
+        surface_points = np.asarray(surface_points, dtype=np.float32)
+        normal_axes = np.asarray(normal_axes, dtype=np.float32)
+        reference_point = np.asarray(reference_point, dtype=np.float32)
+
+        dirs = surface_points - reference_point[None, :]
+        dots = np.einsum("ij,ij->i", normal_axes, dirs)
+
+        oriented = normal_axes.copy()
+        flip = dots < 0.0
+        oriented[flip] *= -1.0
+
+        oriented /= np.maximum(np.linalg.norm(oriented, axis=1, keepdims=True), 1e-12)
+        return oriented.astype(np.float32)
+
     def _select_surface_field(self, fields_data, field_base_name, component=None):
         comp_keys = [k for k in fields_data.keys() if k.startswith(field_base_name + "_")]
         if len(comp_keys) == 0:
@@ -2237,14 +1466,11 @@ class MultiresIO(object):
         use_minus = ~(minus_score > plus_score)
 
         mapped = plus_vals.copy()
-        mapped[use_minus] = minus_vals[use_minus]
+        mapped[use_minus] = minus_vals[use_minus] 
 
-        chosen_normals = surface_normals.copy()
-        chosen_normals[use_minus] *= -1.0
+        return mapped.astype(np.float32)
 
-        return mapped.astype(np.float32), chosen_normals.astype(np.float32), use_minus
-
-    def _smooth_surface_scalar(self, values, faces, iterations=1, relaxation=0.25):
+    def _smooth_surface_scalar(self, values, faces, iterations=2, relaxation=0.2):
         """
         Vectorized Laplacian smoothing via sparse matrix multiply.
         ~100x faster than per-vertex loops.
@@ -2276,6 +1502,129 @@ class MultiresIO(object):
             v = (1.0 - relaxation) * v + relaxation * (L @ v)
         
         return v.astype(np.float32)
+
+    def _weld_vertices(
+        self,
+        vertices,
+        faces,
+        vertex_rgb=None,
+        vertex_values=None,
+        tolerance=0.0,
+    ):
+        """
+        Weld duplicate / near-duplicate vertices by position.
+
+        Parameters
+        ----------
+        vertices : (N,3) array
+        faces : (M,3) int array
+        vertex_rgb : (N,3) uint8 array, optional
+            Averaged across welded duplicates.
+        vertex_values : (N,) float array, optional
+            Averaged across welded duplicates.
+        tolerance : float
+            0.0 means exact-position weld.
+            >0 means weld positions after quantization by this tolerance.
+
+        Returns
+        -------
+        welded_vertices, welded_faces, welded_rgb, welded_values
+        """
+        vertices = np.asarray(vertices, dtype=np.float64)
+        faces = np.asarray(faces, dtype=np.int32)
+
+        if len(vertices) == 0:
+            return (
+                vertices.astype(np.float32),
+                faces,
+                None if vertex_rgb is None else np.asarray(vertex_rgb),
+                None if vertex_values is None else np.asarray(vertex_values),
+            )
+
+        tol = float(tolerance)
+
+        if tol <= 0.0:
+            # exact weld
+            vv = np.ascontiguousarray(vertices)
+            key_view = vv.view(np.dtype((np.void, vv.dtype.itemsize * vv.shape[1]))).ravel()
+            _, unique_idx, inverse = np.unique(key_view, return_index=True, return_inverse=True)
+        else:
+            # tolerance-based weld
+            q = np.rint(vertices / tol).astype(np.int64)
+            _, unique_idx, inverse = np.unique(q, axis=0, return_index=True, return_inverse=True)
+
+        # preserve first-occurrence order rather than np.unique key order
+        order = np.argsort(unique_idx)
+        unique_idx = unique_idx[order]
+        remap = np.empty(len(order), dtype=np.int32)
+        remap[order] = np.arange(len(order), dtype=np.int32)
+        inverse = remap[inverse]
+
+        welded_vertices = vertices[unique_idx].astype(np.float32, copy=False)
+
+        n_unique = len(unique_idx)
+        counts = np.bincount(inverse, minlength=n_unique).astype(np.float64)
+
+        welded_rgb = None
+        if vertex_rgb is not None:
+            rgb = np.asarray(vertex_rgb, dtype=np.float64)
+            acc = np.zeros((n_unique, 3), dtype=np.float64)
+            np.add.at(acc, inverse, rgb)
+            welded_rgb = np.round(acc / np.maximum(counts[:, None], 1.0)).astype(np.uint8)
+
+        welded_values = None
+        if vertex_values is not None:
+            vals = np.asarray(vertex_values, dtype=np.float64)
+            acc = np.zeros(n_unique, dtype=np.float64)
+            np.add.at(acc, inverse, vals)
+            welded_values = (acc / np.maximum(counts, 1.0)).astype(np.float32)
+
+        welded_faces = inverse[faces]
+
+        # drop degenerate triangles introduced by welding
+        keep = (
+            (welded_faces[:, 0] != welded_faces[:, 1]) &
+            (welded_faces[:, 1] != welded_faces[:, 2]) &
+            (welded_faces[:, 0] != welded_faces[:, 2])
+        )
+        welded_faces = welded_faces[keep]
+
+        return welded_vertices, welded_faces, welded_rgb, welded_values
+    
+    def _write_mtl_for_color_bins(
+        self,
+        mtl_filename,
+        material_rgb,
+        material_prefix="field_bin",
+    ):
+        """
+        Write one diffuse material per color bin.
+        """
+        from pathlib import Path
+
+        mtl_path = Path(mtl_filename)
+        mtl_path.parent.mkdir(parents=True, exist_ok=True)
+
+        material_rgb = np.asarray(material_rgb, dtype=np.uint8)
+        material_names = []
+
+        with open(mtl_path, "w") as f:
+            f.write("# MTL written by MultiresIO\n\n")
+
+            for i, rgb in enumerate(material_rgb):
+                r, g, b = (rgb.astype(np.float32) / 255.0).tolist()
+                name = f"{material_prefix}_{i:03d}"
+                material_names.append(name)
+
+                f.write(f"newmtl {name}\n")
+                f.write(f"Ka {r:.6f} {g:.6f} {b:.6f}\n")
+                f.write(f"Kd {r:.6f} {g:.6f} {b:.6f}\n")
+                f.write("Ks 0.000000 0.000000 0.000000\n")
+                f.write("Ns 1.000000\n")
+                f.write("illum 1\n\n")
+
+        print(f"\tMTL written: {mtl_path}")
+        return material_names, str(mtl_path)
 
     def _write_polydata_vtk(self, vtk_filename, vertices, faces, point_data=None, cell_data=None):
         """
@@ -2337,32 +1686,30 @@ class MultiresIO(object):
         with open(vtk_filename, "w") as f:
             f.write(buf.getvalue())
             
-    def _fields_data_to_surface_vtk(
-        self,
-        output_filename,
-        surface_mesh_filename,
+    def _map_field_to_surface_mesh(
+        self,        
+        surface_mesh,        
         fields_data,
         field_base_name,
+        center_point=None,
         component=None,
         sample_dx=None,
-        shell_factors=(0.75, 1.25, 1.75),
-        k=24,
+        shell_factors=(1.0, 1.5),
+        k=10,
         power=2.0,
         max_distance=None,
-        half_space_tolerance=0.25,
+        half_space_tolerance=0.1,
         aggregate="median",
         smooth_iterations=2,
-        smooth_relaxation=0.25,
-        export_debug_arrays=True,
+        smooth_relaxation=0.2,
     ):
-        tic_write = time.perf_counter()
+  
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
 
-        mesh = surface_mesh_filename
+        mesh = surface_mesh
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.int32)
-        toc_write = time.perf_counter()
-        print(f"\tSurface field surface loaded in {toc_write - tic_write:0.1f} seconds")
+   
         if sample_dx is None:
             sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
 
@@ -2370,25 +1717,40 @@ class MultiresIO(object):
             max_distance = 3.0 * float(sample_dx)
 
         vertex_normals = self._repair_and_smooth_vertex_normals(mesh)
-        toc_write = time.perf_counter()
-        print(f"\tSurface field smoothed in {toc_write - tic_write:0.1f} seconds")
-        vtk_filename = output_filename if output_filename.endswith(".vtk") else output_filename + ".vtk"
+        if center_point is None:
+            mapped = self._sample_surface_scalar_bidirectional(
+                            surface_points=vertices,
+                            surface_normals=vertex_normals,
+                            cell_values=cell_values,
+                            sample_dx=sample_dx,
+                            shell_factors=shell_factors,
+                            k=k,
+                            power=power,
+                            max_distance=max_distance,
+                            half_space_tolerance=half_space_tolerance,
+                            aggregate=aggregate,
+                        )        
+        else:
+            chosen_normals = self._orient_normals_away_from_point(
+                            surface_points=vertices,
+                            normal_axes=vertex_normals,
+                            reference_point=center_point,
+                        )
+            mapped, _ = self._sample_surface_scalar_one_side(
+                        surface_points=vertices,
+                        surface_normals=chosen_normals,
+                        cell_values=cell_values,
+                        sample_dx=sample_dx,
+                        shell_factors=shell_factors,
+                        k=k,
+                        power=power,
+                        max_distance=max_distance,
+                        half_space_tolerance=half_space_tolerance,
+                        aggregate=aggregate,
+                    )
 
         
-        mapped, chosen_normals, flipped = self._sample_surface_scalar_bidirectional(
-            surface_points=vertices,
-            surface_normals=vertex_normals,
-            cell_values=cell_values,
-            sample_dx=sample_dx,
-            shell_factors=shell_factors,
-            k=k,
-            power=power,
-            max_distance=max_distance,
-            half_space_tolerance=half_space_tolerance,
-            aggregate=aggregate,
-        )
-        toc_write = time.perf_counter()
-        print(f"\tSurface field mapped in {toc_write - tic_write:0.1f} seconds")
+      
         if smooth_iterations > 0:
             mapped = self._smooth_surface_scalar(
                 mapped,
@@ -2396,49 +1758,248 @@ class MultiresIO(object):
                 iterations=smooth_iterations,
                 relaxation=smooth_relaxation,
             )
-        toc_write = time.perf_counter()
-        print(f"\tSurface field surface results smoothed in {toc_write - tic_write:0.1f} seconds")
-        point_data = {field_name: mapped}
-        if export_debug_arrays:
-            point_data["chosen_normal"] = chosen_normals
-            point_data["normal_flipped"] = flipped.astype(np.float32)
+ 
+        return mesh, vertices, faces, field_name, mapped.astype(np.float32)
+
+    def _fields_data_to_surface_vtk(
+        self,
+        output_filename,
+        surface_mesh,
+        fields_data,
+        field_base_name,
+        center_point=None,
+        component=None,
+        sample_dx=None,
+        shell_factors=(1.0, 1.5),
+        k=10,
+        power=2.0,
+        max_distance=None,
+        half_space_tolerance=0.1,
+        aggregate="median",
+        smooth_iterations=2,
+        smooth_relaxation=0.2,
+    ):
+        _, vertices, faces, field_name, mapped = self._map_field_to_surface_mesh(
+            surface_mesh=surface_mesh,
+            fields_data=fields_data,
+            field_base_name=field_base_name,
+            center_point=center_point,
+            component=component,
+            sample_dx=sample_dx,
+            shell_factors=shell_factors,
+            k=k,
+            power=power,
+            max_distance=max_distance,
+            half_space_tolerance=half_space_tolerance,
+            aggregate=aggregate,
+            smooth_iterations=smooth_iterations,
+            smooth_relaxation=smooth_relaxation,
+        )
+
+        vtk_filename = output_filename if output_filename.endswith(".vtk") else output_filename + ".vtk"
 
         self._write_polydata_vtk(
             vtk_filename,
             vertices,
             faces,
-            point_data=point_data,
+            point_data={field_name: mapped},
             cell_data=None,
         )
-        
-        toc_write = time.perf_counter()
-        print(f"\tSurface field written to {vtk_filename} in {toc_write - tic_write:0.1f} seconds")
-        return mapped
+    
+    def _scalar_to_rgb(self, values, cmap="nipy_spectral", vmin=None, vmax=None):
+        """
+        Convert scalar values to uint8 RGB colors.
+        """
+        from matplotlib import cm
+
+        values = np.asarray(values, dtype=np.float32)
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            raise ValueError("No finite values available for color mapping.")
+
+        if vmin is None:
+            vmin = float(np.nanmin(values))
+        if vmax is None:
+            vmax = float(np.nanmax(values))
+
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+        t = np.zeros_like(values, dtype=np.float32)
+        t[finite] = np.clip((values[finite] - vmin) / (vmax - vmin), 0.0, 1.0)
+
+        rgba = cm.get_cmap(cmap)(t)
+        rgb = np.round(255.0 * rgba[:, :3]).astype(np.uint8)
+        rgb[~finite] = 0
+
+        return rgb, vmin, vmax
+
+    def _write_obj_with_vertex_colors(
+        self,
+        obj_filename,
+        vertices,
+        faces,
+        vertex_rgb,
+        value_name=None,
+        vmin=None,
+        vmax=None,
+        vertex_values=None,
+        cmap="nipy_spectral",
+        weld_vertices=True,
+        weld_tolerance=0.0001,
+        write_mtl=True,
+        mtl_bin_count=32,
+    ):
+        """
+        Write OBJ with:
+        - welded vertices
+        - per-vertex RGB on v-lines
+        - MTL fallback with quantized face materials for Alias / standard OBJ readers
+
+        Returns
+        -------
+        obj_path : str
+        mtl_path : Optional[str]
+        """
+        from pathlib import Path
+
+        vertices = np.asarray(vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32)
+        vertex_rgb = np.asarray(vertex_rgb, dtype=np.uint8)
+
+        if vertex_values is not None:
+            vertex_values = np.asarray(vertex_values, dtype=np.float32)
+
+        # Normalize output path
+        obj_path = Path(obj_filename)
+        if obj_path.suffix.lower() != ".obj":
+            obj_path = obj_path.with_suffix(".obj")
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Weld first
+        if weld_vertices:
+            vertices, faces, vertex_rgb, vertex_values = self._weld_vertices(
+                vertices=vertices,
+                faces=faces,
+                vertex_rgb=vertex_rgb,
+                vertex_values=vertex_values,
+                tolerance=weld_tolerance,
+            )
+
+        rgb01 = vertex_rgb.astype(np.float32) / 255.0
+
+        # Build optional MTL / per-face material assignment
+        mtl_path = None
+        material_names = None
+        face_material_ids = None
+
+        if write_mtl and len(faces) > 0:
+            n_bins = max(2, int(mtl_bin_count))
+
+            if vertex_values is not None:
+                # Preferred path: bin by scalar field
+                if vmin is None:
+                    vmin = float(np.nanmin(vertex_values))
+                if vmax is None:
+                    vmax = float(np.nanmax(vertex_values))
+                if vmax <= vmin:
+                    vmax = vmin + 1.0
+
+                bin_centers = np.linspace(vmin, vmax, n_bins, dtype=np.float32)
+                material_rgb, _, _ = self._scalar_to_rgb(
+                    bin_centers, cmap=cmap, vmin=vmin, vmax=vmax
+                )
+
+                face_values = vertex_values[faces].mean(axis=1)
+                t = np.clip((face_values - vmin) / (vmax - vmin), 0.0, 1.0)
+                face_material_ids = np.minimum(
+                    np.floor(t * n_bins).astype(np.int32),
+                    n_bins - 1,
+                )
+            else:
+                # Fallback: bin directly from averaged face RGB
+                face_rgb = np.round(vertex_rgb[faces].mean(axis=1)).astype(np.uint8)
+                # Quantize RGB to reduce material count
+                qstep = max(1, int(np.ceil(256 / n_bins)))
+                face_rgb_q = (face_rgb // qstep) * qstep
+                material_rgb, inverse = np.unique(face_rgb_q, axis=0, return_inverse=True)
+                face_material_ids = inverse.astype(np.int32)
+
+            mtl_path = obj_path.with_suffix(".mtl")
+            material_names, _ = self._write_mtl_for_color_bins(
+                mtl_filename=str(mtl_path),
+                material_rgb=material_rgb,
+                material_prefix=(value_name or "field"),
+            )
+
+        with open(obj_path, "w") as f:
+            f.write("# Colored OBJ written by Studio Wind Tunnel\n")
+            if value_name is not None:
+                f.write(f"# field_name {value_name}\n")
+            if vmin is not None and vmax is not None:
+                f.write(f"# color_range {vmin:.9g} {vmax:.9g}\n")
+            if weld_vertices:
+                f.write("# welded_vertices 1\n")
+                f.write(f"# weld_tolerance {float(weld_tolerance):.9g}\n")
+            else:
+                f.write("# welded_vertices 0\n")
+
+            if mtl_path is not None:
+                f.write(f"mtllib {mtl_path.name}\n")
+
+            f.write("# vertex format: v x y z r g b\n")
+
+            # vertices with RGB
+            for (x, y, z), (r, g, b) in zip(vertices, rgb01):
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f} {r:.6f} {g:.6f} {b:.6f}\n")
+
+            # faces
+            faces1 = faces + 1
+            if face_material_ids is None:
+                for i, j, k in faces1:
+                    f.write(f"f {i} {j} {k}\n")
+            else:
+                current_mid = -1
+                for (i, j, k), mid in zip(faces1, face_material_ids):
+                    if mid != current_mid:
+                        f.write(f"usemtl {material_names[mid]}\n")
+                        current_mid = mid
+                    f.write(f"f {i} {j} {k}\n")
+
+        print(f"\tOBJ written: {obj_path}")
+        if mtl_path is not None:
+            print(f"\tOBJ references MTL: {mtl_path.name}")
+        else:
+            print("\tOBJ written without MTL")
+
+        return str(obj_path), (None if mtl_path is None else str(mtl_path))
 
     def to_surface_vtk(
         self,
         output_filename,
-        surface_mesh_filename,
+        surface_mesh,
         field_neon_dict,
         field_base_name,
+        center_point=None,
         component=None,
         sample_dx=None,
-        shell_factors=(1.25,),
+        shell_factors=(1.0, 1.5),
         k=10,
         power=2.0,
         max_distance=None,
-        half_space_tolerance=0.25,
+        half_space_tolerance=0.1,
         aggregate="median",
         smooth_iterations=2,
         smooth_relaxation=0.2,
-        export_debug_arrays=True,
     ):
+        tic_write = time.perf_counter()
         fields_data = self.get_fields_data(field_neon_dict)
-        return self._fields_data_to_surface_vtk(
+        self._fields_data_to_surface_vtk(
             output_filename=output_filename,
-            surface_mesh_filename=surface_mesh_filename,
+            surface_mesh=surface_mesh,
             fields_data=fields_data,
             field_base_name=field_base_name,
+            center_point=center_point,
             component=component,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
@@ -2449,33 +2010,35 @@ class MultiresIO(object):
             aggregate=aggregate,
             smooth_iterations=smooth_iterations,
             smooth_relaxation=smooth_relaxation,
-            export_debug_arrays=export_debug_arrays,
         )
+        print(f"\tSurface field written to {output_filename} in {time.perf_counter() - tic_write:0.1f} seconds")
 
     def to_surface_vtk_time_average(
         self,
         output_filename,
-        surface_mesh_filename,
+        surface_mesh,
         field_base_name,
+        center_point=None,
         component=None,
         keep_state=True,
         sample_dx=None,
-        shell_factors=(1.25, ),
+        shell_factors=(1.0, 1.5),
         k=10,
         power=2.0,
         max_distance=None,
-        half_space_tolerance=0.25,
+        half_space_tolerance=0.1,
         aggregate="median",
         smooth_iterations=2,
         smooth_relaxation=0.2,
-        export_debug_arrays=True,
     ):
+        tic_write = time.perf_counter()
         avg_fields = self.finalize_time_average(keep_state=keep_state)
-        return self._fields_data_to_surface_vtk(
+        self._fields_data_to_surface_vtk(
             output_filename=output_filename,
-            surface_mesh_filename=surface_mesh_filename,
+            surface_mesh=surface_mesh,
             fields_data=avg_fields,
             field_base_name=field_base_name,
+            center_point=center_point,
             component=component,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
@@ -2486,6 +2049,155 @@ class MultiresIO(object):
             aggregate=aggregate,
             smooth_iterations=smooth_iterations,
             smooth_relaxation=smooth_relaxation,
-            export_debug_arrays=export_debug_arrays,
         )
-    
+        print(f"\tSurface field written to {output_filename} in {time.perf_counter() - tic_write:0.1f} seconds")
+
+    def _fields_data_to_surface_obj(
+        self,
+        output_filename,
+        surface_mesh,
+        fields_data,
+        field_base_name,
+        center_point=None,
+        component=None,
+        sample_dx=None,
+        shell_factors=(1.0, 1.5),
+        k=10,
+        power=2.0,
+        max_distance=None,
+        half_space_tolerance=0.1,
+        aggregate="median",
+        smooth_iterations=2,
+        smooth_relaxation=0.2,
+        cmap="viridis",
+        vmin=None,
+        vmax=None,
+    ):
+        _, vertices, faces, field_name, mapped = self._map_field_to_surface_mesh(
+            surface_mesh=surface_mesh,
+            fields_data=fields_data,
+            field_base_name=field_base_name,
+            center_point=center_point,
+            component=component,
+            sample_dx=sample_dx,
+            shell_factors=shell_factors,
+            k=k,
+            power=power,
+            max_distance=max_distance,
+            half_space_tolerance=half_space_tolerance,
+            aggregate=aggregate,
+            smooth_iterations=smooth_iterations,
+            smooth_relaxation=smooth_relaxation,
+        )
+
+        vertex_rgb, vmin, vmax = self._scalar_to_rgb(
+            mapped, cmap=cmap, vmin=vmin, vmax=vmax
+        )
+
+        obj_filename = output_filename if output_filename.endswith(".obj") else output_filename + ".obj"
+
+        self._write_obj_with_vertex_colors(
+            obj_filename=obj_filename,
+            vertices=vertices,
+            faces=faces,
+            vertex_rgb=vertex_rgb,
+            value_name=field_name,
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+    def to_surface_obj(
+        self,
+        output_filename,
+        surface_mesh,
+        field_neon_dict,
+        field_base_name,
+        center_point=None,
+        component=None,
+        sample_dx=None,
+        shell_factors=(1.0, 1.5),
+        k=10,
+        power=2.0,
+        max_distance=None,
+        half_space_tolerance=0.1,
+        aggregate="median",
+        smooth_iterations=2,
+        smooth_relaxation=0.2,
+        cmap="nipy_spectral",
+        vmin=None,
+        vmax=None,
+    ):
+        tic_write = time.perf_counter()
+
+        fields_data = self.get_fields_data(field_neon_dict)
+
+        self._fields_data_to_surface_obj(
+            output_filename=output_filename,
+            surface_mesh=surface_mesh,
+            fields_data=fields_data,
+            field_base_name=field_base_name,
+            center_point=center_point,
+            component=component,
+            sample_dx=sample_dx,
+            shell_factors=shell_factors,
+            k=k,
+            power=power,
+            max_distance=max_distance,
+            half_space_tolerance=half_space_tolerance,
+            aggregate=aggregate,
+            smooth_iterations=smooth_iterations,
+            smooth_relaxation=smooth_relaxation,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        print(f"\tSurface OBJ written to {output_filename} in {time.perf_counter() - tic_write:0.1f} seconds")
+
+    def to_surface_obj_time_average(
+        self,
+        output_filename,
+        surface_mesh,
+        field_base_name,
+        center_point=None,
+        component=None,
+        keep_state=True,
+        sample_dx=None,
+        shell_factors=(1.0, 1.5),
+        k=10,
+        power=2.0,
+        max_distance=None,
+        half_space_tolerance=0.1,
+        aggregate="median",
+        smooth_iterations=2,
+        smooth_relaxation=0.2,
+        cmap="nipy_spectral",
+        vmin=None,
+        vmax=None,
+    ):
+        tic_write = time.perf_counter()
+
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+
+        self._fields_data_to_surface_obj(
+            output_filename=output_filename,
+            surface_mesh=surface_mesh,
+            fields_data=avg_fields,
+            field_base_name=field_base_name,
+            center_point=center_point,
+            component=component,
+            sample_dx=sample_dx,
+            shell_factors=shell_factors,
+            k=k,
+            power=power,
+            max_distance=max_distance,
+            half_space_tolerance=half_space_tolerance,
+            aggregate=aggregate,
+            smooth_iterations=smooth_iterations,
+            smooth_relaxation=smooth_relaxation,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        print(f"\tTime-averaged surface OBJ written to {output_filename} in {time.perf_counter() - tic_write:0.1f} seconds")

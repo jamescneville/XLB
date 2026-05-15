@@ -22,8 +22,8 @@ class HelperFunctionsBC(object):
         self.velocity_set = velocity_set or DefaultConfig.velocity_set
         self.precision_policy = precision_policy or DefaultConfig.default_precision_policy
         self.compute_backend = compute_backend or DefaultConfig.default_backend
-        self.distance_decoder_function = distance_decoder_function  
-        
+        self.distance_decoder_function = distance_decoder_function
+
         # Set the compute and Store dtypes
         compute_dtype = self.precision_policy.compute_precision.wp_dtype
         store_dtype = self.precision_policy.store_precision.wp_dtype
@@ -34,15 +34,14 @@ class HelperFunctionsBC(object):
         _opp_indices = self.velocity_set.opp_indices
         _w = self.velocity_set.w
         _c = self.velocity_set.c
-        _c_float = self.velocity_set.c_float
+        _c_float = self.velocity_set.c_float        
+        _cs2 = compute_dtype(self.velocity_set.cs2)
         _qi = self.velocity_set.qi
         _u_vec = wp.vec(_d, dtype=compute_dtype)
         _f_vec = wp.vec(_q, dtype=compute_dtype)
         _missing_mask_vec = wp.vec(_q, dtype=wp.uint8)  # TODO fix vec bool
         _nt = _d * (_d + 1) // 2
-        _nt_vec = wp.vec(_nt, dtype=compute_dtype)
-        _epsilon = compute_dtype(1e-8)
-        _c_center_index = self.velocity_set.center_index
+        _epsilon = compute_dtype(1e-6)
 
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
@@ -52,13 +51,8 @@ class HelperFunctionsBC(object):
 
         # Define the operator needed for computing the momentum flux
         momentum_flux = MomentumFlux(velocity_set, precision_policy, compute_backend)
-
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
-        _B = compute_dtype(5.2)       # Log-law constant
-        _A_plus = compute_dtype(26.0)  # van Driest damping constant
-        _cs2 = compute_dtype(self.velocity_set.cs2)
-        _pi = compute_dtype(3.14159265358979323846)
 
         @wp.func
         def get_bc_thread_data(
@@ -119,7 +113,7 @@ class HelperFunctionsBC(object):
                 elif _missing_mask[l] != wp.uint8(1):
                     fsum_middle += fpop[l]
             return fsum_known + fsum_middle
-       
+
         @wp.func
         def get_normal_vectors(
             _missing_mask: Any,
@@ -132,141 +126,6 @@ class HelperFunctionsBC(object):
                 for l in range(_q):
                     if _missing_mask[l] == wp.uint8(1) and wp.abs(_c[0, l]) + wp.abs(_c[1, l]) == 1:
                         return -_u_vec(_c_float[0, l], _c_float[1, l])
-                    
-        @wp.func
-        def get_normal_and_distance(
-            _missing_mask: Any,
-            f_1: Any,
-            index: Any,
-        ):
-            """
-            Compute both the surface normal vector and normal distance based on
-            actual distances from voxel center to mesh surface.
-            """
-            normal = _u_vec(0.0, 0.0, 0.0)
-            normal_distance = compute_dtype(0.0)
-            weight_sum = compute_dtype(0.0)
-            
-            # First pass: Compute weighted normal based on actual distances
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    # Get distance fraction (0-1) from distance decoder
-                    dist_fraction = compute_dtype(self.distance_decoder_function(f_1, index, l))
-                    if dist_fraction == compute_dtype(5.0):
-                        #dist_fraction = compute_dtype(1.0)
-                        continue  # Skip miss-hits
-                    dist_fraction = wp.max(dist_fraction, _epsilon)
-                    
-                    # Get lattice vector
-                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
-                    c_mag = wp.length(c_l)
-                    
-                    # Actual distance from voxel center to mesh along this direction
-                    actual_distance = dist_fraction * c_mag# + 0.5 * c_mag
-                    
-                    # Unit vector in this direction
-                    c_unit = c_l / c_mag  # Streamlined: use vector division
-                    
-                    # Weight by inverse of actual distance (closer surfaces have more influence)
-                    # Add small epsilon to avoid division by zero
-                    weight =  compute_dtype(1.0) / (actual_distance * actual_distance + _epsilon)
-                    
-                    # Accumulate weighted normal vector
-                    normal += c_unit * weight  # Streamlined: vector addition and scalar multiplication
-                    weight_sum += weight
-            
-            # Normalize the weighted normal
-            if weight_sum > compute_dtype(0.0):
-                normal /= weight_sum  # Streamlined: vector division
-            
-            # Unit normalize the normal vector
-            mag = wp.length(normal)  # Optimized: use wp.length instead of manual sqrt
-            if mag > compute_dtype(0.0):
-                normal /= mag  # Streamlined: vector division
-            
-            # Invert normal to point into fluid
-            normal = -normal
-
-            # Fallback if no real hits: Use all missing directions with assumed dist_fraction=0.5
-            if weight_sum <= _epsilon:
-                weight_sum = compute_dtype(0.0)  # Reset for fallback
-                normal = _u_vec(0.0, 0.0, 0.0)
-                for l in range(_q):
-                    if _missing_mask[l] == wp.uint8(1):
-                        dist_fraction = compute_dtype(0.5)
-                        c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
-                        c_mag = wp.length(c_l)
-                        actual_distance = dist_fraction * c_mag# + 0.5 * c_mag
-                        c_unit = c_l / c_mag  # Streamlined: vector division
-                        weight = compute_dtype(1.0) / (actual_distance * actual_distance + _epsilon)
-                        normal += c_unit * weight  # Streamlined: vector addition and scalar multiplication
-                        weight_sum += weight
-                # Normalize the weighted normal
-                if weight_sum > compute_dtype(0.0):
-                    normal /= weight_sum  # Streamlined: vector division
-                # Unit normalize the normal vector
-                mag = wp.length(normal)  # Optimized: use wp.length instead of manual sqrt
-                if mag > compute_dtype(0.0):
-                    normal /= mag  # Streamlined: vector division
-                # Invert normal to point into fluid
-                normal = -normal
-            
-            # Second pass: Project actual distances onto normal and average
-            distance_weight_sum = compute_dtype(0.0)
-            
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    # Get distance fraction and actual distance again
-                    dist_fraction = compute_dtype(self.distance_decoder_function(f_1, index, l))
-                    if dist_fraction == compute_dtype(5.0):
-                        #dist_fraction = compute_dtype(1.0)
-                        continue  # Skip miss-hits
-                    dist_fraction = wp.max(dist_fraction, _epsilon)
-                    c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
-                    c_mag = wp.length(c_l)
-                    actual_distance = dist_fraction * c_mag# + 0.5 * c_mag
-                    
-                    # Unit vector in this direction
-                    c_unit = c_l / c_mag  # Streamlined: vector division
-                    
-                    # Project this distance vector onto the normal
-                    # (dot product gives projection length, negative because normal points into fluid)
-                    projection = -wp.dot(c_unit, normal) * actual_distance
-                    projection = wp.max(projection, compute_dtype(0.0)) # Zero-out negative projections
-                    
-                    # Weight by inverse distance for averaging
-                    # weight = compute_dtype(1.0) / (actual_distance * actual_distance + _epsilon) # Distance weighted
-                    # weight = compute_dtype(1.0) / (projection * projection + _epsilon) # Projection weighted
-                    weight = (projection * projection) / (actual_distance * actual_distance * actual_distance *actual_distance + _epsilon)
-                    normal_distance += projection * weight
-                    distance_weight_sum += weight
-            
-            # Normalize the distance
-            if distance_weight_sum > compute_dtype(0.0):
-                normal_distance /= distance_weight_sum
-
-            # Fallback for distance if no real hits
-            if distance_weight_sum <= _epsilon:
-                distance_weight_sum = compute_dtype(0.0)  # Reset for fallback
-                normal_distance = compute_dtype(0.0)
-                for l in range(_q):
-                    if _missing_mask[l] == wp.uint8(1):
-                        dist_fraction = compute_dtype(0.5)
-                        c_l = wp.vec3(_c_float[0, l], _c_float[1, l], _c_float[2, l])
-                        c_mag = wp.length(c_l)
-                        actual_distance = dist_fraction * c_mag# + 0.5 * c_mag
-                        c_unit = c_l / c_mag  # Streamlined: vector division
-                        projection = -wp.dot(c_unit, normal) * actual_distance
-                        projection = wp.max(projection, compute_dtype(0.0)) # Zero-out negative projections
-                        # weight = compute_dtype(1.0) / (actual_distance + _epsilon)
-                        weight = (projection * projection) / (actual_distance * actual_distance * actual_distance *actual_distance + _epsilon)
-                        normal_distance += projection * weight
-                        distance_weight_sum += weight
-                # Normalize the distance
-                if distance_weight_sum > compute_dtype(0.0):
-                    normal_distance /= distance_weight_sum
-            
-            return normal, normal_distance
 
         @wp.func
         def bounceback_nonequilibrium(
@@ -278,141 +137,266 @@ class HelperFunctionsBC(object):
                 if _missing_mask[l] == wp.uint8(1):
                     fpop[l] = fpop[_opp_indices[l]] + feq[l] - feq[_opp_indices[l]]
             return fpop
+        
+        @wp.func
+        def regularize_missing(
+            index: Any,
+            _missing_mask: Any,
+            f_1: Any,
+            fpop: Any,
+            feq: Any,
+            needs_mesh_distance: bool,
+        ):
+            """
+            Adaptive wall regularization with rho + momentum preservation.
 
+            Purpose:
+            - Missing populations are regularized strongly.
+            - Known populations are blended toward full regularization only when
+                the boundary node is heavily wall-dominated.
+            - Endpoint-heavy q values reduce known-population regularization.
+            - Final correction restores local density and momentum relative to
+                the post-BC state before adaptive regularization.
+
+            Important:
+            - The final rho/momentum correction is applied over all directions using
+                the low-order lattice basis:
+                    delta_f_l = w_l * (drho + c_l . dj / cs2)
+            - Do not clamp after the final correction if you want exact rho/j
+                preservation. Instead, log min(fpop) or clipping separately.
+            """
+
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
+            half = compute_dtype(0.5)
+            three = compute_dtype(3.0)
+            four = compute_dtype(4.0)
+            f_neq = fpop - feq
+            PiNeq = momentum_flux.warp_functional(f_neq)
+            zero = compute_dtype(0.0)
+            three = compute_dtype(3.0)
+
+            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1):
+                    QiPi = zero
+                    for t in range(_nt):
+                        if t == 0 or t == 3 or t == 5:
+                            QiPi += _qi[l, t] * (PiNeq[t] - trace)
+                        else:
+                            QiPi += _qi[l, t] * PiNeq[t]
+
+                    fpop1 = compute_dtype(4.5) * _w[l] * QiPi
+                    fpop[l] = feq[l] + fpop1
+                    fpop[l] = wp.max(fpop[l], _epsilon)
+
+            return fpop
+
+            # # ------------------------------------------------------------
+            # # 0. Build PiNeq from current post-BC population
+            # # ------------------------------------------------------------
+            # f_neq = fpop - feq
+            # PiNeq = momentum_flux.warp_functional(f_neq)
+            # trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+
+            # # ------------------------------------------------------------
+            # # 1. Save raw state, build full regularized candidate,
+            # #    and compute missing/q-risk metrics in one loop
+            # # ------------------------------------------------------------
+            # f_raw = _f_vec()
+            # f_reg = _f_vec()
+
+            # rho_raw = zero
+            # j_raw = _u_vec()
+
+            # missing_count = zero
+            # missing_w = zero
+            # nonrest_w = zero
+            # q_risk_sum = zero
+
+            # for l in range(_q):
+            #     # Save pre-adaptive-regularization state.
+            #     # This is the state after the noneq wall reconstruction.
+            #     f_raw[l] = fpop[l]
+            #     rho_raw += fpop[l]
+
+            #     for d in range(_d):
+            #         j_raw[d] += _c_float[d, l] * fpop[l]
+
+            #     # Full regularized candidate for this direction.
+            #     QiPi = zero
+            #     for t in range(_nt):
+            #         if t == 0 or t == 3 or t == 5:
+            #             QiPi += _qi[l, t] * (PiNeq[t] - trace)
+            #         else:
+            #             QiPi += _qi[l, t] * PiNeq[t]
+
+            #     fpop1 = compute_dtype(4.5) * _w[l] * QiPi
+            #     f_reg[l] = feq[l] + fpop1
+            #     f_reg[l] = wp.max(f_reg[l], _epsilon)
+
+            #     # Exclude rest population from wall-link severity metrics.
+            #     c_abs = wp.abs(_c[0, l]) + wp.abs(_c[1, l]) + wp.abs(_c[2, l])
+
+            #     if c_abs != 0:
+            #         nonrest_w += _w[l]
+
+            #         if _missing_mask[l] == wp.uint8(1):
+            #             missing_count += one
+            #             missing_w += _w[l]
+
+            #             if needs_mesh_distance:
+            #                 q = compute_dtype(self.distance_decoder_function(f_1, index, l))
+
+            #                 # Match existing distance behavior.
+            #                 if q > one:
+            #                     q = half
+
+            #                 q = wp.clamp(q, compute_dtype(0.01), compute_dtype(0.99))
+
+            #                 # Endpoint risk:
+            #                 #   q = 0.5 -> 0
+            #                 #   q = 0 or 1 -> near 1
+            #                 q_risk = one - four * q * (one - q)
+            #                 q_risk_sum += wp.clamp(q_risk, zero, one)
+
+            # if missing_count <= zero:
+            #     return fpop
+
+            # # ------------------------------------------------------------
+            # # 2. Convert severity metrics to known-population blend
+            # # ------------------------------------------------------------
+            # # For D3Q27, _q - 1 = 26 non-rest links.
+            # missing_frac = missing_count / compute_dtype(_q - 1)
+
+            # weighted_missing_frac = zero
+            # if nonrest_w > _epsilon:
+            #     weighted_missing_frac = missing_w / nonrest_w
+
+            # q_risk_avg = zero
+            # if needs_mesh_distance:
+            #     q_risk_avg = q_risk_sum / missing_count
+
+            # # D3Q27 guide:
+            # #   0.12 ~ 3 missing links
+            # #   0.32 ~ 8 missing links
+            # count_blend = smoothstep(
+            #     compute_dtype(0.12),
+            #     compute_dtype(0.32),
+            #     missing_frac,
+            # )
+
+            # weighted_blend = smoothstep(
+            #     compute_dtype(0.10),
+            #     compute_dtype(0.30),
+            #     weighted_missing_frac,
+            # )
+
+            # severity = wp.max(count_blend, weighted_blend)
+
+            # # Tuning knobs.
+            # # Increase known_blend_max to move back toward full regularization.
+            # # Increase q_risk_damp to protect known populations near endpoint-heavy q.
+            # known_blend_max = compute_dtype(0.65)
+            # q_risk_damp = compute_dtype(0.60)
+
+            # known_blend = known_blend_max * severity
+            # known_blend *= one - q_risk_damp * q_risk_avg
+            # known_blend = wp.clamp(known_blend, zero, known_blend_max)
+
+            # # Missing populations are still regularized strongly.
+            # missing_blend = one
+
+            # # ------------------------------------------------------------
+            # # 3. Apply adaptive blend and compute new rho / momentum
+            # # ------------------------------------------------------------
+            # rho_new = zero
+            # j_new = _u_vec()
+
+            # for l in range(_q):
+            #     blend = known_blend
+
+            #     if _missing_mask[l] == wp.uint8(1):
+            #         blend = missing_blend
+
+            #     fpop[l] = (one - blend) * f_raw[l] + blend * f_reg[l]
+
+            #     # This clamp is before the final conservation correction.
+            #     # The final correction will repair rho/j after this.
+            #     fpop[l] = wp.max(fpop[l], _epsilon)
+
+            #     rho_new += fpop[l]
+
+            #     for d in range(_d):
+            #         j_new[d] += _c_float[d, l] * fpop[l]
+
+            # # ------------------------------------------------------------
+            # # 4. Rho + momentum preservation correction
+            # #
+            # # Correct to the raw post-BC state:
+            # #   sum(delta_f)       = drho
+            # #   sum(c_l delta_f_l) = dj
+            # #
+            # # For D3Q27:
+            # #   sum(w_l)       = 1
+            # #   sum(w_l c_l)   = 0
+            # #   sum(w_l c_l c_l) = cs2 I
+            # #
+            # # Therefore:
+            # #   delta_f_l = w_l * (drho + c_l . dj / cs2)
+            # # ------------------------------------------------------------
+            # # drho = rho_raw - rho_new
+            # # dj = _u_vec()
+
+            # # for d in range(_d):
+            # #     dj[d] = j_raw[d] - j_new[d]
+
+            # # for l in range(_q):
+            # #     cdotdj = zero
+
+            # #     for d in range(_d):
+            # #         cdotdj += _c_float[d, l] * dj[d]
+
+            # #     corr = _w[l] * (drho + cdotdj / _cs2)
+            # #     fpop[l] += corr
+
+            #     # Deliberately no final clamp here if you want exact rho/j preservation.
+            #     # If you add wp.max(fpop[l], _epsilon) here, rho/j will no longer be exact.
+
+            # return fpop
+
+
+        
         @wp.func
         def regularize_fpop(
             fpop: Any,
             feq: Any,
         ):
             """
-            Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
+            Regularizes the distribution functions by adding non-equilibrium contributions
+            based on second moments of fpop.
             """
-            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
-            zero = compute_dtype(0.0)   
-            three = compute_dtype(3.0)
-
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            #trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
-            trace = zero
-
-            for l in range(_q):
-                QiPi = zero
-                for t in range(_nt):
-                        if t == 0 or t == 3 or t == 5:
-                            QiPi += _qi[l, t] * (PiNeq[t] - trace)
-                        else:
-                            QiPi += _qi[l, t] * PiNeq[t]
-
-                # assign all populations based on eq 45 of Latt et al (2008)
-                # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi                
-                fpop[l] = feq[l] + fpop1
-                # if fpop[l] < _epsilon:
-                #     fpop[l] = feq[l]
-                fpop[l] = wp.max(fpop[l], _epsilon)
-            return fpop
-
-        @wp.func
-        def regularize_wallModel(
-            fpop: Any,
-            feq: Any,
-            y_plus: Any,
-        ):
-            """
-            Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
-            """
-            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
-            f_neq = fpop - feq
-            PiNeq = momentum_flux.warp_functional(f_neq)
-            zero = compute_dtype(0.0)  
-            three = compute_dtype(3.0)
-            scale = wp.clamp(y_plus / compute_dtype(30.0), compute_dtype(0.0), compute_dtype(1.0))
-
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
-            #trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
-            trace = zero
-
-            for l in range(_q):
-                QiPi = zero
-                for t in range(_nt):
-                        if t == 0 or t == 3 or t == 5:
-                            QiPi += _qi[l, t] * (PiNeq[t] - trace)
-                        else:
-                            QiPi += _qi[l, t] * PiNeq[t]
-
-                # assign all populations based on eq 45 of Latt et al (2008)
-                # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi                
-                fpop[l] = feq[l] + fpop1 * scale
-                # if fpop[l] < _epsilon:
-                #     fpop[l] = feq[l]
-                fpop[l] = wp.max(fpop[l], _epsilon)
-
-            return fpop
-
-        @wp.func
-        def regularize_bounceback(
-            _missing_mask: Any,
-            rho: Any,
-            u: Any,
-            f_post: Any,
-        ):
-            """
-            Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
-            """
-
-            # Compute pressure tensor Pi using all f_post-streaming values
-            Pi = momentum_flux.warp_functional(f_post)
-            epsilon = compute_dtype(1e-7)            
             zero = compute_dtype(0.0)
-            scale = compute_dtype(1.0)
-            one = compute_dtype(1.0)            
-            one_pt_five = compute_dtype(1.5) 
             three = compute_dtype(3.0)
-            four_pt_five = compute_dtype(4.5)
 
-            missing_count = zero
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    missing_count += one
-            scale = one - scale * (missing_count / compute_dtype(_q))             
-            
-          
-            # Remove convective portion of Pi
-            Pi[0] -= rho * u[0] * u[0]
-            Pi[1] -= rho * u[0] * u[1]
-            Pi[2] -= rho * u[0] * u[2]
-            Pi[3] -= rho * u[1] * u[1]
-            Pi[4] -= rho * u[1] * u[2]
-            Pi[5] -= rho * u[2] * u[2]
-            
+            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
 
-            u_sqr = zero
-            for d in range(_d):
-                u_sqr += u[d] * u[d]
-
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             for l in range(_q):
                 QiPi = zero
-                for t in range(_nt):                        
+                for t in range(_nt):
                     if t == 0 or t == 3 or t == 5:
-                        QiPi += _qi[l, t] * (Pi[t] - rho / three)
+                        QiPi += _qi[l, t] * (PiNeq[t] - trace)
                     else:
-                        QiPi += _qi[l, t] * Pi[t]
-                
-                # Compute c.u
-                cu = zero
-                for d in range(_d):
-                    cu += _c_float[d, l] * u[d]
-                
-                cu_sq = cu * cu                               
-                f_post[l] = _w[l] * rho * (one + three * cu + four_pt_five * cu_sq - one_pt_five * u_sqr) + _w[l] * four_pt_five * QiPi * scale
-                f_post[l] = wp.max(epsilon, f_post[l])
-                
+                        QiPi += _qi[l, t] * PiNeq[t]
 
-            return f_post
+                fpop1 = compute_dtype(4.5) * _w[l] * QiPi
+                fpop[l] = feq[l] + fpop1
+                fpop[l] = wp.max(fpop[l], _epsilon)
+
+            return fpop
 
         @wp.func
         def grads_approximate_fpop(
@@ -431,17 +415,11 @@ class HelperFunctionsBC(object):
             # Note: See also self.regularize_fpop function which is somewhat similar.
 
             # Compute pressure tensor Pi using all f_post-streaming values
-            Pi = momentum_flux.warp_functional(f_post)            
+            Pi = momentum_flux.warp_functional(f_post)         
             zero = compute_dtype(0.0)
             one = compute_dtype(1.0)
             three = compute_dtype(3.0)
             four_pt_five = compute_dtype(4.5)
-            missing_count = zero
-            # Scale on QiPi helps stability at Re1e6+ not required for Re1e5 and below
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1):
-                    missing_count += one
-            scale = one - ((one + missing_count) / compute_dtype(_q)) 
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             nt = _d * (_d + 1) // 2
@@ -462,18 +440,18 @@ class HelperFunctionsBC(object):
                     cu *= three
 
                     # change f_post using the Grad's approximation
-                    f_post[l] = rho * _w[l] * (one + cu) + _w[l] * four_pt_five * QiPi * scale
+                    f_post[l] = rho * _w[l] * (one + cu) + _w[l] * four_pt_five * QiPi
 
-                    f_post[l] = wp.max(_epsilon, f_post[l])
-                else:
-                    f_post[l] = wp.max(_epsilon, f_post[l])
+                    f_post[l] = wp.max(zero, f_post[l])
+                
 
             return f_post
-        
+
         @wp.func
         def moving_wall_fpop_correction(
             u_wall: Any,
             lattice_direction: Any,
+            rho: Any,
         ):
             # Add forcing term necessary to account for the local density changes caused by the mass displacement
             # as the object moves with velocity u_wall.
@@ -484,12 +462,10 @@ class HelperFunctionsBC(object):
             # be only those in the missing direction (the check for missing direction must be outside of this function).
             cu = compute_dtype(0.0)
             l = lattice_direction
-            for d in range(_d):
-                if _c[d, l] == 1:
-                    cu += u_wall[d]
-                elif _c[d, l] == -1:
-                    cu -= u_wall[d]
-            cu *= compute_dtype(6.0) * _w[l]
+            for d in range(_d):                
+                cu += u_wall[d] * _c_float[d, l]                
+                
+            cu *= compute_dtype(6.0) * _w[l] * rho
             return cu
 
         @wp.func
@@ -503,44 +479,45 @@ class HelperFunctionsBC(object):
             u_wall: Any,
             needs_moving_wall_treatment: bool,
             needs_mesh_distance: bool,
+            _rho: Any,
         ):
             # A local single-node version of the interpolated bounce-back boundary condition due to Bouzidi for a lattice
             # Boltzmann method simulation.
             # Ref:
             # [1] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
             # in: 41st aerospace sciences meeting and exhibit, p. 953.
-
+            rho  = wp.neon_read(_rho, index, 0) 
+            zero = compute_dtype(0.0)
+            half = compute_dtype(0.5)
             one = compute_dtype(1.0)
             two = compute_dtype(2.0)
-            three = compute_dtype(3.0)
             for l in range(_q):
                 # If the mask is missing then take the opposite index
-                if _missing_mask[l] == wp.uint8(1):
-                    # The normalized distance to the mesh or "weights" have been stored in known directions of f_1
-                    if needs_mesh_distance:
-                        # use weights associated with curved boundaries that are properly stored in f_1.
-                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))                   
-                        weight = wp.clamp(weight, compute_dtype(0.001), compute_dtype(1.0))
-
-                        # Use differentiable interpolated BB to find f_missing:
-                        f_post[l] = ((one - weight) * f_post[_opp_indices[l]] + weight * (f_pre[l] + f_pre[_opp_indices[l]])) / (one + weight)
-                        #f_near = two * weight * f_pre[_opp_indices[l]] + (one - two * weight) * f_post[_opp_indices[l]]
-                        #f_far = (one/ (two * weight)) * f_pre[_opp_indices[l]] + ((two * weight - one) / (two * weight)) * f_pre[l]
-                        #blend = three * wp.pow(weight, two) - two * wp.pow(weight, three)
-
-                        #f_post[l] = (one - blend)*f_near + blend*f_far
-                        
-                    else:
-                        # Use regular halfway bounceback
-                        f_post[l] = f_pre[_opp_indices[l]]
-
+                if _missing_mask[l] == wp.uint8(1):                      
+                    # Handle sandwiched boundaries
                     if _missing_mask[_opp_indices[l]] == wp.uint8(1):
-                        # These are cases where the boundary is sandwiched between 2 solid cells and so both opposite directions are missing.
-                        f_post[l] = f_pre[_opp_indices[l]]
-
-                    # Add contribution due to moving_wall to f_missing as is usual in regular Bouzidi BC
-                    if needs_moving_wall_treatment:
-                        f_post[l] += moving_wall_fpop_correction(u_wall, l)
+                        f_post[l] = f_pre[_opp_indices[l]]   
+                    else:
+                        # The normalized distance to the mesh or "weights" have been stored in known directions of f_1                  
+                        if needs_mesh_distance:
+                            # use weights associated with curved boundaries that are properly stored in f_1.
+                            weight = compute_dtype(self.distance_decoder_function(f_1, index, l))  
+                            if weight > compute_dtype(1.0):
+                                weight = half                 
+                            weight = wp.clamp(weight, compute_dtype(0.01), compute_dtype(0.99))                          
+                    
+                            # Yu-Mei-Shyy interpolated BB                        
+                            f_post[l] = ((one - weight) * f_post[_opp_indices[l]] + weight * (f_pre[l] + f_pre[_opp_indices[l]])) / (one + weight)
+                           
+                            if needs_moving_wall_treatment:
+                                correction = moving_wall_fpop_correction(u_wall, l, rho)
+                                f_post[l] += correction / (one + weight)  
+                               
+                        else:
+                            # Standard halfway BB
+                            f_post[l] = f_pre[_opp_indices[l]]
+                            if needs_moving_wall_treatment:
+                                f_post[l] += moving_wall_fpop_correction(u_wall, l, rho)    
             return f_post
 
         @wp.func
@@ -565,724 +542,56 @@ class HelperFunctionsBC(object):
             else:
                 feq_wall = _f_vec()
 
-            
             # Apply method in Tao et al (2018) [1] to find missing populations at the boundary
-            one = compute_dtype(1.0)
+            zero = compute_dtype(0.0)
             half = compute_dtype(0.5)
+            one = compute_dtype(1.0)
+            two = compute_dtype(2.0)
             for l in range(_q):
                 # If the mask is missing then take the opposite index
                 if _missing_mask[l] == wp.uint8(1):
-                    # The normalized distance to the mesh or "weights" have been stored in known directions of f_1
-                    if needs_mesh_distance:
-                        # use weights associated with curved boundaries that are properly stored in f_1.
-                        weight = compute_dtype(self.distance_decoder_function(f_1, index, l))                   
-                        weight = wp.clamp(weight, compute_dtype(0.001), compute_dtype(1.0))
+                    # Handle sandwiched boundaries
+                    if _missing_mask[_opp_indices[l]] == wp.uint8(1):
+                        #Sandwich set to FEQ and move on
+                        f_post[l] = feq[l]                    
                     else:
-                        weight = half
+                        # The normalized distance to the mesh or "weights" have been stored in known directions of f_1
+                        if needs_mesh_distance:
+                            # use weights associated with curved boundaries that are properly stored in f_1.
+                            weight = compute_dtype(self.distance_decoder_function(f_1, index, l))  
+                            # if weight > compute_dtype(1.0):
+                            #     weight = half                 
+                            weight = wp.clamp(weight, compute_dtype(0.01), compute_dtype(0.99))
+                        else:
+                            weight = half
+                        #weight = half             
+                        # Use non-equilibrium bounceback to find f_missing:
+                        fneq = f_pre[_opp_indices[l]] - feq[_opp_indices[l]]
 
-                    # Use non-equilibrium bounceback to find f_missing:
-                    fneq = f_pre[_opp_indices[l]] - feq[_opp_indices[l]]
+                        # Compute equilibrium distribution at the wall
+                        # Same quadratic equilibrium but accounting for zero velocity (no-slip)
+                        if not needs_moving_wall_treatment:
+                            feq_wall[l] = _w[l] * rho
 
-                    # Compute equilibrium distribution at the wall
-                    # Same quadratic equilibrium but accounting for zero velocity (no-slip)
-                    if not needs_moving_wall_treatment:
-                        feq_wall[l] = _w[l] * rho
-
-                    # Assemble wall population for doing interpolation at the boundary
-                    f_wall = feq_wall[l] + fneq
-                    f_post[l] = (f_wall + weight * f_pre[l]) / (one + weight)
-
-                    f_post[l] = wp.max(_epsilon, f_post[l])
-                else:
-                    f_post[l] = wp.max(_epsilon, f_post[l])
+                        # Assemble wall population for doing interpolation at the boundary
+                        f_wall = feq_wall[l] + fneq
+                        f_post[l] = (f_wall + weight * f_pre[l]) / (one + weight)                     
+                                           
 
             return f_post
-
-        # ============================================================================
-        # Wall Model Functions
-        # ============================================================================       
-        @wp.func
-        def solve_musker1(K: Any):
-            """
-            Solve for u⁺ given K = u_parallel * y / ν
-            Refined initial guess for u⁺ using Newton on log-law approx"""
-            if K < compute_dtype(1.0):
-                u_plus = wp.sqrt(K)
-            else:
-                one_k = compute_dtype(1.0) / _kappa
-                u_plus = one_k * wp.log(K) + _B
-                
-                for i in range(5):
-                    if u_plus <= compute_dtype(0.0):
-                        u_plus = compute_dtype(0.01)
-                    g = u_plus - _B - one_k * wp.log(K / u_plus)
-                    g_prime = compute_dtype(1.0) + one_k / u_plus
-                    delta = g / g_prime
-                    u_plus = u_plus - delta    
-            # Iteratively refine initial guess (still explicit, just improving starting point)
-            for _ in range(3):
-                y_plus, dy_du = musker_y_from_u(u_plus)  # ← Now using correct function!
-                if y_plus > _epsilon:
-                    u_plus = K / y_plus  # Direct solution: u⁺ = K / y⁺
-                   # wp.printf(" y+: %f  u+: %f", y_plus, u_plus_init)           
-            
-            return wp.clamp(u_plus, compute_dtype(0.01), compute_dtype(50.0)), dy_du
-
         
         @wp.func
-        def musker_y_from_u(u_plus: Any) -> Any:
-            """Numerical inverse Musker: Solve y+ from u+ via Newton with robust init/clamps"""
-            
-            
-            # Better initial guess: Always use log-law, adjusted for low u+
-            if u_plus < compute_dtype(5.0):
-                y_guess = u_plus * compute_dtype(0.8)  # Slight under for viscous to aid convergence
-            else:
-                y_guess = wp.exp(_kappa * (u_plus - _B)) * compute_dtype(0.5)  # Under-guess log to avoid overshoot
-            
-            tol = compute_dtype(1e-6)
-            max_iter = 50  # Increased for high u+
-            converged = wp.bool(False)
-            
-            for i in range(max_iter):
-                # Exact Musker u+ calc
-                term1 = compute_dtype(5.424) * wp.atan((compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / compute_dtype(16.7))
-                denom = y_guess * y_guess - compute_dtype(8.15) * y_guess + compute_dtype(86.0)
-                denom = wp.max(denom, compute_dtype(1e-6))  # Safer clamp >0
-                term2 = wp.log((y_guess + compute_dtype(10.6))**compute_dtype(9.6) / denom) / wp.log(compute_dtype(10.0))  # Use natural log equiv for stability
-                u_calc = term1 + term2 - compute_dtype(3.52)
-                
-                # Derivative du+/dy+ (improved approx to avoid tiny/neg)
-                dterm1 = compute_dtype(5.424) * compute_dtype(2.0) / (compute_dtype(1.0) + ((compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / compute_dtype(16.7))**compute_dtype(2.0))
-                dterm2 = (compute_dtype(9.6) / (y_guess + compute_dtype(10.6))) - (compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / denom
-                du_dy = dterm1 + dterm2 / wp.log(compute_dtype(10.0))
-                du_dy = wp.max(du_dy, compute_dtype(1e-6))  # Clamp to prevent div0 or neg
-                
-                # Update with damping to prevent explosion
-                dy = (u_plus - u_calc) / du_dy
-                dy = wp.clamp(dy, -y_guess * compute_dtype(0.5), y_guess * compute_dtype(2.0))  # Limit step size
-                y_guess += dy
-                y_guess = wp.max(y_guess, compute_dtype(1e-3))  # Clamp low
-                
-                if wp.abs(dy) < tol * wp.max(compute_dtype(1.0), y_guess):
-                    converged = wp.bool(True)
-                    break
-            
-            # Fallback to log-law if not converged (rare now)
-            if not converged:
-                y_guess = wp.exp(_kappa * (u_plus - _B))
-            
-            # Recompute du+/dy+ at final y_guess for accurate derivative
-            term1 = compute_dtype(5.424) * wp.atan((compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / compute_dtype(16.7))
-            denom = y_guess * y_guess - compute_dtype(8.15) * y_guess + compute_dtype(86.0)
-            denom = wp.max(denom, compute_dtype(1e-6))
-            term2 = wp.log((y_guess + compute_dtype(10.6))**compute_dtype(9.6) / denom) / wp.log(compute_dtype(10.0))
-            # u_calc not needed
-            
-            dterm1 = compute_dtype(5.424) * compute_dtype(2.0) / (compute_dtype(1.0) + ((compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / compute_dtype(16.7))**compute_dtype(2.0))
-            dterm2 = (compute_dtype(9.6) / (y_guess + compute_dtype(10.6))) - (compute_dtype(2.0) * y_guess - compute_dtype(8.15)) / denom
-            du_dy = dterm1 + dterm2 / wp.log(compute_dtype(10.0))
-            du_dy = wp.max(du_dy, compute_dtype(1e-6))
-            
-            dy_du = compute_dtype(1.0) / du_dy  # dy+/du+
-            
-            return y_guess, dy_du
-            
-        @wp.func
-        def apg_correction_factor(
-            y_distance: Any,
-            rho: Any,
-            u_parallel_mag: Any,
-            u_tau: Any,
-            nu: Any,
-            u_est: Any,
-            normal: Any,
-        ):
-            """
-            Compute pressure gradient correction factor for wall model.
-            
-            Uses the Clauser parameter β = (δ*/τ_w) × (dp/dx) as basis,
-            but approximated from local quantities.
-            
-            Returns factor in range [0.3, 1.3]:
-            - 1.0 = zero pressure gradient (equilibrium log-law valid)
-            - <1.0 = adverse pressure gradient (reduce wall model correction)
-            - >1.0 = favorable pressure gradient (increase wall model correction)
-            """
-            
-            # Compute y+ for regime detection
-            y_plus = y_distance * u_tau / nu
-            
-            # =========================================
-            # Method: Use velocity profile shape factor
-            # =========================================
-            # In equilibrium, u/u_τ = f(y⁺) with specific shape
-            # In APG, velocity profile is "fuller" near wall (higher u⁺ at same y⁺)
-            # In FPG, velocity profile is "thinner"
-            #
-            # Compare measured u⁺ to expected equilibrium u⁺
-            
-            u_plus_measured = u_parallel_mag / wp.max(u_tau, _epsilon)
-            u_plus_equilibrium = musker_profile(y_plus)
-            
-            # Shape deviation: positive if measured > equilibrium (FPG-like)
-            #                  negative if measured < equilibrium (APG-like)
-            shape_deviation = (u_plus_measured - u_plus_equilibrium) / wp.max(u_plus_equilibrium, compute_dtype(1.0))
-            
-            # =========================================
-            # Additional indicator: normal velocity
-            # =========================================
-            # Flow toward wall (v·n > 0, where n points into fluid) suggests FPG
-            # Flow away from wall (v·n < 0) suggests APG/separation
-            
-            v_normal = wp.dot(u_est, normal)
-            v_normal_normalized = v_normal / wp.max(u_parallel_mag, _epsilon)
-            
-            # Combine indicators (shape deviation is primary)
-            # Scale down normal velocity contribution to avoid noise issues
-            indicator = shape_deviation + compute_dtype(0.1) * v_normal_normalized
-            
-            # =========================================
-            # Convert to correction factor
-            # =========================================
-            # Use smooth mapping to bounded range
-            
-            # Sensitivity parameter (how much the factor changes per unit indicator)
-            sensitivity = compute_dtype(0.5)
-            
-            # Compute factor using tanh for smooth saturation
-            factor = compute_dtype(1.0) + sensitivity * wp.tanh(indicator)
-            
-            # Clamp to reasonable range
-            factor = wp.clamp(factor, compute_dtype(0.3), compute_dtype(1.3))
-            
-            # =========================================
-            # Reduce correction at low y+ (viscous layer)
-            # =========================================
-            # APG/FPG effects are less pronounced in viscous sublayer
-            
-            y_plus_threshold = compute_dtype(30.0)
-            viscous_damping = wp.clamp(y_plus / y_plus_threshold, compute_dtype(0.0), compute_dtype(1.0))
-            
-            # Blend factor toward 1.0 as we approach viscous layer
-            factor = compute_dtype(1.0) + (factor - compute_dtype(1.0)) * viscous_damping
-            
-            return factor
-
-        @wp.func
-        def musker_profile(y_plus: Any) -> Any:
-            """
-            Modernized Musker (1979) / Nagib-Chauhan-Monkewitz (2007) form for u+ = f(y+)
-            Valid from y+ = 0 to y+ >1e6, with correct asymptotic to log-law.
-            """
-            kappa = _kappa
-            B = _B
-            a = compute_dtype(1.0) / kappa + compute_dtype(2.0)  # =4.44 for kappa=0.41
-            alpha = (a - compute_dtype(1.0)/kappa) * compute_dtype(0.5)  # =1.0 for correct slope
-            beta = wp.sqrt(compute_dtype(2.0) * a * alpha - alpha * alpha)
-
-            term1 = y_plus / a
-            
-            arg_log = wp.max(a * y_plus / alpha, compute_dtype(1.0) + _epsilon)
-            term2 = (alpha / kappa) * wp.log(arg_log)
-            
-            arg_arctan = (a * y_plus - alpha) / beta
-            term3 = (beta / (compute_dtype(2.0) * kappa)) * wp.atan(arg_arctan)
-            
-            # Constant to match B: cancels extra terms in asymptotic (1/kappa) ln(y+) + B
-            const = B - (alpha / kappa) * wp.log(a / alpha) - (beta / (compute_dtype(2.0) * kappa)) * (_pi / compute_dtype(2.0))
-            
-            u = term1 + term2 + term3 + const
-            return wp.max(u, compute_dtype(0.0))  # Clamp for robustness at low y+
-
-        @wp.func
-        def solve_musker(K: Any) -> Any:
-            """
-            Solve u+ such that u+ = musker_profile(K / u+)
-            Bisection with fixed bracket and condition for stable convergence.
-            """
-            if K < _epsilon:
-                return wp.sqrt(K)  # Viscous fallback
-            
-            u_lo = _epsilon
-            u_hi = K * compute_dtype(2.0)  # Wider for small K robustness
-
-            kappa = _kappa
-            B = _B
-            if K > compute_dtype(30.0):
-                u_log = (wp.log(K) / kappa) + B
-                u_hi = wp.max(u_hi, u_log * compute_dtype(2.5))  # Optional tighten, consistent kappa
-            
-            tol_rel = compute_dtype(1e-4) 
-            for i in range(20):
-                if (u_hi - u_lo) < (tol_rel * u_hi + _epsilon):
-                    break
-                u_mid = (u_lo + u_hi) * compute_dtype(0.5)
-                if u_mid < _epsilon:
-                    u_mid = _epsilon
-                y_mid = K / u_mid
-                u_computed = musker_profile(y_mid)
-                if u_computed > u_mid:
-                    u_lo = u_mid  # Reversed for correct convergence
-                else:
-                    u_hi = u_mid
-
-            u_final = (u_lo + u_hi) * compute_dtype(0.5)
-            return wp.max(u_final, _epsilon)
-
-        
-        # Reichardt WM
-        @wp.func
-        def reichardt_profile(y_plus: Any) -> Any:
-            """
-            Reichardt (1951) velocity profile - explicit u+(y+)
-            Correctly captures: u+ = y+ as y+ → 0, log-law as y+ → ∞
-            """
-            kappa = _kappa  # 0.41
-            C = compute_dtype(11.0)  # Transition parameter
-            # Logarithmic part (transitions correctly)
-            log_term = (compute_dtype(1.0) / kappa) * wp.log(
-                compute_dtype(1.0) + kappa * y_plus
-            )
-            # Damping function that enforces u+ = y+ near wall
-            damping = compute_dtype(8.5) * (
-                compute_dtype(1.0)
-                - wp.exp(-y_plus / C)
-                - (y_plus / C) * wp.exp(-y_plus / compute_dtype(3.0))
-            )
-            u_plus = log_term + damping
-            return wp.max(u_plus, compute_dtype(0.0))
-        
-        @wp.func
-        def reichardt_derivative(y_plus: Any) -> Any:
-            """
-            Analytical derivative du+/dy+ of Reichardt profile
-            """
-            kappa = _kappa
-            C = compute_dtype(11.0)
-            C3 = compute_dtype(3.0)
-            # d/dy+ of log(1 + κy+)/κ = 1/(1 + κy+)
-            d_log = compute_dtype(1.0) / (compute_dtype(1.0) + kappa * y_plus)
-            # d/dy+ of damping terms
-            # d/dy+ of (1 - exp(-y+/C)) = (1/C) exp(-y+/C)
-            # d/dy+ of (y+/C) exp(-y+/C3) = (1/C) exp(-y+/C3) - (y+/C/C3) exp(-y+/C3)
-            exp_C = wp.exp(-y_plus / C)
-            exp_C3 = wp.exp(-y_plus / C3)
-            d_damping = compute_dtype(8.5) * (
-                exp_C / C
-                - (compute_dtype(1.0) / C) * exp_C3
-                + (y_plus / (C * C3)) * exp_C3
-            )
-            return wp.max(d_log + d_damping, _epsilon)
-        
-        @wp.func
-        def solve_wall_function(u_parallel_mag: Any, y_distance: Any, nu: Any) -> Any:
-            """
-            Solve for u_tau given u_parallel_mag, y_distance, and nu using the Reichardt profile with refinement.
-            """
-            # Compute K = y+ * u+ ≈ u_parallel_mag * y_distance / nu
-            K = u_parallel_mag * y_distance / nu
-            K = wp.max(K, _epsilon)
-
-            # Initial solve for u+ using the profile iteration
-            if K < _epsilon:
-                u_plus = wp.sqrt(K)  # Viscous limit: u+ = y+ → K = u+²
-            else:
-                # Initial guess
-                if K < compute_dtype(25.0):
-                    # Viscous regime: K ≈ u+² → u+ ≈ √K
-                    u_plus = wp.sqrt(K)
-                else:
-                    # Log regime: use approximate inverse
-                    # K = y+ * u+ where u+ ≈ (1/κ)ln(y+) + B
-                    # Approximate: u+ ≈ √(K/ln(K)) as starting point
-                    u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
-
-                # Fixed point iteration: solve u+ = profile(K/u+)
-                for _ in range(20):
-                    y_plus = K / wp.max(u_plus, _epsilon)
-                    # Use Reichardt profile
-                    u_computed = reichardt_profile(y_plus)
-                    # Secant-like update (stable)
-                    u_plus_new = (u_plus + u_computed) * compute_dtype(0.5)
-                    if wp.abs(u_plus_new - u_plus) < compute_dtype(1e-6) * u_plus:
-                        break
-                    u_plus = u_plus_new
-
-            u_plus = wp.max(u_plus, _epsilon)
-            # Initial u_tau
-            u_tau = u_parallel_mag / u_plus
-
-            # Refine u_tau to ensure consistency
-            tolerance = compute_dtype(1e-4)
-            max_iter = 5  # Usually converges in 3-4 iterations
-            for iter in range(max_iter):
-                # Compute y+ with current u_tau
-                y_plus = y_distance * u_tau / nu
-                # Get u+ from Reichardt profile
-                u_plus = reichardt_profile(y_plus)
-                # Velocity implied by this u_tau and u+
-                u_implied = u_tau * u_plus
-                # Update u_tau to match observed velocity
-                u_tau_old = u_tau
-                if u_implied > _epsilon:
-                    u_tau = u_tau * (u_parallel_mag / u_implied)
-                # Check convergence
-                if wp.abs(u_tau - u_tau_old) < tolerance * wp.max(u_tau, _epsilon):
-                    break
-
-            return u_tau
-
-        @wp.func
-        def p_grad_proxy_density(
-            f_pop: Any,   # distributions at the node (typically f_pre)
-            rho: Any,     # local density
-            u: Any,       # local velocity vector (same as used for macroscopic)
-            normal: Any,  # wall-normal unit vector (points into fluid)
-            s_hat: Any,   # wall-tangential / streamwise unit vector
-            nu:Any,
-        ):
-            """
-            Compute τ(h)/ρ along the wall-tangent direction s_hat at the first
-            off-wall cell using the LB momentum flux (second moment).
-
-            τ(h)/ρ = nᵀ P s_hat, with P the (deviatoric + isotropic) stress tensor
-            after removing the convective part ρ u uᵀ. The isotropic part drops
-            out because n · s_hat = 0.
-            """
-
-           
-            feq = equilibrium.warp_functional(rho, u)
-            f_neq = f_pop - feq
-            # Second moment from LB populations
-            Pi = momentum_flux.warp_functional(f_neq)
-
-            # Remove convective part ρ u uᵀ to get stress-like tensor
-            if wp.static(_d == 3):
-                # Pi layout (3D): [Pxx, Pxy, Pxz, Pyy, Pyz, Pzz]
-                Pxx = Pi[0]# - rho * u[0] * u[0]
-                Pxy = Pi[1]# - rho * u[0] * u[1]
-                Pxz = Pi[2]# - rho * u[0] * u[2]
-                Pyy = Pi[3]# - rho * u[1] * u[1]
-                Pyz = Pi[4]# - rho * u[1] * u[2]
-                Pzz = Pi[5]# - rho * u[2] * u[2]
-
-                # P · s_hat
-                Psx = Pxx * s_hat[0] + Pxy * s_hat[1] + Pxz * s_hat[2]
-                Psy = Pxy * s_hat[0] + Pyy * s_hat[1] + Pyz * s_hat[2]
-                Psz = Pxz * s_hat[0] + Pyz * s_hat[1] + Pzz * s_hat[2]
-
-                # traction τ_s = nᵀ (P · s_hat)
-                traction = (
-                    normal[0] * Psx +
-                    normal[1] * Psy +
-                    normal[2] * Psz
-                )
-
-            else:
-                # Pi layout (2D): [Pxx, Pxy, Pyy]  (if ever used in 2D)
-                Pxx = Pi[0] - rho * u[0] * u[0]
-                Pxy = Pi[1] - rho * u[0] * u[1]
-                Pyy = Pi[2] - rho * u[1] * u[1]
-
-                Psx = Pxx * s_hat[0] + Pxy * s_hat[1]
-                Psy = Pxy * s_hat[0] + Pyy * s_hat[1]
-
-                traction = normal[0] * Psx + normal[1] * Psy
-
-            # τ/ρ (can be signed; use directly in TBLE)
-            #tau_over_rho = traction / wp.max(rho, _epsilon)
-            tau_relax = compute_dtype(0.5) + nu / wp.max(_cs2, _epsilon)
-            tau_relax = wp.max(tau_relax, compute_dtype(0.500001))  # avoid omega=2 singular
-
-            omega = compute_dtype(1.0) / tau_relax
-
-            # conversion factor (BGK-style): (1 - omega/2)
-            conv = compute_dtype(1.0) - compute_dtype(0.5) * omega
-
-            # keep it sane
-            conv = wp.clamp(conv, compute_dtype(0.0), compute_dtype(1.0))
-
-            # tau/ρ in the same "units family" as u_tau^2
-            tau_over_rho = (traction * conv) / wp.max(rho, _epsilon)
-            return tau_over_rho
-
-
-        @wp.func
-        def compute_wall_modeled_velocity(
-            index: Any,
-            _missing_mask: Any,
-            f_0: Any,
-            f_1: Any,
-            f_pre: Any,
-            f_post: Any,
-            u_wall: Any,
-            nu: Any, 
-        ):
-            
-            # Get wall geometry
-            normal, y_distance = get_normal_and_distance(_missing_mask, f_1, index)
-            
-            # Macroscopic state
-            rho, u_est = macroscopic.warp_functional(f_pre)
-            
-            # # Decompose velocity
-            u_normal = normal * wp.dot(u_est, normal)
-            u_parallel = u_est - u_normal
-            u_parallel_mag = wp.length(u_parallel)
-            if u_parallel_mag > _epsilon: 
-                u_parallel_unit = u_parallel / u_parallel_mag                
-            else: 
-                u_parallel_mag = compute_dtype(0.0)               
-                u_parallel_unit = _u_vec(0.0, 0.0, 0.0)  
-                   
-            # Solve u_tau from Reichardt
-            u_tau = solve_wall_function(u_parallel_mag, y_distance, nu)
-            # Get approximate y+ (based on f_pre)
-            y_plus = y_distance * u_tau / nu
-            y_plusR =y_plus
-            u_tauR = u_tau
-                    
-            # APG/FPG assessment                        
-            tau_h_over_rho  = p_grad_proxy_density(f_pre, rho, u_est, normal, u_parallel_unit, nu) 
-            sign_tau = wp.sign(tau_h_over_rho)
-            if sign_tau == compute_dtype(0.0):
-                sign_tau = compute_dtype(1.0)
-            tau_w_over_rho = sign_tau * u_tauR * u_tauR  # Wall shear from Reichardt (baseline)  
-            # TBLE-style local pressure-gradient proxy
-            p_grad_proxy = (tau_h_over_rho - tau_w_over_rho) / wp.max(y_distance, _epsilon)
-           
-            p_grad_raw = p_grad_proxy
-            betaR = (p_grad_proxy *y_distance) / (u_tauR*u_tauR +_epsilon)
-            beta_clamped = wp.clamp(betaR, compute_dtype(-10.0), compute_dtype(10.0))
-            p_grad_tble = beta_clamped * (u_tauR*u_tauR) / max(y_distance, _epsilon)
-            #p_grad_proxy = wp.clamp(p_grad_proxy, compute_dtype(-5e-3), compute_dtype(5e-3)) #was 5e-4
-            if u_parallel_mag < compute_dtype(5e-3):
-                p_grad_tble = compute_dtype(0.0)
-            # Solve for dudy based on TBLE
-            
-            u_tau, dudy = solve_tble(y_distance, nu, rho, u_parallel_mag, p_grad_tble)
-            y_plus = u_tau * y_distance / nu 
-            du_plus_dy_plus = reichardt_derivative(y_plus)
-            velocity_gradient = (u_tau * u_tau / nu) * du_plus_dy_plus  
-
-            # Solve for Slip Mag based on TBLE        
-            u_slip_mag = u_parallel_mag - dudy * y_distance
-            u_slip_mag = wp.clamp(u_slip_mag, compute_dtype(-0.01) * u_parallel_mag, compute_dtype(1.5) * u_parallel_mag)
-            u_slip = u_parallel_unit * u_slip_mag
-            
-
-            # Effective wall velocity
-            u_wall_effective_t = u_wall + u_slip
-
-            # y+ gating – don’t use TBLE in very low y+
-            y0 = compute_dtype(15.0)   
-            y1 = compute_dtype(20.0)  
-            w_y = (y_plusR - y0) / (y1 - y0)
-            w_y = wp.clamp(w_y, compute_dtype(0.0), compute_dtype(1.0))
-            # # Blend between No-slip and TBLE based on 
-            u_wall_effective = ((compute_dtype(1.0) - w_y) * u_wall) + (w_y * u_wall_effective_t)                
-            
-            #wp.printf("uParallel, %f, testVel, %f, \n",
-            #            u_parallel_mag, test_vel)
-            # # Debug print
-            #if (normal[2] > compute_dtype(0.5)):
-            #    wp.printf("NormalX, %f, NormalY, %f, NormalZ, %f, uParallel, %f, y_dist, %f, utauR, %f, y_plusR, %f, tau_h, %f, tau_w, %f, P_grad_raw, %f, P_grad_tble, %f, u_tauT, %f, betaR, %f, yplusT, %f, dudy, %f, dupdyp, %f, vel_grad, %f, blend, %f, uslip, %f\n",
-              #        normal[0], normal[1], normal[2],  u_parallel_mag, y_distance, u_tauR, y_plusR, tau_h_over_rho, tau_w_over_rho, p_grad_raw, p_grad_tble, u_tau, betaR, y_plus, dudy, du_plus_dy_plus,velocity_gradient, w_y, u_slip_mag)
-    
-            # # Enforce zero normal component        
-            u_wall_effective = u_wall_effective - normal * wp.dot(u_wall_effective, normal)
-
-            return u_wall_effective
-        
-        @wp.func
-        def solve_tble(
-            y_distance: Any,  # Wall-normal distance h (e.g., boundary layer thickness or outer scale)
-            nu: Any,          # Kinematic viscosity
-            rho: Any,         # Density (unused, kept for interface)
-            u_target: Any,    # Target parallel velocity at y_distance (u_parallel_mag)
-            p_grad: Any,      # Local pressure gradient / rho
-        ):
-            """
-            Wall-model gradient solver returning dudy_at_ydist.
-
-            Features:
-            - Laminar / stagnation cutoff based on local Re_y to avoid PG-driven
-                blow-ups near stagnation.
-            - Separation check in high-Re attached regions.
-            - Equilibrium turbulent BL integration with PG-dependent damping and
-                outer mixing-length cap.
-            - Quadratic local dudy with a cap against a laminar estimate.
-            """
-
+        def smoothstep(edge0: Any, edge1: Any, x: Any):
             zero = compute_dtype(0.0)
-            ydist = y_distance
+            one = compute_dtype(1.0)
+            two = compute_dtype(2.0)
+            three = compute_dtype(3.0)
 
-            # Precompute laminar gradient used in several places
-            dudy_lam = u_target / wp.max(ydist, _epsilon)
+            denom = wp.max(edge1 - edge0, _epsilon)
+            t = wp.clamp((x - edge0) / denom, zero, one)
 
-         
+            return t * t * (three - two * t)
 
-            u_tau_lo = _epsilon
-            u_tau_hi = wp.max(u_target * compute_dtype(2.0), _epsilon)
-
-            # 1.1 quick separation check using u_tau_hi
-            tau_wall_hi  = u_tau_hi * u_tau_hi          # τ/ρ at the wall
-            tau_outer_hi = tau_wall_hi + p_grad * ydist # τ/ρ at y=ydist
-
-      
-
-            # ------------------------------------------------------------------
-            # 2. ATTACHED HIGH-Re equilibrium BL solve
-            # ------------------------------------------------------------------
-            N_steps = wp.int32(50)
-            alpha   = compute_dtype(2.0)
-            tol     = compute_dtype(1e-4)
-
-            for iter in range(30):
-                u_tau_mid = (u_tau_lo + u_tau_hi) * compute_dtype(0.5)
-                if u_tau_mid < _epsilon:
-                    u_tau_mid = _epsilon
-
-                # Pressure-gradient parameter
-                p_plus = (nu / (u_tau_mid * u_tau_mid * u_tau_mid)) * p_grad
-
-                # PG-dependent van Driest; clamp A+ to avoid zeros/negatives
-                A_plus_factor = wp.max(compute_dtype(1.0) - compute_dtype(11.8) * p_plus, compute_dtype(0.005)) if p_plus > compute_dtype(0.0) else wp.max(compute_dtype(1.0) + compute_dtype(11.8) * wp.abs(p_plus), compute_dtype(0.005))  # Symmetric for FPG/APG
-                A_plus = _A_plus * wp.sqrt(compute_dtype(1.0) / A_plus_factor)  # Now reduces for APG, increases for FPG
-                #A_plus_factor = wp.max(compute_dtype(1.0) - compute_dtype(11.8) * p_plus, compute_dtype(0.1))
-                #A_plus = _A_plus * wp.pow(A_plus_factor, compute_dtype(-0.5))
-
-                u_computed = zero
-                y_prev     = zero
-
-                for step in range(1, N_steps + 1):
-                    frac = compute_dtype(step) / compute_dtype(N_steps)
-                    y    = ydist * wp.pow(frac, alpha)
-                    dy   = y - y_prev
-
-                    y_plus = y * u_tau_mid / nu
-                    damp   = compute_dtype(1.0) - wp.exp(-y_plus / A_plus)
-                    l_mix_uncapped = _kappa * y * damp
-                    l_mix          = wp.min(l_mix_uncapped, compute_dtype(0.085) * ydist)
-
-                    dudy_est = u_computed / wp.max(y, _epsilon)
-                    nu_t     = l_mix * l_mix * wp.max(wp.abs(dudy_est), _epsilon)
-
-                    tau_over_rho = (u_tau_mid * u_tau_mid) + p_grad * y
-                    sign         = wp.sign(tau_over_rho)
-                    tau_mag      = wp.max(
-                        wp.abs(tau_over_rho),
-                        (u_tau_mid * u_tau_mid) * compute_dtype(1e-3)
-                    )
-                    tau_over_rho = sign * tau_mag
-
-                    dudy       = tau_over_rho / (nu + nu_t + _epsilon)
-                    u_computed += dudy * dy
-
-                    y_prev = y
-
-                if u_computed < u_target:
-                    u_tau_lo = u_tau_mid
-                else:
-                    u_tau_hi = u_tau_mid
-
-                if (u_tau_hi - u_tau_lo) < (tol * u_tau_hi + _epsilon):
-                    break
-
-            u_tau = (u_tau_lo + u_tau_hi) * compute_dtype(0.5)
-            u_tau = wp.max(u_tau, _epsilon)
-
-            # 2.1 final PG-dependent A+
-            p_plus = (nu / (u_tau * u_tau * u_tau)) * p_grad
-            A_plus_factor = wp.max(compute_dtype(1.0) - compute_dtype(11.8) * p_plus, compute_dtype(0.005)) if p_plus > compute_dtype(0.0) else wp.max(compute_dtype(1.0) + compute_dtype(11.8) * wp.abs(p_plus), compute_dtype(0.005))  # Symmetric for FPG/APG
-            A_plus = _A_plus * wp.sqrt(compute_dtype(1.0) / A_plus_factor)  # Now reduces for APG, increases for FPG
-            #A_plus_factor = wp.max(compute_dtype(1.0) - compute_dtype(11.8) * p_plus, compute_dtype(0.1))
-            #A_plus = _A_plus * wp.pow(A_plus_factor, compute_dtype(-0.5))
-
-            # 2.2 local dudy at ydist from quadratic stress balance
-            y_plus = ydist * u_tau / nu
-            damp   = compute_dtype(1.0) - wp.exp(-y_plus / A_plus)
-
-            l_mix_uncapped = _kappa * ydist * damp
-            l_mix          = wp.min(l_mix_uncapped, compute_dtype(0.085) * ydist)
-
-            # total shear at y = ydist
-            tau_over_rho = (u_tau * u_tau) + p_grad * ydist
-
-            # If total shear goes negative, you're effectively in separation / non-eq:
-            # return a safe baseline gradient (prevents sign-flip ringing).
-            if tau_over_rho <= zero:
-                y_plus_reich = ydist * u_tau / nu
-                dplus_reich  = reichardt_derivative(y_plus_reich)
-                dudy_reich   = (u_tau * u_tau / nu) * dplus_reich
-                return u_tau, dudy_reich
-
-            tau_mag = wp.max(wp.abs(tau_over_rho), (u_tau * u_tau) * compute_dtype(1e-3) )
-
-            # Baselines (smooth)
-            dudy_lam   = u_target / wp.max(ydist, _epsilon)
-            y_plus_r   = ydist * u_tau / nu
-            dplus_r    = reichardt_derivative(y_plus_r)
-            dudy_reich = (u_tau * u_tau / nu) * dplus_r
-
-            # Seed for fixed-point iteration: smooth & positive
-            S = wp.max(wp.abs(dudy_reich), wp.abs(dudy_lam))
-            S = wp.max(S, _epsilon)
-
-            # Under-relaxed fixed-point iterations (2 is usually enough)
-            omega = compute_dtype(0.55)  # 0.2–0.5 recommended
-            for _ in range(3):
-                nu_t = l_mix * l_mix * wp.max(S, compute_dtype(1e-8))
-                S_new = tau_mag / (nu + nu_t + _epsilon)
-                S = (compute_dtype(1.0) - omega) * S + omega * S_new
-
-            # Optional: ratio limiter relative to Reichardt to prevent "too free-slip pockets"
-            base = wp.max(wp.abs(dudy_reich), compute_dtype(1e-8))
-            r = S / base
-
-            r_min = compute_dtype(0.0001)  # allow up to 20x slip vs Reichardt
-            r_max = compute_dtype(1.0)  # don't exceed Reichardt too much
-            r = wp.clamp(r, r_min, r_max)
-
-            dudy_smooth = r * base
-
-            # Enforce non-negative gradient since u_target is a magnitude and slip is along u_parallel_unit
-            dudy_smooth = wp.max(dudy_smooth, zero)
-
-            return u_tau, dudy_smooth
-
-
-        @wp.func
-        def compute_profile_u(
-            y: Any,
-            u_tau: Any,
-            nu: Any,
-            p_grad: Any,
-        ):
-            zero = compute_dtype(0.0)
-            N_steps = wp.int32(30)
-            alpha = compute_dtype(2.0)
-            u_computed = zero
-            y_prev = zero
-            for step in range(1, N_steps + 1):
-                frac = compute_dtype(step) / compute_dtype(N_steps)
-                y_current = y * wp.pow(frac, alpha)
-                dy = y_current - y_prev
-                y_plus = y_current * u_tau / nu
-                damp = compute_dtype(1.0) - wp.exp(-y_plus / _A_plus)
-                l_mix = _kappa * y_current * damp
-                dudy_est = u_computed / wp.max(y_current + _epsilon, _epsilon)
-                nu_t = l_mix * l_mix * wp.max(wp.abs(dudy_est), _epsilon)
-                tau_over_rho = (u_tau * u_tau) + p_grad * y_current
-                sign    = wp.sign(tau_over_rho)
-                tau_mag = wp.max(wp.abs(tau_over_rho), (u_tau*u_tau)*compute_dtype(1e-3))
-                tau_over_rho = sign * tau_mag
-                dudy = tau_over_rho / (nu + nu_t + _epsilon)
-                u_computed += dudy * dy
-                y_prev = y_current
-            return u_computed
-        
         @wp.func
         def neon_index_to_warp(neon_field_hdl: Any, index: Any):
             # Unpack the global index in Neon at the finest level and convert it to a warp vector
@@ -1299,38 +608,789 @@ class HelperFunctionsBC(object):
             index_wp = wp.vec3i(gx, gy, gz)
             return index_wp
 
-        # Store all functions as class attributes
+        # ============================================================================
+        # Wall Model Functions
+        # ============================================================================    
+        @wp.func
+        def reichardt_profile(y_plus: Any) -> Any:
+            """
+            Reichardt (1951) velocity profile - explicit u+(y+).
+            Correctly captures: u+ = y+ as y+ -> 0, log-law as y+ -> inf.
+            """
+            kappa = _kappa
+            C = compute_dtype(11.0)
+
+            log_term = (compute_dtype(1.0) / kappa) * wp.log(
+                compute_dtype(1.0) + kappa * y_plus
+            )
+
+            damping = compute_dtype(8.5) * (
+                compute_dtype(1.0)
+                - wp.exp(-y_plus / C)
+                - (y_plus / C) * wp.exp(-y_plus / compute_dtype(3.0))
+            )
+
+            u_plus = log_term + damping
+            return wp.max(u_plus, compute_dtype(0.0))
+
+        @wp.func
+        def reichardt_derivative(y_plus: Any) -> Any:
+            """
+            Analytical derivative du+/dy+ of the Reichardt profile.
+            """
+            kappa = _kappa
+            C = compute_dtype(11.0)
+            C3 = compute_dtype(3.0)
+
+            d_log = compute_dtype(1.0) / (compute_dtype(1.0) + kappa * y_plus)
+
+            exp_C = wp.exp(-y_plus / C)
+            exp_C3 = wp.exp(-y_plus / C3)
+
+            d_damping = compute_dtype(8.5) * (
+                exp_C / C
+                - (compute_dtype(1.0) / C) * exp_C3
+                + (y_plus / (C * C3)) * exp_C3
+            )
+
+            return wp.max(d_log + d_damping, _epsilon)
+
+        @wp.func
+        def solve_wall_function(K: Any) -> Any:
+            """
+            Solve for u_plus given K = |u_parallel| * y / nu = y+ * u+.
+            Uses Newton iteration with the Reichardt profile.
+            Returns u_plus (dimensionless velocity).
+            """
+            if K < _epsilon:
+                return wp.sqrt(wp.max(K, compute_dtype(0.0)))
+
+            # Initial guess
+            if K < compute_dtype(25.0):
+                u_plus = wp.sqrt(K)
+            else:
+                u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
+
+            # Newton iteration: solve g(u+) = u+ - profile(K/u+) = 0
+            for _ in range(15):
+                y_plus = K / wp.max(u_plus, _epsilon)
+                u_profile = reichardt_profile(y_plus)
+                residual = u_plus - u_profile
+
+                if wp.abs(residual) < compute_dtype(1e-6) * wp.max(u_plus, compute_dtype(1.0)):
+                    break
+
+                du_dy = reichardt_derivative(y_plus)
+                g_prime = compute_dtype(1.0) + du_dy * K / (u_plus * u_plus + _epsilon)
+
+                delta = residual / wp.max(g_prime, _epsilon)
+                u_plus = u_plus - delta
+                u_plus = wp.max(u_plus, _epsilon)
+
+            return wp.max(u_plus, _epsilon)
+       
+        @wp.func
+        def sample_neighbor_Bbased(
+            index: Any,
+            normal: Any,
+            _rho: Any, 
+            _u: Any,
+            streamwise: Any,
+        ):
+            """
+            1. Snap to the lattice link best aligned with `normal` → step 1 voxel to the "neighbor".
+            2. Snap to the lattice link best aligned with `streamwise` → from the neighbor,
+            step 1 voxel in downdstream and upstream to get data.
+
+            
+            """
+            
+            # ============================================================
+            # Find best lattice link aligned with the NORMAL 
+            # ============================================================
+            best_n_l   = wp.int32(0)
+            best_n_dot = compute_dtype(-1.0e9)
+            for l in range(1, _q):
+                # Start with 1 as zero is rest position
+                cx = _c_float[0, l]
+                cy = _c_float[1, l]
+                cz = _c_float[2, l]
+                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
+                    continue
+                c    = wp.vec3(cx, cy, cz)
+                cmag = wp.length(c)
+                if cmag <= _epsilon:
+                    continue
+                c_unit = c / cmag
+                a = wp.dot(c_unit, normal)
+                if a > best_n_dot:
+                    best_n_dot = a
+                    best_n_l   = wp.int32(l)
+
+            # Flip if best dot was negative.
+            step_dir = wp.vec3i(_c[0, best_n_l], _c[1, best_n_l], _c[2, best_n_l])
+            if best_n_dot < compute_dtype(0.0):
+                step_dir = -step_dir
+            
+            # ============================================================
+            # Find neighbor properties and streamwise vector
+            # ============================================================
+            ngh_n = wp.neon_ngh_idx(wp.int8(step_dir[0]), wp.int8(step_dir[1]), wp.int8(step_dir[2]))
+
+            # Neighbor Read
+            rho_center = compute_dtype(wp.neon_read(_rho, index, 0))
+            u_neighbor = _u_vec()
+            for d in range(_d):
+                has_neihbor = wp.bool(False)
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, compute_dtype(0.0), has_neihbor))
+                if has_neihbor:                    
+                    u_neighbor[d] = f_aux
+
+            neighbor_dist = wp.length(wp.vec3(compute_dtype(step_dir[0]), compute_dtype(step_dir[1]), compute_dtype(step_dir[2]), ))
+    
+            # ============================================================
+            # Find best lattice link aligned with the STREAMWISE
+            # ============================================================
+            best_s_l   = wp.int32(0)
+            best_s_dot = compute_dtype(-1.0e9)
+            for l in range(1, _q):
+                # Start with 1 as zero is rest position
+                cx = _c_float[0, l]
+                cy = _c_float[1, l]
+                cz = _c_float[2, l]
+                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
+                    continue
+                c    = wp.vec3(cx, cy, cz)
+                cmag = wp.length(c)
+                if cmag <= _epsilon:
+                    continue
+                c_unit = c / cmag
+                a = wp.dot(c_unit, streamwise)                
+                if a > best_s_dot:
+                    best_s_dot = a
+                    best_s_l   = wp.int32(l)
+
+            # Flip if best dot was negative.            
+            stream_step = wp.vec3i(_c[0, best_s_l], _c[1, best_s_l], _c[2, best_s_l])
+            if best_s_dot < compute_dtype(0.0):
+                stream_step = -stream_step
+            #Test reaching 2 voxels away rather than just 1 out from center
+            stream_step *= 2
+            upstream_dist = wp.length(wp.vec3(
+                compute_dtype(stream_step[0]),
+                compute_dtype(stream_step[1]),
+                compute_dtype(stream_step[2]),
+            )) 
+            # Upstream dist is for neighbor to upstream 
+            # To include Downstream we x2 the length
+            streamwise_dist = wp.max(compute_dtype(2.0) * upstream_dist, _epsilon)
+
+            # ============================================================
+            # Sample UPSTREAM and DOWNSTREAM
+            # ============================================================
+                
+            # Upstream Reads
+            f_upstream_off = wp.vec3i( step_dir[0] - stream_step[0], step_dir[1] - stream_step[1], step_dir[2] - stream_step[2], )
+            ngh_uf = wp.neon_ngh_idx(wp.int8(f_upstream_off[0]), wp.int8(f_upstream_off[1]), wp.int8(f_upstream_off[2]))
+            
+            f_rho_upstream = rho_center
+            has_upstrem = wp.bool(False)
+            f_aux = compute_dtype(
+            wp.neon_read_ngh(_rho, index, ngh_uf, 0, compute_dtype(0.0), has_upstrem))
+            if has_upstrem:                    
+                f_rho_upstream = f_aux
+
+            f_u_upstream = u_neighbor
+            for d in range(_d):
+                has_neihbor = wp.bool(False)
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, compute_dtype(0.0), has_neihbor))
+                if has_neihbor:                    
+                    f_u_upstream[d] = f_aux
+
+            # Downstream Reads    
+            f_downstream_off = wp.vec3i( step_dir[0] + stream_step[0], step_dir[1] + stream_step[1], step_dir[2] + stream_step[2], )
+            ngh_df = wp.neon_ngh_idx(wp.int8(f_downstream_off[0]), wp.int8(f_downstream_off[1]), wp.int8(f_downstream_off[2]))        
+            
+            f_rho_downstream = rho_center
+            has_downstream = wp.bool(False)
+            f_aux = compute_dtype(
+                wp.neon_read_ngh(_rho, index, ngh_df, 0, compute_dtype(0.0), has_downstream))
+            if has_downstream:                    
+                f_rho_downstream = f_aux  
+                
+            f_u_downstream = u_neighbor
+            for d in range(_d):
+                has_neihbor = wp.bool(False)
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, compute_dtype(0.0), has_neihbor))
+                if has_neihbor:                    
+                    f_u_downstream[d] = f_aux    
+
+            # Coherence check
+            f_u_upstream_normal = normal * wp.dot(f_u_upstream, normal)
+            f_u_upstream_streamwise = f_u_upstream - f_u_upstream_normal
+            f_u_upstream_mag = wp.length(f_u_upstream_streamwise)    
+            f_u_upstream_streamwise = f_u_upstream_streamwise / f_u_upstream_mag
+
+            f_u_downstream_normal = normal * wp.dot(f_u_downstream, normal)
+            f_u_downstream_streamwise = f_u_downstream - f_u_downstream_normal
+            f_u_downstream_mag = wp.length(f_u_downstream_streamwise)    
+            f_u_downstream_streamwise = f_u_downstream_streamwise / f_u_downstream_mag
+
+            dot_up = compute_dtype(0.0)
+            dot_dn = compute_dtype(0.0)
+
+            if f_u_upstream_mag > _epsilon:
+                dot_up = wp.dot(streamwise, f_u_upstream_streamwise)
+
+            if f_u_downstream_mag > _epsilon:
+                dot_dn = wp.dot(streamwise,f_u_downstream_streamwise)
+
+            dot_tol = compute_dtype(0.25) #~80deg    0.5 ~60deg higher = tighter 0.45was working well
+            
+            if (dot_up > dot_tol) and (dot_dn > dot_tol):
+                u_up = f_u_upstream
+                rho_up = f_rho_upstream
+                u_down = f_u_downstream
+                rho_down = f_rho_downstream
+                coherent = compute_dtype(1.0)
+            else:
+                u_up = u_neighbor
+                rho_up = rho_center
+                u_down = u_neighbor
+                rho_down = rho_center
+                coherent = compute_dtype(0.0)
+
+            # --- Debug print (unchanged) ---
+            # idx_wp = neon_index_to_warp(f_1, index)
+            # nx = normal[0]
+            # ny = normal[1]
+            # nz = normal[2]
+            # theta = wp.atan2(nz, -nx) * compute_dtype(57.29577951308232)
+            # if theta < compute_dtype(0.0):
+            #     theta += compute_dtype(360.0)
+
+            # #12mm
+            # if (idx_wp[1] > 429) and (idx_wp[1] < 431) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
+            # #10mm
+            # #if (idx_wp[1] > 515) and (idx_wp[1] < 517) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
+            # #8mm
+            # #if (idx_wp[1] > 644) and (idx_wp[1] < 646) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
+            #     wp.printf(
+            #         "WM idx,%4d,%4d,%4d, theta, %1.1f, normal,%1.2f,%1.2f,%1.2f, streamwise,%1.2f,%1.2f,%1.2f, streamstep,%1d,%1d,%1d, f_rho_up, %1.6e f_rho_dn, %1.6e, rho_n, %1.6e, dot_up, %1.1e, dot_dn, %1.1e \n",
+            #         idx_wp[0], idx_wp[1], idx_wp[2], theta, 
+            #         normal[0], normal[1], normal[2],streamwise[0], streamwise[1], streamwise[2],stream_step[0], stream_step[1], stream_step[2], f_rho_upstream, f_rho_downstream, rho_center, dot_up, dot_dn
+            #     )
+         
+                                     
+            return u_neighbor, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent
+            
+        @wp.func
+        def sample_neighbor(
+            index: Any,
+            normal: Any,
+            _rho: Any,
+            _u: Any,
+            streamwise: Any,
+        ):
+            """
+            Sample wall-model reference data.
+
+            Intent:
+            1. Snap the surface normal to the closest lattice link and read F,
+                the first fluid-side neighbor.
+            2. Rebuild the local streamwise direction from F tangential velocity
+                when possible.
+            3. Snap that streamwise direction to a lattice link.
+            4. Read upstream/downstream samples at +/- 2 streamwise lattice steps.
+            5. Use those samples for both dp/ds density and far liftoff support.
+            6. Only use dp/ds if upstream/downstream tangential directions are
+                coherent with the selected streamwise direction.
+            """
+
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
+            rho_center = compute_dtype(wp.neon_read(_rho, index, 0))
+
+            # =====================================================================
+            # SECTION 1: SNAP WALL NORMAL TO NEAREST LATTICE LINK
+            # =====================================================================
+            best_n_l = wp.int32(0)
+            best_n_dot = compute_dtype(-1.0e9)
+
+            for l in range(1, _q):
+                cx = _c_float[0, l]
+                cy = _c_float[1, l]
+                cz = _c_float[2, l]
+
+                cmag2 = cx * cx + cy * cy + cz * cz
+
+                if cmag2 <= _epsilon * _epsilon:
+                    continue
+
+                inv_cmag = one / wp.sqrt(cmag2)
+                a = (cx * normal[0] + cy * normal[1] + cz * normal[2]) * inv_cmag
+
+                if a > best_n_dot:
+                    best_n_dot = a
+                    best_n_l = wp.int32(l)
+
+            step_dir = wp.vec3i(
+                _c[0, best_n_l],
+                _c[1, best_n_l],
+                _c[2, best_n_l],
+            )
+
+            if best_n_dot < zero:
+                step_dir = -step_dir
+
+            neighbor_dist = wp.length(wp.vec3(
+                compute_dtype(step_dir[0]),
+                compute_dtype(step_dir[1]),
+                compute_dtype(step_dir[2])))
+
+            # =====================================================================
+            # SECTION 2: READ F, THE FIRST FLUID-SIDE NEIGHBOR
+            # =====================================================================
+            ngh_n = wp.neon_ngh_idx( wp.int8(step_dir[0]),  wp.int8(step_dir[1]), wp.int8(step_dir[2]) )
+
+            u_neighbor = _u_vec()
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+                value = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, zero, has_neighbor))
+                if has_neighbor:
+                    u_neighbor[d] = value
+
+            # =====================================================================
+            # SECTION 3: REBUILD STREAMWISE DIRECTION FROM F TANGENTIAL FLOW
+            # =====================================================================
+            # The incoming streamwise is the B-cell tangential direction. Use it as a
+            # fallback only. Prefer F because it is the actual wall-function sample.
+            u_neighbor_normal = wp.dot(u_neighbor, normal)
+            u_neighbor_tangent = u_neighbor - normal * u_neighbor_normal
+            u_neighbor_tangent_len = wp.length(u_neighbor_tangent)
+
+            if u_neighbor_tangent_len > _epsilon:
+                streamwise = u_neighbor_tangent / u_neighbor_tangent_len
+
+            # =====================================================================
+            # SECTION 4: SNAP STREAMWISE DIRECTION TO NEAREST LATTICE LINK
+            # =====================================================================
+            best_s_l = wp.int32(0)
+            best_s_dot = compute_dtype(-1.0e9)
+
+            for l in range(1, _q):
+                cx = _c_float[0, l]
+                cy = _c_float[1, l]
+                cz = _c_float[2, l]
+
+                cmag2 = cx * cx + cy * cy + cz * cz
+
+                if cmag2 <= _epsilon * _epsilon:
+                    continue
+
+                inv_cmag = one / wp.sqrt(cmag2)
+                a = (cx * streamwise[0] + cy * streamwise[1] + cz * streamwise[2]) * inv_cmag
+
+                if a > best_s_dot:
+                    best_s_dot = a
+                    best_s_l = wp.int32(l)
+
+            stream_step = wp.vec3i(_c[0, best_s_l],_c[1, best_s_l], _c[2, best_s_l])
+
+            if best_s_dot < zero:
+                stream_step = -stream_step
+
+            # Use +/- two streamwise lattice steps from F.
+            # This preserves your smoother dp/ds behavior.
+            stream_step_pg = wp.vec3i(
+                stream_step[0] * wp.int32(2),
+                stream_step[1] * wp.int32(2),
+                stream_step[2] * wp.int32(2),
+            )
+            
+            upstream_dist = wp.length(wp.vec3(
+                compute_dtype(stream_step[0]),
+                compute_dtype(stream_step[1]),
+                compute_dtype(stream_step[2])))
+
+            # Distance from upstream sample to downstream sample.
+            streamwise_dist = wp.max(
+                compute_dtype(2.0) * upstream_dist,
+                _epsilon,
+            )
+
+            # =====================================================================
+            # SECTION 5: READ UPSTREAM SAMPLE AT F - 2*STREAM_STEP
+            # =====================================================================
+            upstream_off = wp.vec3i(
+                step_dir[0] - stream_step_pg[0],
+                step_dir[1] - stream_step_pg[1],
+                step_dir[2] - stream_step_pg[2],
+            )
+
+            ngh_up = wp.neon_ngh_idx(wp.int8(upstream_off[0]), wp.int8(upstream_off[1]),wp.int8(upstream_off[2]))
+
+            rho_upstream = rho_center
+            has_upstream_rho = wp.bool(False)
+
+            rho_value = compute_dtype( wp.neon_read_ngh( _rho, index,ngh_up, 0,zero,has_upstream_rho))
+
+            if has_upstream_rho:
+                rho_upstream = rho_value
+
+            u_upstream = u_neighbor
+
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+                value = compute_dtype( wp.neon_read_ngh(  _u, index, ngh_up, d,  zero,has_neighbor))
+
+                if has_neighbor:
+                    u_upstream[d] = value
+
+            # =====================================================================
+            # SECTION 6: READ DOWNSTREAM SAMPLE AT F + 2*STREAM_STEP
+            # =====================================================================
+            downstream_off = wp.vec3i(
+                step_dir[0] + stream_step_pg[0],
+                step_dir[1] + stream_step_pg[1],
+                step_dir[2] + stream_step_pg[2],
+            )
+
+            ngh_down = wp.neon_ngh_idx(wp.int8(downstream_off[0]), wp.int8(downstream_off[1]),wp.int8(downstream_off[2]))
+
+            rho_downstream = rho_center
+            has_downstream_rho = wp.bool(False)
+
+            rho_value = compute_dtype(wp.neon_read_ngh( _rho,  index,  ngh_down,  0,  zero, has_downstream_rho) )
+
+            if has_downstream_rho:
+                rho_downstream = rho_value
+
+            u_downstream = u_neighbor
+
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+                value = compute_dtype(wp.neon_read_ngh(  _u, index, ngh_down,  d, zero, has_neighbor) )
+
+                if has_neighbor:
+                    u_downstream[d] = value
+
+            # =====================================================================
+            # SECTION 7: COHERENCE AND FAR LIFTOFF SUPPORT
+            # =====================================================================
+            # fangle = dot(normalized velocity, normal).
+            # Positive values mean the velocity points away from the wall.
+
+            upstream_len = wp.length(u_upstream)
+            upstream_fangle = wp.dot(u_upstream / wp.max(upstream_len, _epsilon), normal)
+
+            upstream_normal = wp.dot(u_upstream, normal)
+            upstream_tangent = u_upstream - normal * upstream_normal
+            upstream_tangent_len = wp.length(upstream_tangent)
+
+            dot_up = zero
+
+            if upstream_tangent_len > _epsilon:
+                dot_up = wp.dot(streamwise, upstream_tangent / upstream_tangent_len)
+
+            downstream_len = wp.length(u_downstream)
+            downstream_fangle = wp.dot(u_downstream / wp.max(downstream_len, _epsilon), normal)
+
+            downstream_normal = wp.dot(u_downstream, normal)
+            downstream_tangent = u_downstream - normal * downstream_normal
+            downstream_tangent_len = wp.length(downstream_tangent)
+
+            dot_down = zero
+
+            if downstream_tangent_len > _epsilon:
+                dot_down = wp.dot( streamwise,downstream_tangent / downstream_tangent_len)
+
+            dot_tol = compute_dtype(0.25)
+
+            rho_up = rho_center
+            rho_down = rho_center
+            coherent = zero
+
+            if (dot_up > dot_tol) and (dot_down > dot_tol):
+                rho_up = rho_upstream
+                rho_down = rho_downstream
+                coherent = one
+
+            return (
+                u_neighbor,
+                rho_up,
+                rho_down,
+                neighbor_dist,
+                streamwise,
+                streamwise_dist,
+                upstream_fangle,
+                downstream_fangle,
+                coherent,
+            )
+
+        @wp.func
+        def compute_wall_modeled_velocity(
+            index: Any,
+            _missing_mask: Any,
+            f_1: Any,
+            f_pre: Any,
+            u_wall: Any,
+            nu: Any,
+            _rho: Any,
+            _u: Any,
+            _relax: Any,
+            _norm_vec:Any,
+            _norm_dist:Any,
+        ):
+            # -----------------------------------------------------------------
+            # SANDWICH DETECTION
+            # -----------------------------------------------------------------
+            for l in range(_q):
+                if _missing_mask[l] == wp.uint8(1) and _missing_mask[_opp_indices[l]] == wp.uint8(1):
+                    return u_wall, _relax
+
+            # -----------------------------------------------------------------
+            # GEOMETRY: SURFACE NORMAL AND WALL DISTANCE
+            # -----------------------------------------------------------------            
+            normal = _u_vec()
+            for d in range(_d):
+                normal[d] = compute_dtype(wp.neon_read(_norm_vec, index, d))
+            
+            y_b = compute_dtype(wp.neon_read(_norm_dist, index, 0))
+
+            # -----------------------------------------------------------------
+            # VELOCITY AT BOUNDARY CELL B
+            # -----------------------------------------------------------------
+            u_B = _u_vec()
+            for d in range(_d):
+                u_B[d] = compute_dtype(wp.neon_read(_u, index, d))
+
+            nu = wp.max(nu, _epsilon)
+
+            # -----------------------------------------------------------------
+            # TANGENTIAL VELOCITY AND STREAMWISE DIRECTION AT B
+            # -----------------------------------------------------------------
+            u_rel_B = u_B - u_wall
+            u_b_norm = wp.dot(u_rel_B, normal)
+            u_b_tangent = u_rel_B - normal * u_b_norm
+            u_b_tangent_len = wp.length(u_b_tangent)
+
+            if u_b_tangent_len < _epsilon:
+                return u_wall, _relax
+
+            streamwiseb = u_b_tangent / u_b_tangent_len
+
+            # -----------------------------------------------------------------
+            # NEIGHBOR SAMPLING
+            # -----------------------------------------------------------------
+            # u_f, rho_up, rho_down,  neighbor_dist,   streamwise,  streamwise_dist,  upstream_fangle,  downstream_fangle,coherent = sample_neighbor(
+            #     index, normal, _rho, _u, streamwiseb
+            # )
+            u_f, rho_up, rho_down,  neighbor_dist,   streamwise,  streamwise_dist, coherent = sample_neighbor_Bbased(
+                index, normal, _rho, _u, streamwiseb
+            )
+
+            # =================================================================
+            # SECTION 1: ZPG WALL FUNCTION — BASELINE u_tau AND U_wm
+            # =================================================================
+            y_f = y_b + neighbor_dist
+
+            u_f_rel = u_f - u_wall
+            u_f_mag = wp.length(u_f_rel)
+
+            # Tangential direction at F (safe fallback)
+            u_f_norm = wp.dot(u_f_rel, normal)
+            u_f_tangent = u_f_rel - normal * u_f_norm
+            u_f_tangent_len = wp.length(u_f_tangent)
+            if u_f_tangent_len > _epsilon:
+                streamwisef = u_f_tangent / u_f_tangent_len
+            else:
+                streamwisef = streamwise
+
+            
+
+            # Use B-streamwise for signed streamwise speed
+            u_f_signed = wp.dot(u_f_rel, streamwise)
+            u_f_par_mag = wp.abs(u_f_signed)
+
+            u_f_fwd = wp.dot(u_f_rel, streamwiseb)
+
+            if u_f_par_mag < _epsilon:
+                return u_wall, _relax
+
+            K = u_f_par_mag * y_f / nu
+            K = wp.max(K, _epsilon)
+
+            u_plus_F = solve_wall_function(K)
+            u_tau = u_f_par_mag / wp.max(u_plus_F, _epsilon)
+            u_tau_zpg = wp.max(u_tau, compute_dtype(1.0e-6))
+
+            y_plus_B = y_b * u_tau_zpg / nu
+            u_plus_B = reichardt_profile(y_plus_B)
+            U_wm_B_zpg = u_tau_zpg * u_plus_B
+
+            # =================================================================
+            # SECTION 2: STREAMWISE PRESSURE GRADIENT
+            # =================================================================
+            dp_ds = _cs2 * (rho_down - rho_up) / wp.max(streamwise_dist, _epsilon)
+            rho_b = wp.max(compute_dtype(wp.neon_read(_rho, index, 0)), compute_dtype(1.0e-6))
+
+            a_pg = dp_ds / rho_b
+
+            sign = compute_dtype(1.0)
+            if a_pg < compute_dtype(0.0):
+                sign = compute_dtype(-1.0)
+
+            u_p = sign * wp.pow(nu * wp.abs(a_pg), _cs2)
+            pg_instant = u_p / wp.max(u_tau_zpg, _epsilon)
+
+            # =================================================================
+            # SECTION 3: EMA OF R_pg
+            # =================================================================
+            ema      = compute_dtype(0.001)
+
+            if coherent == compute_dtype(0.0):
+                pg_avg = _relax * compute_dtype(0.98)
+            else:                
+                pg_avg = ema * pg_instant + (compute_dtype(1.0) - ema) * _relax
+
+            pg_avg = wp.clamp(pg_avg, compute_dtype(-1.2), compute_dtype(1.2))
+  
+   
+
+            # =================================================================
+            # SECTION 4: PRESSURE GRADIENT CORRECTION FACTOR 
+            # =================================================================
+            
+            # Deadband Pressure between +/- p0
+            p0 = compute_dtype(0.0)    #0.1 works great
+            pressure_gate = compute_dtype(1.0)
+            
+            if pg_avg > p0:
+                # APG Correction: Nonlinear reduction
+                p_eff = pg_avg - p0
+                k0 = compute_dtype(9.0)
+                n0 = compute_dtype(1.5) #1.75
+                pressure_gate = wp.exp(-k0 * wp.pow(p_eff, n0))
+          
+                pressure_gate = wp.max(pressure_gate, compute_dtype(0.025))
+            
+            if pg_avg < -p0:
+                p_eff = -pg_avg - p0
+                k1 = compute_dtype(2.0)
+                n1 = compute_dtype(1.5)
+                fpg_max = compute_dtype(1.0)
+                pressure_gate = compute_dtype(1.0) + (fpg_max - compute_dtype(1.0)) * (compute_dtype(1.0) - wp.exp(-k1 * wp.pow(p_eff, n1)))
+         
+
+          
+            # =================================================================
+            # SECTION 5: LIFTOFF CORRECTION
+            # =================================================================    
+            # Signed wall-normal angle indicator
+            # f_angle > 0 : lifting away from wall
+            # f_angle < 0 : pointing into wall
+            # f_angle ~ 0 : tangent to wall
+            f_angle = wp.dot(u_f_rel / wp.max(u_f_mag, _epsilon), normal)        
+            separation_gate = compute_dtype(1.0)
+
+            deg_to_rad = compute_dtype(0.017453292519943295)
+            rad_to_deg = compute_dtype(57.29577951308232)
+            f_angle_deg = wp.asin(f_angle) * rad_to_deg  
+
+            # Base liftoff rolloff in separation-angle space
+            separation_rolloff_start_deg = compute_dtype(2.0)
+            separation_rolloff_full_deg  = compute_dtype(8.0)
+
+            # FPG shield tuning in degree space
+            fpg_shield_start_pg   = compute_dtype(-0.1)  # shield begins once pg_avg goes below this
+            fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
+            fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
+
+            shield_shift_deg = compute_dtype(0.0)
+            if pg_avg < fpg_shield_start_pg:
+                shield_shift_deg = wp.min(
+                    (fpg_shield_start_pg - pg_avg) * fpg_shield_deg_per_pg,
+                    fpg_shield_max_deg,
+                )
+
+            rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
+            rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+
+            rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
+            rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
+            rolloff_full  = wp.max(rolloff_full, rolloff_start + compute_dtype(1.0e-6))
+
+            if f_angle > rolloff_start:
+                penalty = wp.clamp(
+                    (f_angle - rolloff_start) / (rolloff_full - rolloff_start),
+                    compute_dtype(0.0),
+                    compute_dtype(1.0),
+                )
+                penalty_smooth = penalty * penalty * (compute_dtype(3.0) - compute_dtype(2.0) * penalty)
+                separation_gate = compute_dtype(1.0) - penalty_smooth
+           
+            # =================================================================
+            # SECTION 6: COHERENCE CHECK
+            # =================================================================
+            if coherent == compute_dtype(0.0):
+                separation_gate = compute_dtype(0.01)
+
+            # =================================================================
+            # SECTION 7: FINAL VELOCITY ASSEMBLY
+            # =================================================================
+            U_wm_B_final = U_wm_B_zpg * separation_gate #* pressure_gate
+            U_wm_B_final = wp.clamp(
+                U_wm_B_final,
+                compute_dtype(0.0),
+                compute_dtype(2.0) * u_f_par_mag, 
+            )
+
+            u_wall_eff = u_wall + U_wm_B_final * streamwise
+
+            # # =================================================================
+            # # DEBUG OUTPUT
+            # # =================================================================
+            # idx_wp = neon_index_to_warp(f_1, index)
+            # nx = normal[0]
+            # ny = normal[1]
+            # nz = normal[2]
+            # theta = wp.atan2(nz, -nx) * compute_dtype(57.29577951308232)
+            # #theta = wp.atan2(ny, -nx) * compute_dtype(57.29577951308232)
+            # if theta < compute_dtype(0.0):
+            #     theta += compute_dtype(360.0)
+            # #drivaer = 656  429
+            # if (idx_wp[1] == 922) and (idx_wp[2] > 35) and (theta > compute_dtype(1.0)) and (theta < compute_dtype(170.0)):
+            # #if (idx_wp[2] == 44) and (ny < 0.0):                          
+            #     wp.printf(
+            #         "WM idx,%4d,%4d,%4d, streamwise ,%1.1f,%1.1f,%1.1f, normal ,%0.3f,%0.3f,%0.3f,theta, %1.1f, pg_instant, %1.4f, pg_avg, %1.4f, pressure_gate, %1.4f, separation_gate, %1.4f, f_angle_deg, %1.2f, rolloff_start_deg, %1.2f, u_zpg, %0.4f, uFinal, %0.4f, u_b, %0.4f, u_f, %0.4f, coh, %1.0f,\n",
+            #         idx_wp[0], idx_wp[1], idx_wp[2],
+            #         streamwise[0], streamwise[1], streamwise[2],normal[0], normal[1], normal[2],theta,
+            #  pg_instant, pg_avg, pressure_gate, separation_gate, f_angle_deg, rolloff_start_deg, 
+            #  U_wm_B_zpg, U_wm_B_final, u_b_tangent_len, u_f_par_mag,
+            # coherent,
+            # )
+
+            return u_wall_eff, pg_avg
+  
+
+        
         self.get_bc_thread_data = get_bc_thread_data
         self.get_bc_fsum = get_bc_fsum
         self.get_normal_vectors = get_normal_vectors
         self.bounceback_nonequilibrium = bounceback_nonequilibrium
         self.regularize_fpop = regularize_fpop
-        self.regularize_bounceback = regularize_bounceback
         self.grads_approximate_fpop = grads_approximate_fpop
         self.moving_wall_fpop_correction = moving_wall_fpop_correction
         self.interpolated_bounceback = interpolated_bounceback
         self.interpolated_nonequilibrium_bounceback = interpolated_nonequilibrium_bounceback
         self.neon_get_bc_thread_data = neon_get_bc_thread_data
         self.neon_index_to_warp = neon_index_to_warp
-        
-        # Wall model functions 
-        self.p_grad_proxy_density = p_grad_proxy_density
-        self.reichardt_profile = reichardt_profile
-        self.reichardt_derivative = reichardt_derivative
-        self.solve_wall_function = solve_wall_function
-        self.apg_correction_factor = apg_correction_factor
-        self.compute_profile_u = compute_profile_u
-        self.solve_tble = solve_tble
-        self.regularize_wallModel = regularize_wallModel
-        self.solve_musker = solve_musker
-        self.musker_profile = musker_profile
-        self.musker_y_from_u = musker_y_from_u
-        self.compute_wall_modeled_velocity = compute_wall_modeled_velocity        
-        self.get_normal_and_distance = get_normal_and_distance
-        
+        self.compute_wall_modeled_velocity = compute_wall_modeled_velocity
+        self.regularize_missing = regularize_missing
 
 
-# Keep all the encoding classes unchanged
+
 class EncodeAuxiliaryData(Operator):
     """
     Operator for encoding boundary auxiliary data during initialization.
