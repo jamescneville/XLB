@@ -75,6 +75,12 @@ class HelperFunctionsBC(object):
         # Define the operator needed for computing macroscopic variables
         macroscopic = Macroscopic(velocity_set, precision_policy, compute_backend)
 
+        # Define the operator needed for computing equilibrium
+        equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
+
+        # Define the operator needed for computing macroscopic variables
+        macroscopic = Macroscopic(velocity_set, precision_policy, compute_backend)
+
         # Define the operator needed for computing the momentum flux
         momentum_flux = MomentumFlux(velocity_set, precision_policy, compute_backend)
 
