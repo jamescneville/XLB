@@ -89,6 +89,7 @@ from xlb.operator.boundary_masker import (
     MultiresMeshMaskerAABBClose,
     MultiresIndicesBoundaryMasker,
     MultiresMeshMaskerRay,
+    MultiresMeshMaskerTrapped,
 )
 from xlb.operator.boundary_condition.helper_functions_bc import MultiresEncodeAuxiliaryData
 from xlb.cell_type import BC_SFV, BC_SOLID
@@ -124,7 +125,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
     boundary_conditions : list of BoundaryCondition
         Boundary conditions to apply.
     collision_type : str
-        Collision operator type: ``"BGK"`` or ``"KBC"`` or ``"SmagorinskyLESBGK"``.
+        Collision operator type: ``"BGK"`` or ``"KBC"`` or ``"SmagorinskyLESBGK"`` or ``"SmagorinskyLESKBC"``.
     forcing_scheme : str
         Forcing scheme name (only used when *force_vector* is given).
     force_vector : array-like, optional
@@ -138,6 +139,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         collision_type="BGK",
         forcing_scheme="exact_difference",
         force_vector=None,
+        smagorinsky_constant = 0.0
     ):
         super().__init__(grid, boundary_conditions)
 
@@ -148,6 +150,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             self.collision = KBC(self.velocity_set, self.precision_policy, self.compute_backend)
         elif collision_type == "SmagorinskyLESBGK":
             self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
+        elif collision_type == "SmagorinskyLESKBC":
+            self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend, smagorinsky_constant)
+
 
         if force_vector is not None:
             self.collision = ForcedCollision(collision_operator=self.collision, forcing_scheme=forcing_scheme, force_vector=force_vector)
@@ -186,12 +191,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         missing_mask = self.grid.create_field(cardinality=self.velocity_set.q, dtype=Precision.UINT8)
         bc_mask = self.grid.create_field(cardinality=1, dtype=Precision.UINT8)
+        normal_vector = self.grid.create_field(cardinality=self.velocity_set.d, dtype=self.precision_policy.store_precision)
+        normal_distance = self.grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
 
         for level in range(self.grid.count_levels):
             f_1.copy_from_run(level, f_0, 0)
 
         # Process boundary conditions and update masks
-        f_1, bc_mask, missing_mask = self._process_boundary_conditions(self.boundary_conditions, f_1, bc_mask, missing_mask)
+        f_1, bc_mask, missing_mask,  normal_vector, normal_distance= self._process_boundary_conditions(self.boundary_conditions, f_1, bc_mask, missing_mask, normal_vector, normal_distance)
         # Initialize auxiliary data if needed
         f_1 = self._initialize_auxiliary_data(self.boundary_conditions, f_1, bc_mask, missing_mask)
 
@@ -204,7 +211,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
             f_0 = initialize_multires_eq(f_0, self.grid, self.velocity_set, self.precision_policy, self.compute_backend, rho=rho, u=u)
 
-        return f_0, f_1, bc_mask, missing_mask
+        return f_0, f_1, bc_mask, missing_mask, normal_vector, normal_distance
 
     def prepare_coalescence_count(self, coalescence_factor, bc_mask):
         """Precompute coalescence weighting factors for multi-resolution streaming.
@@ -313,7 +320,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         return
 
     @classmethod
-    def _process_boundary_conditions(cls, boundary_conditions, f_1, bc_mask, missing_mask):
+    def _process_boundary_conditions(cls, boundary_conditions, f_1, bc_mask, missing_mask, normal_vector, normal_distance):
         """Process boundary conditions and update boundary masks."""
 
         # Check for boundary condition overlaps
@@ -359,9 +366,20 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     raise ValueError(f"Unsupported voxelization method for multi-res: {bc.voxelization_method}")
                 # Apply the mesh masker to the boundary condition
-                f_1, bc_mask, missing_mask = mesh_masker(bc, f_1, bc_mask, missing_mask)
+                f_1, bc_mask, missing_mask, normal_vector, normal_distance = mesh_masker(bc, f_1, bc_mask, missing_mask, normal_vector, normal_distance)
 
-        return f_1, bc_mask, missing_mask
+            # Run Trapped Masker looking for sandwich voxels
+            trapped_masker = MultiresMeshMaskerTrapped(
+                    velocity_set=DefaultConfig.velocity_set,
+                    precision_policy=DefaultConfig.default_precision_policy,
+                    compute_backend=DefaultConfig.default_backend,
+            )
+            
+            f_1, bc_mask, missing_mask = trapped_masker(bc_with_vertices[0], f_1, bc_mask, missing_mask)
+
+
+
+        return f_1, bc_mask, missing_mask, normal_vector, normal_distance
 
     @staticmethod
     def _initialize_auxiliary_data(boundary_conditions, f_1, bc_mask, missing_mask):
@@ -404,6 +422,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         for bc_name, bc_id in bc_to_id.items():
             if bc_name.startswith("ExtrapolationOutflowBC"):
                 extrapolation_outflow_bc_ids.append(bc_id)
+        # Gather IDs of HybridBC boundary conditions
+        hybrid_bc_ids = []
+        for bc_name, bc_id in bc_to_id.items():
+            if bc_name.startswith("HybridBC"):
+                hybrid_bc_ids.append(bc_id)
 
         # Factory for apply_bc: generates compile-time specialized variants
         def make_apply_bc(is_post_streaming: bool):
@@ -417,16 +440,26 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 f_1: Any,
                 f_pre: Any,
                 f_post: Any,
+                _rho: Any,
+                _u: Any,
+                _relax:Any, 
+                _norm_vec_pn: Any,
+                _norm_dist_pn: Any,
             ):
                 f_result = f_post
 
                 for i in range(wp.static(len(self.boundary_conditions))):
                     if wp.static(is_post_streaming):
                         if wp.static(self.boundary_conditions[i].implementation_step == ImplementationStep.STREAMING):
-                            if _boundary_id == wp.static(self.boundary_conditions[i].id):
-                                f_result = wp.static(self.boundary_conditions[i].neon_functional)(
-                                    index, timestep, _missing_mask, f_0, f_1, f_pre, f_post
-                                )
+                            if wp.static(self.boundary_conditions[i].id in hybrid_bc_ids):
+                                if _boundary_id == wp.static(self.boundary_conditions[i].id):
+                                    f_result = wp.static(self.boundary_conditions[i].neon_functional)(
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
+                            else:
+                                if _boundary_id == wp.static(self.boundary_conditions[i].id):
+                                    f_result = wp.static(self.boundary_conditions[i].neon_functional)(
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post
+                                    )
                     else:
                         if wp.static(self.boundary_conditions[i].implementation_step == ImplementationStep.COLLISION):
                             if _boundary_id == wp.static(self.boundary_conditions[i].id):
@@ -506,6 +539,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 num_levels: int,
                 level: int,
                 accumulation_pn: Any,
+                _rho0_pn: Any,
+                _u0_pn: Any,
+                _rho1_pn: Any,
+                _u1_pn: Any,
+                _relax_pn: Any,
+                _norm_vec_pn: Any,
+                _norm_dist_pn: Any,
             ):
                 _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
                 _feq = self.equilibrium.neon_functional(_rho, _u)
@@ -513,7 +553,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 if wp.static(do_bc):
                     _f_post_collision = apply_bc_post_collision(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream, _f_post_collision
+                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream, _f_post_collision,
+                        _rho0_pn, _u0_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn
                     )
                     neon_apply_aux_recovery_bc(index, _boundary_id, _missing_mask, f_0_pn, f_1_pn)
 
@@ -581,7 +622,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return _f_post_stream
 
         @neon.Container.factory(name="collide_coarse")
-        def collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int):
+        def collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             num_levels = f_0_fd.get_grid().num_levels
 
             def ll(loader: neon.Loader):
@@ -594,6 +635,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
+
 
                 @wp.func
                 def device(index: Any):
@@ -614,6 +663,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             num_levels,
                             level,
                             f_1_pn,
+                            _rho0_pn,
+                            _u0_pn,
+                            _rho1_pn,
+                            _u1_pn,
+                            _relax_pn,
+                            _norm_vec_pn,
+                            _norm_dist_pn,
                         )
                     else:
                         for l in range(self.velocity_set.q):
@@ -624,7 +680,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="SFV_collide_coarse")
-        def SFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int):
+        def SFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             """Collision on SFV voxels only — no BCs, no multi-resolution accumulation."""
 
             def ll(loader: neon.Loader):
@@ -633,6 +689,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 @wp.func
                 def device(index: Any):
@@ -652,6 +715,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         0,
                         level,
                         f_1_pn,
+                        _rho0_pn,
+                        _u0_pn,
+                        _rho1_pn,
+                        _u1_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn,
                     )
 
                 loader.declare_kernel(device)
@@ -659,7 +729,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="CFV_collide_coarse")
-        def CFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int):
+        def CFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, timestep: int, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             """Collision on CFV voxels only — skips both solid and SFV."""
             num_levels = f_0_fd.get_grid().num_levels
 
@@ -673,6 +743,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 @wp.func
                 def device(index: Any):
@@ -695,6 +772,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             num_levels,
                             level,
                             f_1_pn,
+                            _rho0_pn,
+                            _u0_pn,
+                            _rho1_pn,
+                            _u1_pn,
+                            _relax_pn,
+                            _norm_vec_pn,
+                            _norm_dist_pn,
                         )
                     else:
                         for l in range(self.velocity_set.q):
@@ -713,6 +797,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             missing_mask_fd: Any,
             coalescence_factor: Any,
             timestep: int,
+            _rho0: Any,
+            _u0: Any,
+            _rho1: Any,
+            _u1: Any,
+            _relax: Any,
+            normal_vector: Any,
+            normal_distance: Any,
         ):
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -720,6 +811,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
 
                 @wp.func
@@ -735,7 +833,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _f_post_stream = neon_stream_explode_coalesce(index, f_0_pn, coalescence_factor_pn)
 
                     _f_post_stream = apply_bc_post_streaming(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream
+                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                        _rho0_pn, _u0_pn, _relax_pn,   _norm_vec_pn, _norm_dist_pn,
                     )
                     neon_apply_aux_recovery_bc(index, _boundary_id, _missing_mask, f_0_pn, f_1_pn)
 
@@ -755,6 +854,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             missing_mask_fd: Any,
             coalescence_factor: Any,
             timestep: int,
+            _rho0: Any,
+            _u0: Any,
+            _rho1: Any,
+            _u1: Any,
+            _relax: Any,
+            normal_vector: Any,
+            normal_distance: Any,
         ):
             """Stream on CFV voxels only — skips SFV and solid."""
 
@@ -764,6 +870,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
 
                 @wp.func
@@ -781,7 +894,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _f_post_stream = neon_stream_explode_coalesce(index, f_0_pn, coalescence_factor_pn)
 
                     _f_post_stream = apply_bc_post_streaming(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream
+                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                        _rho0_pn, _u0_pn, _relax_pn,   _norm_vec_pn, _norm_dist_pn,
                     )
                     neon_apply_aux_recovery_bc(index, _boundary_id, _missing_mask, f_0_pn, f_1_pn)
 
@@ -799,6 +913,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             f_1_fd: Any,
             bc_mask_fd: Any,
             missing_mask_fd: Any,
+            _rho0: Any,
+            _u0: Any,
+            _rho1: Any,
+            _u1: Any,
+            _relax: Any,
+            normal_vector: Any,
+            normal_distance: Any,
         ):
             """
             Setting the BC type to BC_SFV
@@ -811,6 +932,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 _c = self.velocity_set.c
 
@@ -856,13 +984,18 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     # Voxel is a pure fluid cell with no multi-resolution interactions — mark as SFV
                     wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SFV))
+                    # Update rho / u fields for wall model
+                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
+                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                    for d in range(self.velocity_set.d):
+                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
 
                 loader.declare_kernel(cl_stream_coarse)
 
             return ll_stream_coarse
 
         @neon.Container.factory(name="SFV_stream_coarse_step")
-        def SFV_stream_coarse_step(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any):
+        def SFV_stream_coarse_step(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             def ll_stream_coarse(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
 
@@ -871,6 +1004,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 _c = self.velocity_set.c
 
@@ -891,6 +1031,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     for l in range(self.velocity_set.q):
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_stream[l]))
+                    
+                    # Update rho / u fields for wall model
+                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
+                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                    for d in range(self.velocity_set.d):
+                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
 
                 loader.declare_kernel(cl_stream_coarse)
 
@@ -940,6 +1086,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             omega: Any,
             timestep: Any,
             is_f1_the_explosion_src_field: bool,
+            _rho0: Any,
+            _u0: Any,
+            _rho1: Any,
+            _u1: Any,
+            _relax: Any,
+            normal_vector: Any,
+            normal_distance: Any,
         ):
             if level != 0:
                 raise Exception("Only the finest level is supported for now")
@@ -955,6 +1108,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
                 accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
 
@@ -971,7 +1131,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _f_post_stream = neon_stream_finest_with_explosion(index, f_0_pn, explosion_src_pn)
 
                     _f_post_stream = apply_bc_post_streaming(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream
+                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                        _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
                     )
 
                     collide_bc_accum(
@@ -986,6 +1147,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         num_levels,
                         level,
                         accumulation_pn,
+                        _rho0_pn,
+                        _u0_pn,
+                        _rho1_pn,
+                        _u1_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn,
                     )
 
                 loader.declare_kernel(device)
@@ -1002,6 +1170,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             omega: Any,
             timestep: Any,
             is_f1_the_explosion_src_field: bool,
+            _rho0: Any,
+            _u0: Any,
+            _rho1: Any,
+            _u1: Any,
+            _relax: Any,
+            normal_vector: Any,
+            normal_distance: Any,
         ):
             """Fused stream+collide on CFV voxels at the finest level — skips SFV and solid."""
             if level != 0:
@@ -1018,6 +1193,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
                 accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
 
@@ -1036,7 +1218,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _f_post_stream = neon_stream_finest_with_explosion(index, f_0_pn, explosion_src_pn)
 
                     _f_post_stream = apply_bc_post_streaming(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream
+                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                        _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
                     )
 
                     collide_bc_accum(
@@ -1051,6 +1234,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         num_levels,
                         level,
                         accumulation_pn,
+                        _rho0_pn,
+                        _u0_pn,
+                        _rho1_pn,
+                        _u1_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn,
                     )
 
                 loader.declare_kernel(device)
@@ -1058,7 +1248,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="SFV_finest_fused_pull")
-        def SFV_finest_fused_pull(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any):
+        def SFV_finest_fused_pull(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             """Fused stream+collide on SFV voxels at the finest level — no BCs, no explosion."""
             if level != 0:
                 raise Exception("Only the finest level is supported for now")
@@ -1069,6 +1259,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 f_1_pn = loader.get_mres_write_handle(f_1_fd)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                _rho0_pn = loader.get_mres_read_handle(_rho0)
+                _u0_pn = loader.get_mres_read_handle(_u0)
+                _rho1_pn = loader.get_mres_write_handle(_rho1)
+                _u1_pn = loader.get_mres_write_handle(_u1)
+                _relax_pn = loader.get_mres_write_handle(_relax)
+                _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
                 @wp.func
                 def device(index: Any):
@@ -1089,6 +1286,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         0,
                         0,
                         f_1_pn,
+                        _rho0_pn,
+                        _u0_pn,
+                        _rho1_pn,
+                        _u1_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn,
                     )
 
                 loader.declare_kernel(device)

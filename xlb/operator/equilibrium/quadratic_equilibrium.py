@@ -32,13 +32,14 @@ class QuadraticEquilibrium(Equilibrium):
     def _construct_warp(self):
         # Set local constants TODO: This is a hack and should be fixed with warp update
         _c = self.velocity_set.c
+        _c_float = self.velocity_set.c_float
         _w = self.velocity_set.w
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
 
         # Construct the equilibrium functional
         @wp.func
-        def functional(
+        def functional_quadratic(
             rho: Any,
             u: Any,
         ):
@@ -63,6 +64,85 @@ class QuadraticEquilibrium(Equilibrium):
                 feq[l] = rho * _w[l] * (self.compute_dtype(1.0) + cu * (self.compute_dtype(1.0) + self.compute_dtype(0.5) * cu) - usqr)
 
             return feq
+        
+        # Construct the full product equilibrium functional
+        @wp.func
+        def functional(
+            rho: Any,
+            u: Any,
+        ):
+            # Allocate the equilibrium
+            feq = _f_vec()
+
+            # # Compute the equilibrium
+            # Product-form entropic equilibrium
+            one   = self.compute_dtype(1.0)
+            two   = self.compute_dtype(2.0)
+            three = self.compute_dtype(3.0)
+            max_u = self.compute_dtype(0.7)
+
+            ux = wp.clamp(u[0], -max_u, max_u)
+            uy = wp.clamp(u[1], -max_u, max_u)
+
+            sx = wp.sqrt(one + three * ux * ux)
+            sy = wp.sqrt(one + three * uy * uy)
+
+            Ax = two - sx
+            Ay = two - sy
+
+            num_x = (two * ux + sx)
+            den_x = (one - ux)
+            Bx = num_x / den_x
+            inv_Bx = den_x / num_x
+            
+            num_y = (two * uy + sy)
+            den_y = (one - uy)
+            By = num_y / den_y
+            inv_By = den_y / num_y
+
+            Psi = Ax * Ay
+
+            # defaults so variables exist even in 2D builds
+            Bz = one
+            inv_Bz = one            
+
+            if wp.static(self.velocity_set.d == 3):
+                uz = wp.clamp(u[2], -max_u, max_u)
+                sz = wp.sqrt(one + three * uz * uz)
+                Az = two - sz
+                num_z = (two * uz + sz)
+                den_z = (one - uz)
+                Bz = num_z / den_z
+                inv_Bz = den_z / num_z
+                Psi = Psi * Az
+
+            base = rho * Psi
+            for l in range(self.velocity_set.q):
+                val = base * self.compute_dtype(_w[l]) 
+
+                cx = _c[0, l]
+                if cx == 1:
+                    val *= Bx
+                elif cx == -1:
+                    val *= inv_Bx
+
+                cy = _c[1, l]
+                if cy == 1:
+                    val *= By
+                elif cy == -1:
+                    val *= inv_By
+
+                if wp.static(self.velocity_set.d == 3):
+                    cz = _c[2, l]
+                    if cz == 1:
+                        val *= Bz
+                    elif cz == -1:
+                        val *= inv_Bz
+
+                feq[l] = val
+
+            return feq
+
 
         # Construct the warp kernel
         @wp.kernel
