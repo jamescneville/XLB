@@ -75,7 +75,7 @@ from xlb.compute_backend import ComputeBackend
 from xlb.precision_policy import Precision
 from xlb.operator import Operator
 from xlb.operator.stream import Stream
-from xlb.operator.collision import BGK, KBC, SmagorinskyLESBGK
+from xlb.operator.collision import BGK, KBC, SmagorinskyLESBGK, SmagorinskyLESKBC
 from xlb.operator.equilibrium import MultiresQuadraticEquilibrium
 from xlb.operator.macroscopic import MultiresMacroscopic
 from xlb.operator.stepper import Stepper
@@ -144,6 +144,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         super().__init__(grid, boundary_conditions)
 
         # Construct the collision operator
+        self._collision_requires_macro = wp.bool(False)
         if collision_type == "BGK":
             self.collision = BGK(self.velocity_set, self.precision_policy, self.compute_backend)
         elif collision_type == "KBC":
@@ -151,8 +152,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         elif collision_type == "SmagorinskyLESBGK":
             self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend)
         elif collision_type == "SmagorinskyLESKBC":
-            self.collision = SmagorinskyLESBGK(self.velocity_set, self.precision_policy, self.compute_backend, smagorinsky_constant)
-
+            self.collision = SmagorinskyLESKBC(self.velocity_set, self.precision_policy, self.compute_backend, smagorinsky_constant)
+            self._collision_requires_macro = wp.bool(True)
 
         if force_vector is not None:
             self.collision = ForcedCollision(collision_operator=self.collision, forcing_scheme=forcing_scheme, force_vector=force_vector)
@@ -428,6 +429,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             if bc_name.startswith("HybridBC"):
                 hybrid_bc_ids.append(bc_id)
 
+        
         # Factory for apply_bc: generates compile-time specialized variants
         def make_apply_bc(is_post_streaming: bool):
             @wp.func
@@ -549,7 +551,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             ):
                 _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
                 _feq = self.equilibrium.neon_functional(_rho, _u)
-                _f_post_collision = self.collision.neon_functional(_f_post_stream, _feq, omega)
+                if wp.static(self._collision_requires_macro):
+                    _f_post_collision = self.collision.neon_functional(
+                        _f_post_stream, _feq, _rho, _u, omega
+                    )
+                else:
+                    _f_post_collision = self.collision.neon_functional(
+                        _f_post_stream, _feq, omega
+                    )
 
                 if wp.static(do_bc):
                     _f_post_collision = apply_bc_post_collision(
@@ -567,6 +576,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     for l in range(self.velocity_set.q):
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_collision[l]))
+             
 
                 return _f_post_collision
 
@@ -840,6 +850,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     for l in range(self.velocity_set.q):
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_stream[l]))
+                    # Update rho / u fields for wall model
+                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
+                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                    for d in range(self.velocity_set.d):
+                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
 
                 loader.declare_kernel(device)
 
@@ -901,6 +916,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     for l in range(self.velocity_set.q):
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_stream[l]))
+
+                    # Update rho / u fields for wall model
+                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
+                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                    for d in range(self.velocity_set.d):
+                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
 
                 loader.declare_kernel(device)
 
@@ -984,11 +1005,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     # Voxel is a pure fluid cell with no multi-resolution interactions — mark as SFV
                     wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SFV))
-                    # Update rho / u fields for wall model
-                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
-                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
-                    for d in range(self.velocity_set.d):
-                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
+                    
 
                 loader.declare_kernel(cl_stream_coarse)
 

@@ -137,6 +137,7 @@ class HybridBC(BoundaryCondition):
             self.needs_moving_wall_treatment = True
 
         if self.use_wall_model is True:
+            print(f"Wall Model enabled for BC type = {self.__class__.__name__}_{self.bc_method}!")
             self.needs_moving_wall_treatment = True
 
         # Handle no-slip BCs if neither prescribed_value or profile are provided.
