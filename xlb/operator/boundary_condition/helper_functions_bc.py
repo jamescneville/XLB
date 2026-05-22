@@ -1142,6 +1142,8 @@ class HelperFunctionsBC(object):
             _norm_vec:Any,
             _norm_dist:Any,
         ):
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
             # -----------------------------------------------------------------
             # SANDWICH DETECTION
             # -----------------------------------------------------------------
@@ -1205,9 +1207,7 @@ class HelperFunctionsBC(object):
             if u_f_tangent_len > _epsilon:
                 streamwisef = u_f_tangent / u_f_tangent_len
             else:
-                streamwisef = streamwise
-
-            
+                streamwisef = streamwise            
 
             # Use B-streamwise for signed streamwise speed
             u_f_signed = wp.dot(u_f_rel, streamwise)
@@ -1255,32 +1255,30 @@ class HelperFunctionsBC(object):
                 pg_avg = ema * pg_instant + (compute_dtype(1.0) - ema) * _relax
 
             pg_avg = wp.clamp(pg_avg, compute_dtype(-1.2), compute_dtype(1.2))
-  
-   
 
             # =================================================================
             # SECTION 4: PRESSURE GRADIENT CORRECTION FACTOR 
             # =================================================================
             
             # Deadband Pressure between +/- p0
-            p0 = compute_dtype(0.0)    #0.1 works great
-            pressure_gate = compute_dtype(1.0)
+            # p0 = compute_dtype(0.0)    #0.1 works great
+            # pressure_gate = compute_dtype(1.0)
             
-            if pg_avg > p0:
-                # APG Correction: Nonlinear reduction
-                p_eff = pg_avg - p0
-                k0 = compute_dtype(9.0)
-                n0 = compute_dtype(1.5) #1.75
-                pressure_gate = wp.exp(-k0 * wp.pow(p_eff, n0))
+            # if pg_avg > p0:
+            #     # APG Correction: Nonlinear reduction
+            #     p_eff = pg_avg - p0
+            #     k0 = compute_dtype(9.0)
+            #     n0 = compute_dtype(1.5) #1.75
+            #     pressure_gate = wp.exp(-k0 * wp.pow(p_eff, n0))
           
-                pressure_gate = wp.max(pressure_gate, compute_dtype(0.025))
+            #     pressure_gate = wp.max(pressure_gate, compute_dtype(0.025))
             
-            if pg_avg < -p0:
-                p_eff = -pg_avg - p0
-                k1 = compute_dtype(2.0)
-                n1 = compute_dtype(1.5)
-                fpg_max = compute_dtype(1.0)
-                pressure_gate = compute_dtype(1.0) + (fpg_max - compute_dtype(1.0)) * (compute_dtype(1.0) - wp.exp(-k1 * wp.pow(p_eff, n1)))
+            # if pg_avg < -p0:
+            #     p_eff = -pg_avg - p0
+            #     k1 = compute_dtype(2.0)
+            #     n1 = compute_dtype(1.5)
+            #     fpg_max = compute_dtype(1.0)
+            #     pressure_gate = compute_dtype(1.0) + (fpg_max - compute_dtype(1.0)) * (compute_dtype(1.0) - wp.exp(-k1 * wp.pow(p_eff, n1)))
          
 
           
@@ -1299,13 +1297,13 @@ class HelperFunctionsBC(object):
             f_angle_deg = wp.asin(f_angle) * rad_to_deg  
 
             # Base liftoff rolloff in separation-angle space
-            separation_rolloff_start_deg = compute_dtype(2.0)
-            separation_rolloff_full_deg  = compute_dtype(8.0)
+            separation_rolloff_start_deg = compute_dtype(2.5)
+            separation_rolloff_full_deg  = compute_dtype(17.0)
 
             # FPG shield tuning in degree space
-            fpg_shield_start_pg   = compute_dtype(-0.1)  # shield begins once pg_avg goes below this
+            fpg_shield_start_pg   = compute_dtype(-0.1)  #.2 shield begins once pg_avg goes below this
             fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
-            fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
+            fpg_shield_max_deg    = compute_dtype(10.0)   # cap on total shield protection
 
             shield_shift_deg = compute_dtype(0.0)
             if pg_avg < fpg_shield_start_pg:
@@ -1314,12 +1312,25 @@ class HelperFunctionsBC(object):
                     fpg_shield_max_deg,
                 )
 
-            rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
-            rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+            
+            # APG sensitivity tuning in degree space
+            # apg_advance_start_pg   = compute_dtype(0.175)   #.15 advance begins once pg_avg goes above this
+            # apg_advance_deg_per_pg = compute_dtype(50.0)  # rolloff reduction per 1.0 of extra positive pg_avg
+            # apg_advance_max_deg    = compute_dtype(5.0)   # cap; keep small unless you want very aggressive APG
+
+            apg_shift_deg = compute_dtype(0.0)
+            # if pg_avg > apg_advance_start_pg:
+            #     apg_shift_deg = wp.min(
+            #         (pg_avg - apg_advance_start_pg) * apg_advance_deg_per_pg,
+            #         apg_advance_max_deg,
+            #     )
+
+            # FPG delays rolloff; APG advances rolloff
+            rolloff_start_deg = wp.max(separation_rolloff_start_deg + shield_shift_deg - apg_shift_deg, _epsilon)
+            rolloff_full_deg  = wp.max(separation_rolloff_full_deg  + shield_shift_deg - apg_shift_deg, one)
 
             rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
             rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
-            rolloff_full  = wp.max(rolloff_full, rolloff_start + compute_dtype(1.0e-6))
 
             if f_angle > rolloff_start:
                 penalty = wp.clamp(
@@ -1330,11 +1341,26 @@ class HelperFunctionsBC(object):
                 penalty_smooth = penalty * penalty * (compute_dtype(3.0) - compute_dtype(2.0) * penalty)
                 separation_gate = compute_dtype(1.0) - penalty_smooth
            
+            if pg_avg < zero:
+                separation_gate = one
+            # else:
+            #     b_f_alignment = wp.dot(streamwiseb, streamwisef)
+            #     bf_start = compute_dtype(70.0)
+            #     bf_end = compute_dtype(90.0)
+
+            #     separation_gate *= smoothstep(
+            #         wp.max(wp.cos(bf_end * deg_to_rad),  compute_dtype(0.00)),
+            #         wp.cos(bf_start * deg_to_rad),
+            #         b_f_alignment,
+            #     )  
+           
             # =================================================================
             # SECTION 6: COHERENCE CHECK
             # =================================================================
-            if coherent == compute_dtype(0.0):
-                separation_gate = compute_dtype(0.01)
+            if pg_avg > zero:
+                if coherent == compute_dtype(0.0):
+                    separation_gate = compute_dtype(0.01)
+            
 
             # =================================================================
             # SECTION 7: FINAL VELOCITY ASSEMBLY
@@ -1359,15 +1385,15 @@ class HelperFunctionsBC(object):
             # #theta = wp.atan2(ny, -nx) * compute_dtype(57.29577951308232)
             # if theta < compute_dtype(0.0):
             #     theta += compute_dtype(360.0)
-            # #drivaer = 656  429
-            # if (idx_wp[1] == 922) and (idx_wp[2] > 35) and (theta > compute_dtype(1.0)) and (theta < compute_dtype(170.0)):
+            # #drivaer = 537  389
+            # if (idx_wp[1] == 389) and (idx_wp[2] > 35) and (theta > compute_dtype(1.0)) and (theta < compute_dtype(170.0)):
             # #if (idx_wp[2] == 44) and (ny < 0.0):                          
             #     wp.printf(
-            #         "WM idx,%4d,%4d,%4d, streamwise ,%1.1f,%1.1f,%1.1f, normal ,%0.3f,%0.3f,%0.3f,theta, %1.1f, pg_instant, %1.4f, pg_avg, %1.4f, pressure_gate, %1.4f, separation_gate, %1.4f, f_angle_deg, %1.2f, rolloff_start_deg, %1.2f, u_zpg, %0.4f, uFinal, %0.4f, u_b, %0.4f, u_f, %0.4f, coh, %1.0f,\n",
+            #         "WM idx,%4d,%4d,%4d, streamwise ,%1.1f,%1.1f,%1.1f, normal ,%0.3f,%0.3f,%0.3f,theta, %1.1f, pg_instant, %1.4f, pg_avg, %1.4f, separation_gate, %1.4f, f_angle_deg, %1.2f, rolloff_start_deg, %1.2f, rolloff_full_deg, %1.2f, u_zpg, %0.4f, uFinal, %0.4f, u_b, %0.4f, u_f, %0.4f, b_f_align, %1.2f, coh, %1.0f,\n",
             #         idx_wp[0], idx_wp[1], idx_wp[2],
             #         streamwise[0], streamwise[1], streamwise[2],normal[0], normal[1], normal[2],theta,
-            #  pg_instant, pg_avg, pressure_gate, separation_gate, f_angle_deg, rolloff_start_deg, 
-            #  U_wm_B_zpg, U_wm_B_final, u_b_tangent_len, u_f_par_mag,
+            #  pg_instant, pg_avg,  separation_gate, f_angle_deg, rolloff_start_deg, rolloff_full_deg,
+            #  U_wm_B_zpg, U_wm_B_final, u_b_tangent_len, u_f_par_mag,wp.cos(b_f_alignment * deg_to_rad),
             # coherent,
             # )
 
