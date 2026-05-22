@@ -814,24 +814,24 @@ class HelperFunctionsBC(object):
             # =================================================================
             
             # Deadband Pressure between +/- p0
-            p0 = zero   
-            pressure_gate = one
+            # p0 = zero   
+            # pressure_gate = one
             
-            if pg_avg > p0:
-                # APG Correction: Nonlinear reduction
-                p_eff = pg_avg - p0
-                k0 = compute_dtype(9.0)
-                n0 = compute_dtype(1.5) #1.75
-                pressure_gate = wp.exp(-k0 * wp.pow(p_eff, n0))
+            # if pg_avg > p0:
+            #     # APG Correction: Nonlinear reduction
+            #     p_eff = pg_avg - p0
+            #     k0 = compute_dtype(9.0)
+            #     n0 = compute_dtype(1.5) #1.75
+            #     pressure_gate = wp.exp(-k0 * wp.pow(p_eff, n0))
           
-                pressure_gate = wp.max(pressure_gate, compute_dtype(0.025))
+            #     pressure_gate = wp.max(pressure_gate, compute_dtype(0.025))
             
-            if pg_avg < -p0:
-                p_eff = -pg_avg - p0
-                k1 = compute_dtype(2.0)
-                n1 = compute_dtype(1.5)
-                fpg_max = compute_dtype(1.0)
-                pressure_gate = one + (fpg_max - one) * (one - wp.exp(-k1 * wp.pow(p_eff, n1)))
+            # if pg_avg < -p0:
+            #     p_eff = -pg_avg - p0
+            #     k1 = compute_dtype(2.0)
+            #     n1 = compute_dtype(1.5)
+            #     fpg_max = compute_dtype(1.0)
+            #     pressure_gate = one + (fpg_max - one) * (one - wp.exp(-k1 * wp.pow(p_eff, n1)))
       
 
           
@@ -842,55 +842,57 @@ class HelperFunctionsBC(object):
             # f_angle > 0 : lifting away from wall
             # f_angle < 0 : pointing into wall
             # f_angle ~ 0 : tangent to wall
-            f_angle = wp.dot(u_f_rel / wp.max(u_f_mag, _epsilon), normal)        
+                   
             separation_gate = one
+            if pg_avg > zero:
+                f_angle = wp.dot(u_f_rel / wp.max(u_f_mag, _epsilon), normal) 
+                deg_to_rad = compute_dtype(0.017453292519943295)
+                rad_to_deg = compute_dtype(57.29577951308232)
+                f_angle_deg = wp.asin(f_angle) * rad_to_deg  
 
-            deg_to_rad = compute_dtype(0.017453292519943295)
-            rad_to_deg = compute_dtype(57.29577951308232)
-            f_angle_deg = wp.asin(f_angle) * rad_to_deg  
+                # Base liftoff rolloff in separation-angle space
+                separation_rolloff_start_deg = compute_dtype(2.5)
+                separation_rolloff_full_deg  = compute_dtype(17.0)
 
-            # Base liftoff rolloff in separation-angle space
-            separation_rolloff_start_deg = compute_dtype(2.5)
-            separation_rolloff_full_deg  = compute_dtype(17.0)
+                # FPG shield tuning in degree space
+                # fpg_shield_start_pg   = compute_dtype(-0.1)  # shield begins once pg_avg goes below this
+                # fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
+                # fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
 
-            # FPG shield tuning in degree space
-            fpg_shield_start_pg   = compute_dtype(-0.1)  # shield begins once pg_avg goes below this
-            fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
-            fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
+                shield_shift_deg = compute_dtype(0.0)
+                # if pg_avg < fpg_shield_start_pg:
+                #     shield_shift_deg = wp.min(
+                #         (fpg_shield_start_pg - pg_avg) * fpg_shield_deg_per_pg,
+                #         fpg_shield_max_deg,
+                #     )
 
-            shield_shift_deg = compute_dtype(0.0)
-            if pg_avg < fpg_shield_start_pg:
-                shield_shift_deg = wp.min(
-                    (fpg_shield_start_pg - pg_avg) * fpg_shield_deg_per_pg,
-                    fpg_shield_max_deg,
-                )
+                rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
+                rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
 
-            rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
-            rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+                rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
+                rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
+                rolloff_full  = wp.max(rolloff_full, rolloff_start + compute_dtype(1.0e-6))
 
-            rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
-            rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
-            rolloff_full  = wp.max(rolloff_full, rolloff_start + compute_dtype(1.0e-6))
-
-            if f_angle > rolloff_start:
-                penalty = wp.clamp(
-                    (f_angle - rolloff_start) / (rolloff_full - rolloff_start),
-                    zero,
-                    one,
-                )
-                penalty_smooth = penalty * penalty * (compute_dtype(3.0) - compute_dtype(2.0) * penalty)
-                separation_gate = one - penalty_smooth
+                if f_angle > rolloff_start:
+                    penalty = wp.clamp(
+                        (f_angle - rolloff_start) / (rolloff_full - rolloff_start),
+                        zero,
+                        one,
+                    )
+                    penalty_smooth = penalty * penalty * (compute_dtype(3.0) - compute_dtype(2.0) * penalty)
+                    separation_gate = one - penalty_smooth
            
             # =================================================================
             # SECTION 6: COHERENCE CHECK
             # =================================================================
+            coherence_gate = compute_dtype(1.0) 
             if coherent == zero:
-                pressure_gate = compute_dtype(0.01) 
+                coherence_gate = compute_dtype(0.01) 
 
             # =================================================================
             # SECTION 7: FINAL VELOCITY ASSEMBLY
             # =================================================================
-            U_wm_B_final = U_wm_B_zpg * separation_gate #* pressure_gate 
+            U_wm_B_final = U_wm_B_zpg * separation_gate * coherence_gate
             U_wm_B_final = wp.clamp(
                 U_wm_B_final,
                 zero,

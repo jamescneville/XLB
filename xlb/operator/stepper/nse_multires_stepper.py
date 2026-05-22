@@ -576,6 +576,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     for l in range(self.velocity_set.q):
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_collision[l]))
+                
+                # Update rho / u fields for wall model                
+                wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                for d in range(self.velocity_set.d):
+                    wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
              
 
                 return _f_post_collision
@@ -603,6 +608,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 has_ngh_at_same_level = wp.bool(False)
                 accumulated = wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level)
+                accumulated = wp.max(accumulated, self.compute_dtype(0.0))
 
                 if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
                     # No finer ngh in the pull direction (opposite of l)
@@ -1005,6 +1011,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     # Voxel is a pure fluid cell with no multi-resolution interactions — mark as SFV
                     wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SFV))
+                    # Update rho / u fields for wall model
+                    _rho, _u = self.macroscopic.neon_functional(_f_post_stream)
+                    wp.neon_write(_rho1_pn, index, 0, self.store_dtype(_rho))
+                    for d in range(self.velocity_set.d):
+                        wp.neon_write(_u1_pn, index, d, self.store_dtype(_u[d]))
+                    
                     
 
                 loader.declare_kernel(cl_stream_coarse)
