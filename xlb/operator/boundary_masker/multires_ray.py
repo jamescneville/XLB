@@ -52,8 +52,8 @@ class MultiresMeshMaskerRay(MeshMaskerRay):
                 distances_pn = loader.get_mres_write_handle(distances)
                 bc_mask_pn = loader.get_mres_write_handle(bc_mask)
                 missing_mask_pn = loader.get_mres_write_handle(missing_mask)
-                norm_vec_pn = loader.get_write_handle(normal_vector)
-                norm_dist_pn = loader.get_write_handle(normal_distance)
+                norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                norm_dist_pn = loader.get_mres_write_handle(normal_distance)
 
 
                 @wp.func
