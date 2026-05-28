@@ -1448,6 +1448,10 @@ class MultiresIO(object):
         show_colorbar=False,        
         normalize=1.0,
         output=None,
+        width=None,
+        height=None,
+        width_vec=None,
+        height_vec=None,
         **kwargs,
     ):
         """
@@ -1512,6 +1516,10 @@ class MultiresIO(object):
             show_axes=show_axes,
             show_colorbar=show_colorbar,
             normalize=normalize,
+            width=width,
+            height=height,
+            width_vec=width_vec,
+            height_vec=height_vec,
             **kwargs,
         )
         print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
@@ -1529,10 +1537,18 @@ class MultiresIO(object):
         show_axes,
         show_colorbar,
         normalize,
+        width,
+        height,
+        width_vec,
+        height_vec,
         **kwargs,
     ):
         """
         Helper function to create a slice image for a single field.
+
+        If width, height, width_vec, and height_vec are all provided, the image
+        extent is pinned to the rectangle [plane_point, plane_point + width*width_vec + height*height_vec]
+        so consecutive slices in a sweep share an identical pixel grid (no shift).
         """
         from matplotlib import cm
         import numpy as np
@@ -1542,16 +1558,32 @@ class MultiresIO(object):
         # field data are associated with the cells centers
         cell_values = field_data
 
-        # get the normalized plane normal
-        plane_normal = np.asarray(np.abs(plane_normal))
+        fixed_extent = (
+            width is not None
+            and height is not None
+            and width_vec is not None
+            and height_vec is not None
+        )
+
+        # get the normalized plane normal (preserve sign)
+        plane_normal = np.asarray(plane_normal, dtype=np.float64)
         n = plane_normal / np.linalg.norm(plane_normal)
 
-        # Compute signed distances of each cell center to the plane
-        plane_point *= plane_normal
+        # Compute signed distances of each cell center to the plane.
+        # Copy plane_point so concurrent slice renders cannot corrupt a shared array.
+        plane_point = np.asarray(plane_point, dtype=np.float64).copy()
         sdf = np.dot(self.centroids - plane_point, n)
 
-        # Filter: cells with centroid near plane
-        mask = np.abs(sdf) <= slice_thickness / 2
+        # Filter: cells with centroid near plane.
+        # On multires grids, scale the slab thickness per cell by its refinement level
+        # so each level contributes ~one intersecting layer instead of many fine layers.
+        if getattr(self, "level_id_field", None) is not None:
+            local_thickness = float(slice_thickness) * (
+                2.0 ** self.level_id_field.astype(np.float32)
+            )
+            mask = np.abs(sdf) <= 0.55 * local_thickness
+        else:
+            mask = np.abs(sdf) <= slice_thickness / 2
         if not np.any(mask):
             raise ValueError("No cells intersect the plane within thickness.")
 
@@ -1563,34 +1595,51 @@ class MultiresIO(object):
         values = cell_values[mask]
 
         # Build in-plane basis
-        if np.allclose(n, [1, 0, 0]):
-            u1 = np.array([0, 1, 0])
+        if fixed_extent:
+            u1 = np.asarray(width_vec, dtype=np.float64)
+            u1 = u1 / np.linalg.norm(u1)
+            u2 = np.asarray(height_vec, dtype=np.float64)
+            u2 = u2 / np.linalg.norm(u2)
         else:
-            u1 = np.array([1, 0, 0])
-        u2 = np.abs(np.cross(n, u1))
+            if np.allclose(n, [1, 0, 0]):
+                u1 = np.array([0, 1, 0])
+            else:
+                u1 = np.array([1, 0, 0])
+            u2 = np.abs(np.cross(n, u1))
 
         local_x = np.dot(proj - plane_point, u1)
         local_y = np.dot(proj - plane_point, u2)
 
-        # Define extent of the plot
-        xmin, xmax, ymin, ymax = local_x.min(), local_x.max(), local_y.min(), local_y.max()
-        Lx = xmax - xmin
-        Ly = ymax - ymin
-        extent = np.array([xmin + bounds[0] * Lx, xmin + bounds[1] * Lx, ymin + bounds[2] * Ly, ymin + bounds[3] * Ly])
-        mask_bounds = (extent[0] <= local_x) & (local_x <= extent[1]) & (extent[2] <= local_y) & (local_y <= extent[3])
-
         if cmap is None:
             cmap = cm.nipy_spectral
 
-        # Adjust vertical resolution based on bounds
-        bounded_x_min = local_x[mask_bounds].min()
-        bounded_x_max = local_x[mask_bounds].max()
-        bounded_y_min = local_y[mask_bounds].min()
-        bounded_y_max = local_y[mask_bounds].max()
-        width_x = bounded_x_max - bounded_x_min
-        height_y = bounded_y_max - bounded_y_min
-        aspect_ratio = height_y / width_x
-        grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
+        if fixed_extent:
+            # Pin grid to the published slice rectangle so every slice in a
+            # sweep uses an identical pixel grid (no inter-slice shift).
+            bounded_x_min = 0.0
+            bounded_x_max = float(width)
+            bounded_y_min = 0.0
+            bounded_y_max = float(height)
+            mask_bounds = (
+                (bounded_x_min <= local_x) & (local_x <= bounded_x_max)
+                & (bounded_y_min <= local_y) & (local_y <= bounded_y_max)
+            )
+            aspect_ratio = (bounded_y_max - bounded_y_min) / max(bounded_x_max - bounded_x_min, 1e-20)
+            grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
+        else:
+            # Legacy: derive the extent from whichever cells fell into the slab.
+            xmin, xmax, ymin, ymax = local_x.min(), local_x.max(), local_y.min(), local_y.max()
+            Lx = xmax - xmin
+            Ly = ymax - ymin
+            extent = np.array([xmin + bounds[0] * Lx, xmin + bounds[1] * Lx, ymin + bounds[2] * Ly, ymin + bounds[3] * Ly])
+            mask_bounds = (extent[0] <= local_x) & (local_x <= extent[1]) & (extent[2] <= local_y) & (local_y <= extent[3])
+
+            bounded_x_min = local_x[mask_bounds].min()
+            bounded_x_max = local_x[mask_bounds].max()
+            bounded_y_min = local_y[mask_bounds].min()
+            bounded_y_max = local_y[mask_bounds].max()
+            aspect_ratio = (bounded_y_max - bounded_y_min) / max(bounded_x_max - bounded_x_min, 1e-20)
+            grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
 
         # Create grid
         grid_x = np.linspace(bounded_x_min, bounded_x_max, grid_res)
@@ -1605,13 +1654,31 @@ class MultiresIO(object):
         query_points = np.column_stack((xv.ravel(), yv.ravel()))
 
         # Find k nearest neighbors for smoother interpolation
-        k = min(4, len(points))  # Use 4 neighbors or less if not enough points
-        distances, indices = tree.query(query_points, k=k, workers=-1)  # -1 uses all cores
+        k = min(4, len(points))
+        distances, indices = tree.query(query_points, k=k, workers=-1)
 
-        # Inverse distance weighting
-        epsilon = 1e-10
-        weights = 1.0 / (distances + epsilon)
-        weights /= weights.sum(axis=1, keepdims=True)
+        if k == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+
+        # Gaussian-weighted interpolation with an adaptive per-query bandwidth.
+        # h scales with the actual neighbor spacing at each pixel, so coarse-grid
+        # regions widen the kernel automatically and weights don't underflow to
+        # zero between cell centers (which paints a dot grid).
+        pixel_dx = (bounded_x_max - bounded_x_min) / max(grid_res - 1, 1)
+        pixel_dy = (bounded_y_max - bounded_y_min) / max(grid_resY - 1, 1)
+        floor_h = max(2.0 * float(slice_thickness), 2.0 * pixel_dx, 2.0 * pixel_dy, 1e-12)
+
+        # Use the farthest of the k neighbors as the local scale: the closest
+        # neighbor lands near exp(-0.5) instead of underflowing in coarse zones.
+        if k > 1:
+            local_h = distances[:, -1:]
+        else:
+            local_h = np.full((distances.shape[0], 1), floor_h)
+        h = np.maximum(local_h, floor_h)
+
+        weights = np.exp(-0.5 * (distances / h) ** 2)
+        weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-20)
 
         # Interpolate values
         neighbor_values = values[mask_bounds][indices]
@@ -1894,7 +1961,11 @@ class MultiresIO(object):
         show_axes=False,
         show_colorbar=False,
         normalize=1.0,
-        keep_state: bool = True,
+        keep_state: bool = True,       
+        width=None,
+        height=None,
+        width_vec=None,
+        height_vec=None,
         **kwargs,
     ):
         """
@@ -1948,6 +2019,10 @@ class MultiresIO(object):
             show_axes=show_axes,
             show_colorbar=show_colorbar,
             normalize=normalize,
+            width=width,
+            height=height,
+            width_vec=width_vec,
+            height_vec=height_vec,
             **kwargs,
         )
         print(f"\tTime-averaged slice image for field {field_name} saved as {output_filename}.png")

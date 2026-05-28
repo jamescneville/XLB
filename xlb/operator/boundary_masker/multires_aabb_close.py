@@ -363,7 +363,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                         cluster_w3 += hit_w
                         cluster_d3 += hit_w * wall_dist
 
-            if total_weight < 0.0:
+            if (total_weight <= 0.0) or (not needs_mesh_distance):
                 return
 
             # Goal 2:

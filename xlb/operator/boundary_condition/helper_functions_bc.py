@@ -316,7 +316,7 @@ class HelperFunctionsBC(object):
                      
                             # Add contribution due to moving_wall to f_missing as is usual in regular Bouzidi BC
                             if needs_moving_wall_treatment:
-                                f_post[l] += moving_wall_fpop_correction(u_wall, l)
+                                f_post[l] += moving_wall_fpop_correction(u_wall, l, rho)
             return f_post
 
         @wp.func
