@@ -1302,7 +1302,109 @@ class MultiresIO(object):
 
         return container
 
-    def get_fields_data(self, field_neon_dict):
+    # ------------------------------------------------------------------
+    # Derived fields
+    # ------------------------------------------------------------------
+    # Maps a derived field name -> tuple of base fields it is computed from.
+    # To add a new derived quantity:
+    #   1) add an entry here listing the base fields it needs, and
+    #   2) add a branch computing it in _compute_derived_fields().
+    # Naming rules (so it plays nicely with the rest of MultiresIO):
+    #   - DO NOT put "pressure"/"velocity"/"density" in a dimensionless field's
+    #     name, or the name-based unit conversion will rescale it.
+    #   - Avoid prefix collisions: surface/slice selection matches
+    #     startswith(base + "_"), so "CpTotal" is safe next to "Cp" but
+    #     "cp_total" would collide with base "cp".
+    DERIVED_FIELD_DEPS = {
+        "pressure": ("density",),            # static pressure -> Pa via name hook
+        "Cp": ("density",),                  # static pressure coefficient (dimensionless)
+        "CpTotal": ("density", "velocity"),  # total/stagnation pressure coefficient (dimensionless)
+        "CpTotalLoss": ("density", "velocity"),  # total-pressure-loss coeff (0 freestream, <0 in wake)
+        "qdyn": ("density", "velocity"),     # dynamic pressure 0.5*rho*|u|^2 [Pa]
+    }
+
+    def _compute_derived_fields(self, fields_data, derived):
+        """
+        Append derived field component arrays to ``fields_data`` in place.
+
+        Must be called while the base fields are still in LATTICE units (before
+        the name-based unit conversion). Density and velocity are read as the
+        lattice arrays ``density_0`` and ``velocity_0/1/2``.
+
+        Reference state is the freestream/inlet: rho_inf = 1, U_inf = ulb.
+        """
+        import numpy as np
+
+        if self.unit_convertor is None:
+            raise ValueError(
+                "Derived fields require a unit_convertor (needed for the reference "
+                "lattice velocity ulb)."
+            )
+
+        cs2 = 1.0 / 3.0
+        rho_ref = 1.0
+        ulb = float(self.unit_convertor.velocity_lbm_unit)
+        q_dyn = 0.5 * rho_ref * ulb * ulb  # reference dynamic pressure (lattice units)
+
+        # Lattice->physical scale factors for fields NOT routed through the
+        # name-based unit hook (they must be emitted already in physical units).
+        ref_vel = float(self.unit_convertor.reference_velocity)            # [m/s] per lattice velocity
+        rho_phys = float(self.unit_convertor.reference_density)            # [kg/m^3] at rho=1
+        pressure_scale = rho_phys * ref_vel * ref_vel                      # lattice pressure -> Pa
+
+        for name in derived:
+            deps = self.DERIVED_FIELD_DEPS.get(name)
+            assert deps is not None, (
+                f"Unknown derived field '{name}'. Known: {list(self.DERIVED_FIELD_DEPS)}"
+            )
+            for dep in deps:
+                assert f"{dep}_0" in fields_data, (
+                    f"Derived field '{name}' needs base field '{dep}', but it was not "
+                    f"extracted. Include '{dep}' in the field dict you pass."
+                )
+
+            rho = fields_data["density_0"]  # lattice density (pre-conversion)
+
+            if name == "pressure":
+                # lattice static pressure; pressure_to_physical converts to Pa
+                fields_data["pressure_0"] = (cs2 * rho).astype(rho.dtype, copy=False)
+
+            elif name == "Cp":
+                fields_data["Cp_0"] = ((cs2 * (rho - rho_ref)) / q_dyn).astype(rho.dtype, copy=False)
+
+            elif name == "CpTotal":
+                u_sq = (
+                    fields_data["velocity_0"] ** 2
+                    + fields_data["velocity_1"] ** 2
+                    + fields_data["velocity_2"] ** 2
+                )  # lattice |u|^2
+                p_static = cs2 * (rho - rho_ref)
+                p_total = p_static + 0.5 * rho * u_sq
+                fields_data["CpTotal_0"] = (p_total / q_dyn).astype(rho.dtype, copy=False)
+
+            elif name == "CpTotalLoss":
+                # Total-pressure loss referenced to freestream total pressure:
+                # 0 in clean flow, negative in the wake. (= CpTotal - 1)
+                u_sq = (
+                    fields_data["velocity_0"] ** 2
+                    + fields_data["velocity_1"] ** 2
+                    + fields_data["velocity_2"] ** 2
+                )
+                p_static = cs2 * (rho - rho_ref)
+                p_total = p_static + 0.5 * rho * u_sq
+                fields_data["CpTotalLoss_0"] = (p_total / q_dyn - 1.0).astype(rho.dtype, copy=False)
+
+            elif name == "qdyn":
+                # Dynamic pressure 0.5*rho*|u|^2 in Pa (no atmospheric offset, so it
+                # cannot use the 'pressure' hook -- emitted directly in physical units).
+                u_sq = (
+                    fields_data["velocity_0"] ** 2
+                    + fields_data["velocity_1"] ** 2
+                    + fields_data["velocity_2"] ** 2
+                )
+                fields_data["qdyn_0"] = (0.5 * rho * u_sq * pressure_scale).astype(rho.dtype, copy=False)
+
+    def get_fields_data(self, field_neon_dict, derived=None):
         """
         Extracts and prepares fields data from NEON fields for export.
 
@@ -1310,6 +1412,16 @@ class MultiresIO(object):
         - WARP fields are allocated lazily only for requested fields.
         - output arrays are preallocated to self.total_cells.
         - avoids per-field list accumulation and final np.concatenate().
+
+        Parameters
+        ----------
+        derived : list[str], optional
+            Names of derived fields to synthesize from the extracted base fields
+            (e.g. ["pressure", "Cp", "CpTotal"]). Derived fields are pure algebraic
+            functions of density/velocity, so no extra NEON fields or solver work
+            are needed -- you only pass the base fields ("density", "velocity").
+            See MultiresIO.DERIVED_FIELD_DEPS for the available names and their
+            base-field dependencies.
         """
         import numpy as np
 
@@ -1390,6 +1502,13 @@ class MultiresIO(object):
                         f"Error: Field {key} size mismatch!"
                     )
 
+        # Synthesize derived fields (pressure, Cp, CpTotal, ...) from the base
+        # lattice fields BEFORE unit conversion runs. Derived "pressure" is written
+        # in lattice units (rho*cs2) so the name-based hook below converts it to Pa;
+        # the dimensionless coefficients are written final and skipped by the hook.
+        if derived:
+            self._compute_derived_fields(fields_data, derived)
+
         # Unit conversion if applicable.
         if self.unit_convertor is not None:
             for field_name in list(fields_data.keys()):
@@ -1404,7 +1523,7 @@ class MultiresIO(object):
 
         return fields_data
     
-    def to_hdf5(self, output_filename, field_neon_dict, compression="gzip", compression_opts=0):
+    def to_hdf5(self, output_filename, field_neon_dict, compression="gzip", compression_opts=0, derived=None):
         """
         Export the multi-resolution mesh data to an HDF5 file.
         Parameters
@@ -1421,7 +1540,7 @@ class MultiresIO(object):
         import time
 
         # Get the fields data from the NEON fields
-        fields_data = self.get_fields_data(field_neon_dict)
+        fields_data = self.get_fields_data(field_neon_dict, derived=derived)
 
         # Save XDMF file
         self.save_xdmf(output_filename + ".h5", output_filename + ".xmf", self.total_cells, len(self.coordinates), fields_data)
@@ -1445,13 +1564,15 @@ class MultiresIO(object):
         cmap=None,
         component=None,
         show_axes=False,
-        show_colorbar=False,        
+        show_colorbar=False,
         normalize=1.0,
         output=None,
         width=None,
         height=None,
         width_vec=None,
         height_vec=None,
+        derived=None,
+        field_base_name=None,
         **kwargs,
     ):
         """
@@ -1478,19 +1599,57 @@ class MultiresIO(object):
             Matplotlib colormap.
         normalize : float
             Factor to scale and normalize data to ensure consistent images
+        derived : list[str], optional
+            Derived fields to synthesize from the base NEON fields you pass
+            (e.g. ["pressure"]). Pass the base fields the derived quantity needs
+            in field_neon_dict (density for pressure/Cp; density+velocity for
+            CpTotal), then set field_base_name to choose which one to render.
+        field_base_name : str, optional
+            Which field to plot when field_neon_dict carries more than one field
+            or when plotting a derived field (e.g. "pressure", "Cp", "velocity").
+            Selects keys "<field_base_name>_0", "_1", ... ; with component=None a
+            scalar is plotted directly and a vector is reduced to its magnitude.
+            If None, the legacy single-field behavior is used.
         """
-        # Get the fields data from the NEON fields
-        assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
-        fields_data = self.get_fields_data(field_neon_dict)
+        fields_data = self.get_fields_data(field_neon_dict, derived=derived)
 
-        # Check if the component is within the valid range
-        if component is None:
+        if field_base_name is not None:
+            # Explicit field selection (base or derived). Mirrors the
+            # component-key handling used by to_slice_image_time_average.
+            comp_keys = sorted(
+                [k for k in fields_data if k.startswith(field_base_name + "_")],
+                key=lambda k: int(k.rsplit("_", 1)[1]),
+            )
+            assert comp_keys, (
+                f"No components found for field_base_name '{field_base_name}'. "
+                f"Available: {sorted(fields_data.keys())}"
+            )
+            if component is None and len(comp_keys) > 1:
+                print(f"\tCreating slice image of the {field_base_name} magnitude!")
+                comps = [fields_data[k].astype(np.float64) for k in comp_keys]
+                cell_data = np.sqrt(sum(c**2 for c in comps))
+                field_name = field_base_name + "_magnitude"
+            elif component is None:
+                print(f"\tCreating slice image of scalar field {field_base_name}!")
+                field_name = comp_keys[0]
+                cell_data = fields_data[field_name]
+            else:
+                assert 0 <= int(component) < len(comp_keys), (
+                    f"Component {component} out of range for '{field_base_name}'."
+                )
+                field_name = comp_keys[int(component)]
+                print(f"\tCreating slice image for component {component} of {field_base_name}!")
+                cell_data = fields_data[field_name]
+        # Legacy path: a single field in the dict, indexed by component.
+        elif component is None:
+            assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
             print("\tCreating slice image of the field magnitude!")
             cell_data = list(fields_data.values())
             squared = [comp**2 for comp in cell_data]
             cell_data = np.sqrt(sum(squared))
             field_name = list(fields_data.keys())[0].split("_")[0] + "_magnitude"
         else:
+            assert len(field_neon_dict.keys()) == 1, "Error: This function is designed to plot a single field at a time."
             assert component < max(self.field_name_cardinality_dict.values()), (
                 f"Error: Component {component} is out of range for the provided fields."
             )
@@ -1856,7 +2015,7 @@ class MultiresIO(object):
         self._avg_cache_weight = 0.0
         self._avg_derived_cache = {}
 
-    def accumulate_time_average(self, field_neon_dict: Dict[str, Any], weight: float = 1.0):
+    def accumulate_time_average(self, field_neon_dict: Dict[str, Any], weight: float = 1.0, derived=None):
         """
         Accumulate a timestep into the running time-average using extracted cell-centered data.
 
@@ -1868,10 +2027,17 @@ class MultiresIO(object):
             the accumulator stores by extracted component keys (e.g. "velocity_0").
         weight : float
             Typically dt for dt-weighted averaging, or 1.0 for simple arithmetic mean.
+        derived : list[str], optional
+            Derived fields to synthesize and average alongside the base fields
+            (e.g. ["pressure", "Cp", "CpTotal"]). They are computed per-step BEFORE
+            averaging, so nonlinear quantities like CpTotal are averaged correctly
+            (true mean of the instantaneous coefficient, not the coefficient of the
+            mean field). The resulting keys (pressure_0, Cp_0, CpTotal_0) then flow
+            through to_hdf5_time_average / to_surface_vtk_time_average / etc.
         """
         start_time = time.time()
         assert self._avg_active, "Call start_time_average() before accumulate_time_average()."
-        fields_data = self.get_fields_data(field_neon_dict)
+        fields_data = self.get_fields_data(field_neon_dict, derived=derived)
         self.accumulate_time_average_from_fields_data(fields_data, weight=weight)  
         print(f"Time Avg Accumulation in {time.time()-start_time}sec ")
 
