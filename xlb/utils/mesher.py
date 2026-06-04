@@ -2746,6 +2746,46 @@ class MultiresIO(object):
         bc = np.asarray(fields_data[bc_mask_key])
         return np.rint(bc).astype(np.int32) == int(BC_SOLID)
 
+    def _infer_ambient_fill(self, field_base_name, component=None):
+        """Free-stream/ambient value used to cap an iso-surface at the body.
+
+        Returned in the field's physical units (matching ``iso_value``): the
+        contoured scalar reaches the iso routine already converted (velocity in
+        m/s, density in kg/m^3, pressure in Pa; Cp/CpTotal/CpTotalLoss/qdyn left
+        as emitted). The value is the clean reference state, NOT read from solid
+        voxels. Returns None when it cannot be inferred reliably (the caller then
+        falls back to the open/masked-hole behaviour).
+        """
+        name = str(field_base_name).lower()
+
+        # Dimensionless pressure coefficients: reference state is exact and does
+        # not depend on the unit convertor.
+        if name == "cp":
+            return 0.0
+        if name == "cptotal":
+            return 1.0
+        if name == "cptotalloss":
+            return 0.0
+
+        uc = self.unit_convertor
+        if uc is None:
+            return None
+
+        if name == "velocity":
+            # Magnitude caps at the free-stream speed. A single signed component is
+            # direction-dependent (depends on flow orientation), so don't guess.
+            if component is None:
+                return float(uc.velocity_phys_unit)
+            return None
+        if name == "density":
+            return float(uc.reference_density)
+        if name == "pressure":
+            return float(uc.referece_pressure)  # attribute spelling per UnitConvertor
+        if name == "qdyn":
+            return 0.5 * float(uc.reference_density) * float(uc.velocity_phys_unit) ** 2
+
+        return None
+
     def _scalar_to_isosurface_stl(
         self,
         output_filename,
@@ -2762,6 +2802,8 @@ class MultiresIO(object):
         smooth_taubin_lambda=0.5,
         smooth_taubin_nu=0.53,
         step_size=1,
+        body_handling="cap",
+        fill_value=None,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
 
@@ -2775,10 +2817,20 @@ class MultiresIO(object):
         neighbour resampling (``interpolation="nearest"``) is faster but blocky.
 
         Solid handling (when ``solid_mask`` is given):
-        - Solid (bc_mask==255) cells are excluded from the interpolation source,
-          so their invalid data never contributes to the contoured field.
-        - Grid points sitting inside a solid voxel are masked out of marching
-          cubes, leaving the surface OPEN (a hole) where it meets the body.
+        - Solid (bc_mask==255) cells are ALWAYS excluded from the interpolation
+          source, so their invalid data never contributes to the contoured field.
+          The solid cells are used only to detect which grid points sit inside the
+          body (nearest-cell-is-solid); they contribute no data either way.
+        - ``body_handling`` controls what happens at those interior points:
+            * "cap" (default): stamp the ambient/free-stream ``fill_value`` into
+              the body interior so the surface caps cleanly at the body skin,
+              giving a closed, watertight-ish STL. ``fill_value`` must be a clean
+              constant on the OUTSIDE side of ``iso_value`` (e.g. CpTotal=1,
+              velocity=U_inf); it is NOT read from the solid voxels. If
+              ``fill_value`` is None here, capping cannot be done safely and the
+              routine falls back to "open" with a warning.
+            * "open": mask the interior out of marching cubes, leaving the surface
+              OPEN (a hole) where it meets the body.
           Note: only the shell voxels intersecting the body mesh are solid; any
           fluid in the interior is still contoured.
 
@@ -2878,7 +2930,39 @@ class MultiresIO(object):
 
         np.nan_to_num(vol, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-        sample = vol[compute_mask] if compute_mask is not None else vol
+        # Resolve body handling. ``compute_mask`` is True for fluid grid points and
+        # False for points whose nearest cell is solid (inside the body).
+        mode = str(body_handling).lower()
+        if mode not in ("cap", "open"):
+            raise ValueError(f"body_handling must be 'cap' or 'open', got {body_handling!r}")
+
+        if compute_mask is not None and mode == "cap" and fill_value is None:
+            print(
+                "\tBody handling 'cap' requested but no fill_value could be resolved "
+                "(ambient value unknown for this quantity); falling back to 'open' "
+                "(masked hole at the body)."
+            )
+            mode = "open"
+
+        if compute_mask is not None and mode == "cap":
+            # Stamp the ambient/free-stream constant into the body interior so the
+            # surface caps cleanly at the skin. The fill is a clean constant, NOT
+            # read from solid voxels; it now legitimately participates in the field.
+            fv = np.float32(fill_value)
+            vol[~compute_mask] = fv
+            mc_mask = None
+            sample = vol
+            print(f"\tBody handling: cap (fill_value={float(fill_value):.6g})")
+        elif compute_mask is not None and mode == "open":
+            # Mask the body interior out of marching cubes -> open surface (hole).
+            mc_mask = compute_mask
+            sample = vol[compute_mask]
+            print("\tBody handling: open (masked hole at the body)")
+        else:
+            # No solids present (nothing to cap or open).
+            mc_mask = None
+            sample = vol
+
         vmin = float(sample.min())
         vmax = float(sample.max())
         if not (vmin < float(iso_value) < vmax):
@@ -2894,9 +2978,9 @@ class MultiresIO(object):
             step_size=int(step_size),
             allow_degenerate=False,
         )
-        if compute_mask is not None:
+        if mc_mask is not None:
             try:
-                verts, faces, normals, _ = measure.marching_cubes(vol, mask=compute_mask, **mc_kwargs)
+                verts, faces, normals, _ = measure.marching_cubes(vol, mask=mc_mask, **mc_kwargs)
             except TypeError:
                 print("\tThis scikit-image lacks marching_cubes(mask=...); body will not be opened.")
                 verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
@@ -2940,6 +3024,8 @@ class MultiresIO(object):
         derived=None,
         component=None,
         exclude_solids=True,
+        body_handling="cap",
+        fill_value=None,
         bounds=None,
         pitch=None,
         grid_resolution=512,
@@ -2970,8 +3056,18 @@ class MultiresIO(object):
         component : int, optional
             Vector component to contour; None contours the magnitude.
         exclude_solids : bool
-            Drop solid (bc_mask==255) cells from the field and open the surface at
-            the body (requires ``bc_mask`` in field_neon_dict).
+            Drop solid (bc_mask==255) cells from the interpolation source so their
+            data never contributes (requires ``bc_mask`` in field_neon_dict).
+        body_handling : {"cap", "open"}
+            What the surface does at the body. "cap" (default) stamps the ambient
+            free-stream value into the body interior for a closed surface that
+            terminates at the skin; "open" leaves a masked hole there.
+        fill_value : float, optional
+            Ambient constant (in the field's physical units) used when
+            ``body_handling="cap"``. Defaults to an auto-inferred free-stream value
+            for known quantities (Cp=0, CpTotal=1, CpTotalLoss=0, velocity
+            magnitude=U_inf, density/pressure/qdyn from the UnitConvertor). If it
+            cannot be inferred (and none is given), capping falls back to "open".
 
         Remaining parameters control the resample grid / smoothing; see
         :meth:`_scalar_to_isosurface_stl`.
@@ -2979,6 +3075,9 @@ class MultiresIO(object):
         fields_data = self.get_fields_data(field_neon_dict, derived=derived)
         field_name, scalar = self._select_surface_field(fields_data, field_base_name, component=component)
         solid_mask = self._solid_mask_from_fields_data(fields_data) if exclude_solids else None
+
+        if fill_value is None:
+            fill_value = self._infer_ambient_fill(field_base_name, component=component)
 
         return self._scalar_to_isosurface_stl(
             f"{output_filename}_{field_name}",
@@ -2993,6 +3092,8 @@ class MultiresIO(object):
             power=power,
             smooth_iterations=smooth_iterations,
             step_size=step_size,
+            body_handling=body_handling,
+            fill_value=fill_value,
         )
 
     def to_isosurface_stl_time_average(
@@ -3003,6 +3104,8 @@ class MultiresIO(object):
         bc_mask_neon=None,
         component=None,
         exclude_solids=True,
+        body_handling="cap",
+        fill_value=None,
         keep_state=True,
         bounds=None,
         pitch=None,
@@ -3036,6 +3139,9 @@ class MultiresIO(object):
             bc_fields = self.get_fields_data({"bc_mask": bc_mask_neon})
             solid_mask = self._solid_mask_from_fields_data(bc_fields)
 
+        if fill_value is None:
+            fill_value = self._infer_ambient_fill(field_base_name, component=component)
+
         return self._scalar_to_isosurface_stl(
             f"{output_filename}_{field_name}",
             scalar,
@@ -3049,4 +3155,6 @@ class MultiresIO(object):
             power=power,
             smooth_iterations=smooth_iterations,
             step_size=step_size,
+            body_handling=body_handling,
+            fill_value=fill_value,
         )
