@@ -1611,6 +1611,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                     height=height,
                     width_vec=width_vec,
                     height_vec=height_vec,
+                    query_workers=1,  # one core per slice; pool parallelizes across slices
                 )
                 # Coefficient slices (Cp, CpTotal) on the identical pixel grid
                 # (different values + filenames). Data is pre-clipped to [0, 1];
@@ -1632,6 +1633,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                         height=height,
                         width_vec=width_vec,
                         height_vec=height_vec,
+                        query_workers=1,  # one core per slice; pool parallelizes across slices
                     )
                 return (idx, True, None)
             except Exception as e:

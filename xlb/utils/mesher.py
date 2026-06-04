@@ -1700,6 +1700,7 @@ class MultiresIO(object):
         height,
         width_vec,
         height_vec,
+        query_workers=-1,
         **kwargs,
     ):
         """
@@ -1812,9 +1813,12 @@ class MultiresIO(object):
         # Query points
         query_points = np.column_stack((xv.ravel(), yv.ravel()))
 
-        # Find k nearest neighbors for smoother interpolation
+        # Find k nearest neighbors for smoother interpolation.
+        # query_workers controls scipy's internal parallelism: -1 uses all cores
+        # (good for a single slice), 1 keeps the query single-threaded so an outer
+        # thread pool can parallelize across slices without oversubscribing cores.
         k = min(4, len(points))
-        distances, indices = tree.query(query_points, k=k, workers=-1)
+        distances, indices = tree.query(query_points, k=k, workers=query_workers)
 
         if k == 1:
             distances = distances[:, None]
