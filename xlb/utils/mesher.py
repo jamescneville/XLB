@@ -1319,7 +1319,7 @@ class MultiresIO(object):
         "pressure": ("density",),            # static pressure -> Pa via name hook
         "Cp": ("density",),                  # static pressure coefficient (dimensionless)
         "CpTotal": ("density", "velocity"),  # total/stagnation pressure coefficient (dimensionless)
-        "CpTotalLoss": ("density", "velocity"),  # total-pressure-loss coeff (0 freestream, <0 in wake)
+        "CpTotalLoss": ("density", "velocity"),  # total-pressure-loss coeff (0 freestream, >0 in wake)
         "qdyn": ("density", "velocity"),     # dynamic pressure 0.5*rho*|u|^2 [Pa]
     }
 
@@ -1384,7 +1384,8 @@ class MultiresIO(object):
 
             elif name == "CpTotalLoss":
                 # Total-pressure loss referenced to freestream total pressure:
-                # 0 in clean flow, negative in the wake. (= CpTotal - 1)
+                # loss = (freestream total pressure - local total pressure) / q_dyn,
+                # so it is 0 in clean flow and POSITIVE in the wake. (= 1 - CpTotal)
                 u_sq = (
                     fields_data["velocity_0"] ** 2
                     + fields_data["velocity_1"] ** 2
@@ -1392,7 +1393,7 @@ class MultiresIO(object):
                 )
                 p_static = cs2 * (rho - rho_ref)
                 p_total = p_static + 0.5 * rho * u_sq
-                fields_data["CpTotalLoss_0"] = (p_total / q_dyn - 1.0).astype(rho.dtype, copy=False)
+                fields_data["CpTotalLoss_0"] = (1.0 - p_total / q_dyn).astype(rho.dtype, copy=False)
 
             elif name == "qdyn":
                 # Dynamic pressure 0.5*rho*|u|^2 in Pa (no atmospheric offset, so it
@@ -2729,4 +2730,323 @@ class MultiresIO(object):
             smooth_relaxation=smooth_relaxation,
             export_debug_arrays=export_debug_arrays,
         )
-    
+
+    # ------------------------------------------------------------------
+    # Iso-surface STL export (generic over any base or derived scalar)
+    # ------------------------------------------------------------------
+    def _solid_mask_from_fields_data(self, fields_data, bc_mask_key="bc_mask_0"):
+        """Per-cell bool mask (True == solid) from an extracted bc_mask field."""
+        from xlb.cell_type import BC_SOLID
+
+        if bc_mask_key not in fields_data:
+            raise KeyError(
+                f"'{bc_mask_key}' not found; include 'bc_mask' in the field dict "
+                "(or pass bc_mask_neon for the time-averaged variant) to exclude solids."
+            )
+        bc = np.asarray(fields_data[bc_mask_key])
+        return np.rint(bc).astype(np.int32) == int(BC_SOLID)
+
+    def _scalar_to_isosurface_stl(
+        self,
+        output_filename,
+        cell_scalar,
+        iso_value,
+        solid_mask=None,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        smooth_taubin_lambda=0.5,
+        smooth_taubin_nu=0.53,
+        step_size=1,
+    ):
+        """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
+
+        The merged multi-resolution mesh is unstructured, so the scalar is
+        resampled (via the cell-centroid KDTree) onto an axis-aligned uniform
+        grid, then marching cubes extracts the iso-surface.
+
+        For a smooth, ParaView-like surface the default resampling is
+        inverse-distance weighting over the ``k`` nearest fluid cells (a
+        continuous field), and the extracted mesh is Taubin-smoothed. Nearest-
+        neighbour resampling (``interpolation="nearest"``) is faster but blocky.
+
+        Solid handling (when ``solid_mask`` is given):
+        - Solid (bc_mask==255) cells are excluded from the interpolation source,
+          so their invalid data never contributes to the contoured field.
+        - Grid points sitting inside a solid voxel are masked out of marching
+          cubes, leaving the surface OPEN (a hole) where it meets the body.
+          Note: only the shell voxels intersecting the body mesh are solid; any
+          fluid in the interior is still contoured.
+
+        Returns the trimesh.Trimesh, or None if the iso-value is outside the
+        sampled range (no surface).
+        """
+        try:
+            from skimage import measure
+        except ImportError as e:
+            raise ImportError(
+                "Iso-surface export requires scikit-image. Install it with "
+                "`pip install scikit-image`."
+            ) from e
+
+        tic = time.perf_counter()
+
+        cell_scalar = np.asarray(cell_scalar, dtype=np.float32)
+        centroids = self.centroids
+        assert cell_scalar.shape[0] == centroids.shape[0], (
+            "cell_scalar length must match number of cells (centroids)."
+        )
+        if solid_mask is not None:
+            solid_mask = np.asarray(solid_mask, dtype=bool)
+            assert solid_mask.shape[0] == centroids.shape[0], "solid_mask must align with centroids."
+
+        if bounds is None:
+            gmin = self.coordinates.min(axis=0).astype(np.float64)
+            gmax = self.coordinates.max(axis=0).astype(np.float64)
+        else:
+            gmin = np.asarray(bounds[0], dtype=np.float64)
+            gmax = np.asarray(bounds[1], dtype=np.float64)
+        span = gmax - gmin
+        if np.any(span <= 0):
+            raise ValueError(f"Invalid iso-surface bounds: min={gmin}, max={gmax}")
+
+        if pitch is None:
+            pitch = float(span.max()) / float(max(1, int(grid_resolution)))
+        pitch = float(pitch)
+
+        dims = np.floor(span / pitch).astype(int) + 1
+        dims = np.maximum(dims, 2)
+        nx, ny, nz = (int(d) for d in dims)
+        total = nx * ny * nz
+        print(
+            f"\tIso-surface resample grid {nx}x{ny}x{nz} = {total:,} points "
+            f"(pitch={pitch:.6g}, ~{total * 4 / 1e6:.0f} MB)"
+        )
+
+        xs = gmin[0] + np.arange(nx) * pitch
+        ys = gmin[1] + np.arange(ny) * pitch
+        zs = gmin[2] + np.arange(nz) * pitch
+
+        # Interpolation source = fluid cells only, so solid (bc_mask==255) data
+        # (invalid) never contributes. A separate all-cells nearest lookup flags
+        # grid points sitting inside a solid voxel, which are masked out of
+        # marching cubes (open hole at the body).
+        has_solid = solid_mask is not None and bool(solid_mask.any())
+        if has_solid:
+            fluid = ~solid_mask
+            fluid_scalar = cell_scalar[fluid]
+            fluid_tree = cKDTree(centroids[fluid])
+            solid_tree = self.kd_tree  # all cells, for inside-body detection
+        else:
+            fluid_scalar = cell_scalar
+            fluid_tree = self.kd_tree
+            solid_tree = None
+
+        use_idw = str(interpolation).lower() == "idw" and fluid_scalar.shape[0] > 1
+        kk = max(1, min(int(k), fluid_scalar.shape[0])) if use_idw else 1
+
+        # Sample plane-by-plane along x to keep transient memory low.
+        vol = np.empty((nx, ny, nz), dtype=np.float32)
+        compute_mask = np.ones((nx, ny, nz), dtype=bool) if solid_tree is not None else None
+        Y, Z = np.meshgrid(ys, zs, indexing="ij")
+        Yf = Y.ravel()
+        Zf = Z.ravel()
+        plane_pts = np.empty((Yf.size, 3), dtype=np.float64)
+        plane_pts[:, 1] = Yf
+        plane_pts[:, 2] = Zf
+        for ix in range(nx):
+            plane_pts[:, 0] = xs[ix]
+            if use_idw:
+                dist, idx = fluid_tree.query(plane_pts, k=kk, workers=-1)
+                if kk == 1:
+                    dist = dist[:, None]
+                    idx = idx[:, None]
+                w = 1.0 / np.maximum(dist, 1e-12) ** float(power)
+                v = np.sum(w * fluid_scalar[idx], axis=1) / np.sum(w, axis=1)
+            else:
+                _, idx1 = fluid_tree.query(plane_pts, k=1, workers=-1)
+                v = fluid_scalar[idx1]
+            vol[ix] = v.reshape(ny, nz).astype(np.float32)
+            if solid_tree is not None:
+                _, idx_all = solid_tree.query(plane_pts, k=1, workers=-1)
+                # mask OUT (False) grid points whose nearest cell is solid
+                compute_mask[ix] = (~solid_mask[idx_all]).reshape(ny, nz)
+
+        np.nan_to_num(vol, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        sample = vol[compute_mask] if compute_mask is not None else vol
+        vmin = float(sample.min())
+        vmax = float(sample.max())
+        if not (vmin < float(iso_value) < vmax):
+            print(
+                f"\tIso-value {iso_value} is outside the sampled range "
+                f"[{vmin:.4g}, {vmax:.4g}] - no surface extracted."
+            )
+            return None
+
+        mc_kwargs = dict(
+            level=float(iso_value),
+            spacing=(pitch, pitch, pitch),
+            step_size=int(step_size),
+            allow_degenerate=False,
+        )
+        if compute_mask is not None:
+            try:
+                verts, faces, normals, _ = measure.marching_cubes(vol, mask=compute_mask, **mc_kwargs)
+            except TypeError:
+                print("\tThis scikit-image lacks marching_cubes(mask=...); body will not be opened.")
+                verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
+        else:
+            verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
+
+        # marching_cubes returns vertices in index*spacing coordinates; shift to physical.
+        verts = verts + gmin.astype(verts.dtype)
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        # Taubin smoothing: removes residual marching-cubes faceting without the
+        # volumetric shrinkage of plain Laplacian smoothing.
+        if smooth_iterations and int(smooth_iterations) > 0:
+            try:
+                from trimesh import smoothing as _smoothing
+
+                _smoothing.filter_taubin(
+                    mesh,
+                    lamb=float(smooth_taubin_lambda),
+                    nu=float(smooth_taubin_nu),
+                    iterations=int(smooth_iterations),
+                )
+            except Exception as _e:
+                print(f"\tTaubin smoothing skipped: {_e}")
+
+        out = output_filename if output_filename.lower().endswith(".stl") else output_filename + ".stl"
+        mesh.export(out)
+        print(
+            f"\tIso-surface ({len(mesh.vertices):,} verts, {len(mesh.faces):,} tris) written to {out} "
+            f"in {time.perf_counter() - tic:.1f} s"
+        )
+        return mesh
+
+    def to_isosurface_stl(
+        self,
+        output_filename,
+        field_neon_dict,
+        field_base_name,
+        iso_value,
+        derived=None,
+        component=None,
+        exclude_solids=True,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        step_size=1,
+    ):
+        """Export an iso-surface of any base or derived scalar as an STL file.
+
+        Parameters
+        ----------
+        field_neon_dict : dict
+            NEON fields to extract, e.g. ``{"velocity": sim.u, "density": sim.rho,
+            "bc_mask": sim.bc_mask}``. Include whatever base fields the chosen
+            quantity needs, plus ``bc_mask`` when ``exclude_solids`` is True.
+        field_base_name : str
+            Quantity to contour: a base field ("velocity", "density") or a derived
+            one ("Cp", "CpTotal", "CpTotalLoss", "pressure", "qdyn"). Vectors are
+            reduced to magnitude unless ``component`` is given.
+        iso_value : float
+            Iso level, in the field's physical units (m/s for velocity,
+            dimensionless for Cp/CpTotal, Pa for pressure, ...).
+        derived : list[str], optional
+            Derived fields to synthesize (passed to get_fields_data). Required when
+            ``field_base_name`` is a derived quantity, e.g. ``derived=["CpTotal"]``.
+        component : int, optional
+            Vector component to contour; None contours the magnitude.
+        exclude_solids : bool
+            Drop solid (bc_mask==255) cells from the field and open the surface at
+            the body (requires ``bc_mask`` in field_neon_dict).
+
+        Remaining parameters control the resample grid / smoothing; see
+        :meth:`_scalar_to_isosurface_stl`.
+        """
+        fields_data = self.get_fields_data(field_neon_dict, derived=derived)
+        field_name, scalar = self._select_surface_field(fields_data, field_base_name, component=component)
+        solid_mask = self._solid_mask_from_fields_data(fields_data) if exclude_solids else None
+
+        return self._scalar_to_isosurface_stl(
+            f"{output_filename}_{field_name}",
+            scalar,
+            iso_value,
+            solid_mask=solid_mask,
+            bounds=bounds,
+            pitch=pitch,
+            grid_resolution=grid_resolution,
+            interpolation=interpolation,
+            k=k,
+            power=power,
+            smooth_iterations=smooth_iterations,
+            step_size=step_size,
+        )
+
+    def to_isosurface_stl_time_average(
+        self,
+        output_filename,
+        field_base_name,
+        iso_value,
+        bc_mask_neon=None,
+        component=None,
+        exclude_solids=True,
+        keep_state=True,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        step_size=1,
+    ):
+        """Export a time-averaged iso-surface of any accumulated base/derived scalar.
+
+        Uses the accumulated time-average (see :meth:`finalize_time_average`). The
+        field must have been accumulated (base fields, plus any derived names passed
+        to ``accumulate_time_average(..., derived=[...])``). ``bc_mask`` is not part
+        of the accumulator, so pass the static ``bc_mask`` NEON field via
+        ``bc_mask_neon`` (e.g. ``sim.bc_mask``) to exclude solids.
+
+        See :meth:`to_isosurface_stl` for the field/grid/smoothing parameters.
+        """
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+        field_name, scalar = self._select_surface_field(avg_fields, field_base_name, component=component)
+
+        solid_mask = None
+        if exclude_solids:
+            if bc_mask_neon is None:
+                raise ValueError(
+                    "exclude_solids=True requires bc_mask_neon (e.g. sim.bc_mask); "
+                    "bc_mask is not part of the time-average accumulator."
+                )
+            bc_fields = self.get_fields_data({"bc_mask": bc_mask_neon})
+            solid_mask = self._solid_mask_from_fields_data(bc_fields)
+
+        return self._scalar_to_isosurface_stl(
+            f"{output_filename}_{field_name}",
+            scalar,
+            iso_value,
+            solid_mask=solid_mask,
+            bounds=bounds,
+            pitch=pitch,
+            grid_resolution=grid_resolution,
+            interpolation=interpolation,
+            k=k,
+            power=power,
+            smooth_iterations=smooth_iterations,
+            step_size=step_size,
+        )

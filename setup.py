@@ -101,7 +101,8 @@ setup(
         "cuda": ["jax[cuda13]>=0.8.2"],  # For CUDA installations (pip install -U "jax[cuda13]")
         "tpu": ["jax[tpu]>=0.8.2"],  # For TPU installations
         # h5py: MultiresIO / Neon multi-resolution export to HDF5 (see xlb.utils.mesher).
-        "neon": [_neon_wheel_requirement(), "h5py>=3.10.0"],
+        # scikit-image: marching-cubes iso-surface STL export (MultiresIO.to_isosurface_stl).
+        "neon": [_neon_wheel_requirement(), "h5py>=3.10.0", "scikit-image>=0.22.0"],
         "test": ["pytest>=8.0.0"],
     },
     python_requires=">=3.11",

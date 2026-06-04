@@ -1372,6 +1372,14 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
          settings.get("cpTotalColorMap", "bwr"),
          float(settings.get("cpTotalMin", -1.0)),
          float(settings.get("cpTotalMax", 1.0))),
+        # Total-pressure-loss coefficient: 0 in clean flow, positive in the wake
+        # (= 1 - CpTotal). The loss range is one-sided, so the default window is
+        # [0, 1] (clean -> full dynamic head lost) rather than a symmetric span,
+        # which keeps the whole colormap on the part of the field that varies.
+        ("CpTotalLoss",
+         settings.get("cpTotalLossColorMap", "bwr"),
+         float(settings.get("cpTotalLossMin", 0.0)),
+         float(settings.get("cpTotalLossMax", 1.0))),
     )
 
     partSize = np.array(partSize, dtype=float)
@@ -1909,7 +1917,7 @@ def solve(
                     h5exporter.accumulate_time_average(
                         {"velocity": sim.u, "density": sim.rho},
                         weight=1.0,
-                        derived=["pressure", "Cp", "CpTotal"],
+                        derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"],
                     )
                 wp.synchronize()
                 total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
@@ -1942,7 +1950,7 @@ def solve(
                     {"velocity": sim.u, "density": sim.rho, "bc_mask": sim.bc_mask},
                     compression="gzip",
                     compression_opts=0,
-                    derived=["pressure", "Cp", "CpTotal"],
+                    derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"],
                 )
                 wp.synchronize()
             if time_out:
@@ -2037,7 +2045,7 @@ def solve(
         # Surface pressure-coefficient maps on the body (Cp, CpTotal) from the
         # time-averaged derived fields accumulated during the run. field_base_name
         # selects the stored derived key ("Cp" -> Cp_0, "CpTotal" -> CpTotal_0).
-        for surf_field in ("Cp", "CpTotal"):
+        for surf_field in ("Cp", "CpTotal", "CpTotalLoss"):
             filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surf_field}")
             h5exporter.to_surface_vtk_time_average(
                 output_filename=filename,
@@ -2056,23 +2064,48 @@ def solve(
                 smooth_relaxation=0.20,
             )
 
-        # Total-pressure-coefficient (CpT) iso-surface as STL (replaces the ParaView pipeline).
-        # Limited to the same vehicle region swept for the result slices.
+        # Iso-surface STLs (open at the body), on the same vehicle region as the slices.
+        #   - velocity:     iso at half the inlet speed (m/s).
+        #   - CpTotal:      free-stream ~1, wake < 1; iso 0 isolates strong total-pressure-loss cores.
+        #   - CpTotalLoss:  free-stream 0, wake < 0; small negative iso shows the coherent wake envelope.
+        # All are derived fields already accumulated in the time-average (derived=[...] above).
         try:
-            cpt_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
-            h5exporter.to_cpt_isosurface_stl_time_average(
-                output_filename=os.path.join(output_dir, f"{jsonfile['outputName']}_CpT_iso"),
+            iso_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
+            iso_prefix = os.path.join(output_dir, f"{jsonfile['outputName']}_iso")
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="velocity",
+                iso_value=0.5 * prescribed_velocity_phys,
+                bc_mask_neon=sim.bc_mask,
+                keep_state=True,
+                bounds=iso_region,
+                grid_resolution=1024,
+            )
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="CpTotal",
                 iso_value=0.0,
                 bc_mask_neon=sim.bc_mask,
-                u_inf=prescribed_velocity_phys,
-                rho_air=jsonfile['fluid']['density'],
-                p_inf=101325.0,
                 keep_state=True,
-                bounds=cpt_region,
+                bounds=iso_region,
+                grid_resolution=1024,
+            )
+            # CpTotalLoss wake surface: 0 == clean flow, so an iso AT 0 would wrap
+            # every faintly-lossy cell (a noisy blob), while 1 is the strongest
+            # cores (identical to the CpTotal=0 surface above). 0.5 picks out the
+            # coherent mid-wake -- half a dynamic head of total-pressure loss --
+            # a genuinely different surface from the core view.
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="CpTotalLoss",
+                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 0.5)),
+                bc_mask_neon=sim.bc_mask,
+                keep_state=True,
+                bounds=iso_region,
                 grid_resolution=1024,
             )
         except Exception as e:
-            print(f"CpT iso-surface export failed: {e}")
+            print(f"Iso-surface export failed: {e}")
 
         with open(os.path.join(output_dir, "source.json"), 'w') as file:
             json.dump(jsonfile, file, indent=4) # indent for pretty-printing
@@ -2102,7 +2135,7 @@ def solve(
                     h5exporter.accumulate_time_average(
                         {"velocity": sim.u, "density": sim.rho},
                         weight=1.0,
-                        derived=["pressure", "Cp", "CpTotal"],
+                        derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"],
                     )
                     wp.synchronize()
                     scm_results_available() 
@@ -2160,23 +2193,48 @@ def solve(
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)
 
-        # Total-pressure-coefficient (CpT) iso-surface as STL (replaces the ParaView pipeline).
-        # Limited to the same vehicle region swept for the result slices.
+        # Iso-surface STLs (open at the body), on the same vehicle region as the slices.
+        #   - velocity:     iso at half the inlet speed (m/s).
+        #   - CpTotal:      free-stream ~1, wake < 1; iso 0 isolates strong total-pressure-loss cores.
+        #   - CpTotalLoss:  free-stream 0, wake < 0; small negative iso shows the coherent wake envelope.
+        # All are derived fields already accumulated in the time-average (derived=[...] above).
         try:
-            cpt_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
-            h5exporter.to_cpt_isosurface_stl_time_average(
-                output_filename=os.path.join(output_dir, f"{jsonfile['outputName']}_CpT_iso"),
+            iso_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
+            iso_prefix = os.path.join(output_dir, f"{jsonfile['outputName']}_iso")
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="velocity",
+                iso_value=0.5 * prescribed_velocity_phys,
+                bc_mask_neon=sim.bc_mask,
+                keep_state=True,
+                bounds=iso_region,
+                grid_resolution=1024,
+            )
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="CpTotal",
                 iso_value=0.0,
                 bc_mask_neon=sim.bc_mask,
-                u_inf=prescribed_velocity_phys,
-                rho_air=jsonfile['fluid']['density'],
-                p_inf=101325.0,
                 keep_state=True,
-                bounds=cpt_region,
+                bounds=iso_region,
+                grid_resolution=1024,
+            )
+            # CpTotalLoss wake surface: 0 == clean flow, so an iso AT 0 would wrap
+            # every faintly-lossy cell (a noisy blob), while 1 is the strongest
+            # cores (identical to the CpTotal=0 surface above). 0.5 picks out the
+            # coherent mid-wake -- half a dynamic head of total-pressure loss --
+            # a genuinely different surface from the core view.
+            h5exporter.to_isosurface_stl_time_average(
+                output_filename=iso_prefix,
+                field_base_name="CpTotalLoss",
+                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 0.5)),
+                bc_mask_neon=sim.bc_mask,
+                keep_state=True,
+                bounds=iso_region,
                 grid_resolution=1024,
             )
         except Exception as e:
-            print(f"CpT iso-surface export failed: {e}")
+            print(f"Iso-surface export failed: {e}")
 
         with open(os.path.join(output_dir, "Results.json"), 'w') as file:
             json.dump({"outputSlices": jsonfile['outputSlices']}, file, indent=4) # indent for pretty-printing
