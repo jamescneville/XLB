@@ -8,6 +8,7 @@ from xlb.operator.boundary_masker.aabb_close import MeshMaskerAABBClose
 from xlb.operator.boundary_masker.mesh_voxelization_method import MeshVoxelizationMethod
 from xlb.operator.boundary_masker.multires_aabb import MultiresMeshMaskerAABB
 from xlb.operator.boundary_masker.multires_aabb_close import MultiresMeshMaskerAABBClose
+from xlb.operator.boundary_masker.multires_aabb_close_solid import MultiresMeshMaskerAABBCloseSolid
 from xlb.operator.boundary_masker.multires_indices_boundary_masker import MultiresIndicesBoundaryMasker
 from xlb.operator.boundary_masker.multires_ray import MultiresMeshMaskerRay
 from xlb.operator.boundary_masker.trapped import MeshMaskerTrapped
