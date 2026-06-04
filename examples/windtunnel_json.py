@@ -1358,12 +1358,21 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     cmap = settings["sliceColorMap"]
     normalize = jsonfile["InletBC"]["x"] * settings["sliceFactor"]
 
-    # Pressure-analog slices: physical density normalized about its reference value.
-    # Rendered on the same slice geometry as velocity; independent of the CpT/iso feature.
-    pressure_ref = float(settings.get("pressureRef", 1.2047))     # density reference (analog for pressure)
-    pressure_band = float(settings.get("pressureBand", 0.01))     # +/- fraction shown about the reference (0.98x..1.02x)
-    pressure_cmap = settings.get("pressureColorMap", "bwr")
-    pressure_field_name = settings.get("pressureFieldName", "pressure")
+    # Coefficient slices (Cp, CpTotal): proper derived fields synthesized from the
+    # time-averaged density/velocity (accumulated with derived=[...] in solve()).
+    # Each is linearly mapped from [lo, hi] onto the colormap's [0, 1] range and
+    # rendered on the same slice geometry as velocity. This replaces the previous
+    # manual density "pressure-analog" hack.
+    coeff_slice_specs = (
+        ("Cp",
+         settings.get("cpColorMap", "bwr"),
+         float(settings.get("cpMin", -1.0)),
+         float(settings.get("cpMax", 1.0))),
+        ("CpTotal",
+         settings.get("cpTotalColorMap", "bwr"),
+         float(settings.get("cpTotalMin", -1.0)),
+         float(settings.get("cpTotalMax", 1.0))),
+    )
 
     partSize = np.array(partSize, dtype=float)
     L, W, H = map(float, partSize)
@@ -1564,18 +1573,20 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
         if normalize != 1.0:
             cell_data = np.clip(cell_data / normalize, 0, 1)
 
-        # Pressure-analog field: physical density mapped so [(1-band)*ref, (1+band)*ref]
-        # spans the colormap's [0, 1]. Uses the same averaged data as the velocity slices.
-        pressure_cell_data = None
-        density_keys = sorted(
-            [k for k in avg_fields.keys() if k.startswith("density_")],
-            key=lambda k: int(k.split("_")[-1]),
-        )
-        if density_keys:
-            density_data = avg_fields[density_keys[0]].astype(np.float64)
-            p_lo = (1.0 - pressure_band) * pressure_ref
-            p_hi = (1.0 + pressure_band) * pressure_ref
-            pressure_cell_data = np.clip((density_data - p_lo) / (p_hi - p_lo), 0.0, 1.0).astype(np.float32)
+        # Coefficient fields (Cp, CpTotal): proper derived fields from the averaged
+        # density/velocity, linearly mapped from [lo, hi] onto the colormap's [0, 1].
+        # Rendered on the same averaged data / slice geometry as the velocity slices.
+        coeff_slices = []  # list of (field_name, cell_data, cmap)
+        for base_name, coeff_cmap, lo, hi in coeff_slice_specs:
+            keys = sorted(
+                [k for k in avg_fields.keys() if k.startswith(base_name + "_")],
+                key=lambda k: int(k.split("_")[-1]),
+            )
+            if not keys:
+                continue
+            coeff_data = avg_fields[keys[0]].astype(np.float64)
+            coeff_data = np.clip((coeff_data - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+            coeff_slices.append((base_name, coeff_data, coeff_cmap))
 
         max_workers = os.cpu_count() or 1
 
@@ -1601,20 +1612,22 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                     width_vec=width_vec,
                     height_vec=height_vec,
                 )
-                # Pressure-analog slice on the identical pixel grid (different value + filename).
-                if pressure_cell_data is not None:
+                # Coefficient slices (Cp, CpTotal) on the identical pixel grid
+                # (different values + filenames). Data is pre-clipped to [0, 1];
+                # normalize != 1.0 locks the PNG color range to vmin=0, vmax=1.
+                for coeff_name, coeff_data, coeff_cmap in coeff_slices:
                     h5exporter._to_slice_image_single_field(
-                        f"{output_filename}_{pressure_field_name}",
-                        pressure_cell_data,
+                        f"{output_filename}_{coeff_name}",
+                        coeff_data,
                         plane_point,
                         plane_normal,
                         slice_thickness=voxel_size,
                         bounds=[0, 1, 0, 1],
                         grid_res=grid_res,
-                        cmap=pressure_cmap,
+                        cmap=coeff_cmap,
                         show_axes=False,
                         show_colorbar=False,
-                        normalize=pressure_ref,   # any value != 1.0 -> fixed [0,1] color range
+                        normalize=2.0,   # any value != 1.0 -> fixed [0,1] color range
                         width=width,
                         height=height,
                         width_vec=width_vec,
@@ -1891,7 +1904,13 @@ def solve(
                     normalize=jsonfile['InletBC']['x'] * jsonfile['settings']['sliceFactor'],
                 )
                 if step >= crossover_step:
-                    h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0)
+                    # Derived fields (pressure/Cp/CpTotal) are synthesized per-step
+                    # before averaging so nonlinear coefficients average correctly.
+                    h5exporter.accumulate_time_average(
+                        {"velocity": sim.u, "density": sim.rho},
+                        weight=1.0,
+                        derived=["pressure", "Cp", "CpTotal"],
+                    )
                 wp.synchronize()
                 total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
                 MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
@@ -1916,7 +1935,15 @@ def solve(
             if step % file_output_interval == 0 or step == num_steps - 1 or time_out:
                 sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
                 filename = os.path.join(output_dir, f"{jsonfile['outputName']}_{step:04d}")
-                h5exporter.to_hdf5(filename, {"velocity": sim.u, "density": sim.rho, "bc_mask": sim.bc_mask}, compression="gzip", compression_opts=0)
+                # Derived fields (pressure [Pa], Cp, CpTotal) are synthesized from the
+                # base velocity/density -- no extra NEON fields needed.
+                h5exporter.to_hdf5(
+                    filename,
+                    {"velocity": sim.u, "density": sim.rho, "bc_mask": sim.bc_mask},
+                    compression="gzip",
+                    compression_opts=0,
+                    derived=["pressure", "Cp", "CpTotal"],
+                )
                 wp.synchronize()
             if time_out:
                 break
@@ -2007,6 +2034,28 @@ def solve(
             smooth_relaxation=0.20,
         )
 
+        # Surface pressure-coefficient maps on the body (Cp, CpTotal) from the
+        # time-averaged derived fields accumulated during the run. field_base_name
+        # selects the stored derived key ("Cp" -> Cp_0, "CpTotal" -> CpTotal_0).
+        for surf_field in ("Cp", "CpTotal"):
+            filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surf_field}")
+            h5exporter.to_surface_vtk_time_average(
+                output_filename=filename,
+                surface_mesh_filename=surface_mesh_for_vtk,
+                field_base_name=surf_field,
+                component=None,
+                keep_state=True,
+                sample_dx=voxel_size,
+                shell_factors=(2.20,),
+                k=8,
+                power=2.0,
+                max_distance=1.0 * voxel_size,
+                half_space_tolerance=0.15,
+                aggregate="median",
+                smooth_iterations=2,
+                smooth_relaxation=0.20,
+            )
+
         # Total-pressure-coefficient (CpT) iso-surface as STL (replaces the ParaView pipeline).
         # Limited to the same vehicle region swept for the result slices.
         try:
@@ -2047,8 +2096,14 @@ def solve(
             if (step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)) or time_out:
                     print(f"Step {step} completed out of {num_steps}")
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                    
-                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)              
-                    h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0)
+                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
+                    # Derived fields (pressure/Cp/CpTotal) are synthesized per-step
+                    # before averaging so nonlinear coefficients average correctly.
+                    h5exporter.accumulate_time_average(
+                        {"velocity": sim.u, "density": sim.rho},
+                        weight=1.0,
+                        derived=["pressure", "Cp", "CpTotal"],
+                    )
                     wp.synchronize()
                     scm_results_available() 
 
