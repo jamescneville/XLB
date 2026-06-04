@@ -454,7 +454,7 @@ class UnitConvertor(object):
         velocity_physical_unit: float,
         voxel_size_physical_unit: float,
         density_physical_unit: float = 1.2041,
-        pressure_physical_unit: float = 1.101325e5,
+        pressure_physical_unit: float = 1.01325e5,
     ):
         """
         Initialize the UnitConvertor object.
@@ -470,7 +470,7 @@ class UnitConvertor(object):
         density_physical_unit : float, optional
             The reference density in physical units (e.g., kg/m^3). Default is 1.2041 (density of air at room temperature).
         pressure_physical_unit : float, optional
-            The reference pressure in physical units (e.g., Pascals). Default is 1.101325e5 (atmospheric pressure at sea level).
+            The reference pressure in physical units (e.g., Pascals). Default is 1.01325e5 (atmospheric pressure at sea level).
         """
 
         self.voxel_size = voxel_size_physical_unit
