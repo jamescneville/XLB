@@ -2786,6 +2786,37 @@ class MultiresIO(object):
 
         return None
 
+    @staticmethod
+    def _exterior_connected_fluid_mask(fluid_mask):
+        """Fluid grid points connected to the resample-grid boundary.
+
+        Takes the boolean fluid mask on the uniform iso grid (True where the
+        nearest cell is fluid) and floods inward from the six domain faces using
+        6-connectivity (face neighbours only). The result is True only for fluid
+        reachable from the exterior; fluid pockets sealed off by the body skin -
+        e.g. trapped cavities in a messy STL - come back False.
+
+        Those sealed pockets are what produce the spurious closed iso "balloons"
+        inside enclosed regions, so the caller treats them like the body interior
+        instead of contouring them. 6-connectivity is the conservative choice: a
+        single-voxel-thick body shell stays watertight against the flood (a
+        26-connected flood would leak through diagonal pinholes in the shell).
+        """
+        from scipy import ndimage
+
+        fluid_mask = np.asarray(fluid_mask, dtype=bool)
+        seed = np.zeros_like(fluid_mask)
+        # Seed every fluid grid point touching a face of the resample box.
+        seed[0, :, :] |= fluid_mask[0, :, :]
+        seed[-1, :, :] |= fluid_mask[-1, :, :]
+        seed[:, 0, :] |= fluid_mask[:, 0, :]
+        seed[:, -1, :] |= fluid_mask[:, -1, :]
+        seed[:, :, 0] |= fluid_mask[:, :, 0]
+        seed[:, :, -1] |= fluid_mask[:, :, -1]
+
+        structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
+        return ndimage.binary_propagation(seed, mask=fluid_mask, structure=structure)
+
     def _scalar_to_isosurface_stl(
         self,
         output_filename,
@@ -2804,6 +2835,7 @@ class MultiresIO(object):
         step_size=1,
         body_handling="cap",
         fill_value=None,
+        remove_trapped_fluid=True,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
 
@@ -2833,6 +2865,13 @@ class MultiresIO(object):
               OPEN (a hole) where it meets the body.
           Note: only the shell voxels intersecting the body mesh are solid; any
           fluid in the interior is still contoured.
+        - ``remove_trapped_fluid`` (default True): flood-fill the fluid mask from
+          the domain boundary and treat fluid NOT connected to the exterior the
+          same as the body interior (capped under "cap", masked out under
+          "open"). This removes the spurious closed iso "balloons" that otherwise
+          form inside sealed cavities of messy STLs. Resolution-limited: a leak
+          narrower than ``pitch`` reads as sealed, so the dropped-point count is
+          logged. Requires a ``solid_mask``; a no-op when none is given.
 
         Returns the trimesh.Trimesh, or None if the iso-value is outside the
         sampled range (no surface).
@@ -2944,19 +2983,45 @@ class MultiresIO(object):
             )
             mode = "open"
 
+        # Flood-fill: drop fluid grid points sealed off from the exterior flow so
+        # trapped cavities are treated like the body interior, not contoured into
+        # closed iso "balloons". ``keep_mask`` is the exterior-connected fluid;
+        # ``~keep_mask`` is body interior + trapped fluid.
+        keep_mask = compute_mask
+        if compute_mask is not None and remove_trapped_fluid:
+            exterior = self._exterior_connected_fluid_mask(compute_mask)
+            n_fluid = int(compute_mask.sum())
+            n_trapped = int(np.count_nonzero(compute_mask & ~exterior))
+            if not exterior.any() and n_fluid:
+                # Nothing reached the box faces (e.g. bounds cropped inside the
+                # body) - removing everything would be wrong, so skip.
+                print(
+                    "\tFlood-fill: no fluid reached the domain boundary; "
+                    "trapped-fluid removal skipped (check iso bounds)."
+                )
+            else:
+                keep_mask = exterior
+                pct = 100.0 * n_trapped / max(1, n_fluid)
+                print(
+                    f"\tFlood-fill: dropped {n_trapped:,} trapped-fluid grid points "
+                    f"({pct:.2f}% of fluid) not connected to the domain boundary"
+                )
+
         if compute_mask is not None and mode == "cap":
-            # Stamp the ambient/free-stream constant into the body interior so the
-            # surface caps cleanly at the skin. The fill is a clean constant, NOT
-            # read from solid voxels; it now legitimately participates in the field.
+            # Stamp the ambient/free-stream constant into the body interior (and
+            # trapped fluid) so the surface caps cleanly at the skin and sealed
+            # pockets vanish. The fill is a clean constant, NOT read from solid
+            # voxels; it now legitimately participates in the field.
             fv = np.float32(fill_value)
-            vol[~compute_mask] = fv
+            vol[~keep_mask] = fv
             mc_mask = None
             sample = vol
             print(f"\tBody handling: cap (fill_value={float(fill_value):.6g})")
         elif compute_mask is not None and mode == "open":
-            # Mask the body interior out of marching cubes -> open surface (hole).
-            mc_mask = compute_mask
-            sample = vol[compute_mask]
+            # Mask the body interior (and trapped fluid) out of marching cubes ->
+            # open surface (hole).
+            mc_mask = keep_mask
+            sample = vol[keep_mask]
             print("\tBody handling: open (masked hole at the body)")
         else:
             # No solids present (nothing to cap or open).
@@ -3026,6 +3091,7 @@ class MultiresIO(object):
         exclude_solids=True,
         body_handling="cap",
         fill_value=None,
+        remove_trapped_fluid=True,
         bounds=None,
         pitch=None,
         grid_resolution=512,
@@ -3094,6 +3160,7 @@ class MultiresIO(object):
             step_size=step_size,
             body_handling=body_handling,
             fill_value=fill_value,
+            remove_trapped_fluid=remove_trapped_fluid,
         )
 
     def to_isosurface_stl_time_average(
@@ -3106,6 +3173,7 @@ class MultiresIO(object):
         exclude_solids=True,
         body_handling="cap",
         fill_value=None,
+        remove_trapped_fluid=True,
         keep_state=True,
         bounds=None,
         pitch=None,
@@ -3157,4 +3225,5 @@ class MultiresIO(object):
             step_size=step_size,
             body_handling=body_handling,
             fill_value=fill_value,
+            remove_trapped_fluid=remove_trapped_fluid,
         )
