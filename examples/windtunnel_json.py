@@ -658,22 +658,25 @@ def prep_inputs(input_file):
             voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile
         )
   
-    # Define a unit convertor
-    unit_convertor = UnitConvertor(
-    velocity_lbm_unit=ulb,
-    velocity_physical_unit=prescribed_velocity_phys,
-    voxel_size_physical_unit=voxel_size,
-    )
-
-    # Characteristic length
-    L = float(partSize[0])    
     #Material Setup
     material = jsonfile['fluid']
     density = material['density']
     dynamic_viscosity = material['viscosity']
     kinematic_viscosity = dynamic_viscosity / density
 
-    # Compute Re   
+
+    # Define a unit convertor
+    unit_convertor = UnitConvertor(
+    velocity_lbm_unit=ulb,
+    velocity_physical_unit=prescribed_velocity_phys,
+    voxel_size_physical_unit=voxel_size,
+    density_physical_unit=density,
+    )
+
+    # Characteristic length
+    L = float(partSize[0])
+
+    # Compute Re
     Re = abs(prescribed_velocity_phys) * L / kinematic_viscosity
 
     # Calculate lattice parameters
@@ -770,36 +773,36 @@ def prep_inputs(input_file):
             )
             wheel_momentum.append(mt)
     
-    if settings['debug'] == True: 
-        # bcMask = os.path.join(output_dir, f"{jsonfile['outputName']}_initial_bc_mask") 
+    #if settings['debug'] == True:
+        # bcMask = os.path.join(output_dir, f"{jsonfile['outputName']}_initial_bc_mask")
         # bc_mask_exporter.to_hdf5(bcMask, {"bc_mask": sim.bc_mask}, compression="gzip", compression_opts=0)
- 
-        # Print simulation info
-        print("\n" + "=" * 50 + "\n")
-        print(f"Simulation Configuration for Re = {Re}:")
-        print(f"Number of flow passes: {jsonfile['settings']['flowPasses']}")
-        print(f"Calculated iterations: {num_steps:,}")
-        print(f"Finest voxel size: {voxel_size} meters")
-        print(f"Coarsest voxel size: {delta_x_coarse} meters")
-        print(f"Total voxels: {sum(np.count_nonzero(mask) for mask in sparsity_pattern):,}")
-        print(f"Total active voxels: {total_voxels:,}")
-        print(f"Active voxels per level: {active_voxels}")
-        print(f"Solid voxels per level: {solid_voxels}")
-        print(f"Total lattice updates per global step: {total_lattice_updates_per_step:,}")
-        print(f"Actual number of refinement levels: {actual_num_levels}")
-        print(f"Physical inlet velocity: {prescribed_velocity_phys:.4f} m/s")
-        print(f"Lattice velocity (ulb): {ulb}")
-        print(f"Characteristic length: {L: .4f} meters")
-        print(f"Computed reference area (bc_mask): {reference_area} lattice units")
-        print(f"Physical reference area (bc_mask): {reference_area_physical:.6f} m^2")
-        print(f"Reynolds number: {Re:,.2f}")
-        print(f"Relaxation parameter (omega): {omega:.5f}")
-        time_remaining =(total_lattice_updates_per_step * num_steps) / (100 * 1e6)
-        hours, rem = divmod(time_remaining, 3600)
-        minutes, seconds = divmod(rem, 60)
-        time_remaining_str = f"{int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s"
-        print(f"Approx Runtime (assuming 100mlups): {time_remaining_str} \n")
-        print("\n" + "=" * 50 + "\n")
+
+    # Print simulation info
+    print("\n" + "=" * 50 + "\n")
+    print(f"Simulation Configuration for Re = {Re}:")
+    print(f"Number of flow passes: {jsonfile['settings']['flowPasses']}")
+    print(f"Calculated iterations: {num_steps:,}")
+    print(f"Finest voxel size: {voxel_size} meters")
+    print(f"Coarsest voxel size: {delta_x_coarse} meters")
+    print(f"Total voxels: {sum(np.count_nonzero(mask) for mask in sparsity_pattern):,}")
+    print(f"Total active voxels: {total_voxels:,}")
+    print(f"Active voxels per level: {active_voxels}")
+    print(f"Solid voxels per level: {solid_voxels}")
+    print(f"Total lattice updates per global step: {total_lattice_updates_per_step:,}")
+    print(f"Actual number of refinement levels: {actual_num_levels}")
+    print(f"Physical inlet velocity: {prescribed_velocity_phys:.4f} m/s")
+    print(f"Lattice velocity (ulb): {ulb}")
+    print(f"Characteristic length: {L: .4f} meters")
+    print(f"Computed reference area (bc_mask): {reference_area} lattice units")
+    print(f"Physical reference area (bc_mask): {reference_area_physical:.6f} m^2")
+    print(f"Reynolds number: {Re:,.2f}")
+    print(f"Relaxation parameter (omega): {omega:.5f}")
+    time_remaining =(total_lattice_updates_per_step * num_steps) / (100 * 1e6)
+    hours, rem = divmod(time_remaining, 3600)
+    minutes, seconds = divmod(rem, 60)
+    time_remaining_str = f"{int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s"
+    print(f"Approx Runtime (assuming 100mlups): {time_remaining_str} \n")
+    print("\n" + "=" * 50 + "\n")
 
     with open(os.path.join(output_dir, "project.log"),'a') as fd:
         fd.write('Material Properties\n')
@@ -1273,16 +1276,26 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
     else:
         is_target_voxel = bc_mask_finest == 255
 
-    ref_area_start = time.time()
     solid_voxels_indices = active_indices_finest[is_target_voxel]
-    # Project onto YZ plane using a 2D boolean grid — O(N), avoids the
-    # lexicographic sort that np.unique(..., axis=0) does on (j,k) pairs.
-    finest_shape = level_data[0][0].shape
-    yz_hit = np.zeros((finest_shape[1], finest_shape[2]), dtype=bool)
-    yz_hit[solid_voxels_indices[:, 1], solid_voxels_indices[:, 2]] = True
-    reference_area = int(yz_hit.sum())
+    unique_jk = np.unique(solid_voxels_indices[:, 1:3], axis=0)
+    reference_area = unique_jk.shape[0]
+
     reference_area_physical = reference_area * (voxel_size ** 2)
-    print(f"Reference area computation took {time.time() - ref_area_start:.3f} s")
+
+    # -------------------------------------------------------------------------
+    # ALTERNATE (faster) reference-area method, kept commented for reference.
+    #
+    # Projects the solid voxels onto the YZ plane with a 2D boolean grid in
+    # O(N), avoiding the lexicographic sort that np.unique(..., axis=0) performs
+    # on the (j, k) pairs above. Produces an identical reference_area; swap in if
+    # the np.unique path becomes a bottleneck on large meshes.
+    #
+    # finest_shape = level_data[0][0].shape
+    # yz_hit = np.zeros((finest_shape[1], finest_shape[2]), dtype=bool)
+    # yz_hit[solid_voxels_indices[:, 1], solid_voxels_indices[:, 2]] = True
+    # reference_area = int(yz_hit.sum())
+    # reference_area_physical = reference_area * (voxel_size ** 2)
+    # -------------------------------------------------------------------------
 
     return {
         "active_voxels": active_voxels,
@@ -1346,55 +1359,78 @@ def vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel
 
 
 def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize):
+    """
+    Generate slice images for each configured output slice group.
 
-    # -----------------------------
-    # Settings / constants
-    # -----------------------------
-    settings = jsonfile.get("settings", {})
-    default_num_slices = int(settings.get("numSlices", 51))
+      - grid_res and numSlices are universal for all enabled fields and axes.
+      - velocity uses InletBC["x"] * velocityFactor for normalization.
+      - pressure, Cp, CpTotal, and CpTotalLoss use field-specific min/max values.
+      - If a field is set to false, no PNGs or outputSlices entries are generated for it.
+    """
+
+    # -------------------------------------------------------------------------
+    # Read slice settings and constants from JSON.
+    # -------------------------------------------------------------------------
+
+    sliceSettings = jsonfile.get("slices", {})
+
+    # Universal controls for all fields and axes.
+    default_num_slices = int(sliceSettings.get("numSlices", 51))
     default_num_slices = max(1, default_num_slices)
 
-    grid_res = settings["grid_res"]
-    cmap = settings["sliceColorMap"]
-    normalize = jsonfile["InletBC"]["x"] * settings["sliceFactor"]
+    grid_res = int(sliceSettings.get("grid_res", 1000))
 
-    # Coefficient slices (Cp, CpTotal): proper derived fields synthesized from the
-    # time-averaged density/velocity (accumulated with derived=[...] in solve()).
-    # Each is linearly mapped from [lo, hi] onto the colormap's [0, 1] range and
-    # rendered on the same slice geometry as velocity. This replaces the previous
-    # manual density "pressure-analog" hack.
-    coeff_slice_specs = (
-        ("Cp",
-         settings.get("cpColorMap", "bwr"),
-         float(settings.get("cpMin", -1.0)),
-         float(settings.get("cpMax", 1.0))),
-        ("CpTotal",
-         settings.get("cpTotalColorMap", "bwr"),
-         float(settings.get("cpTotalMin", -1.0)),
-         float(settings.get("cpTotalMax", 1.0))),
-        # Total-pressure-loss coefficient: 0 in clean flow, positive in the wake
-        # (= 1 - CpTotal). The loss range is one-sided, so the default window is
-        # [0, 1] (clean -> full dynamic head lost) rather than a symmetric span,
-        # which keeps the whole colormap on the part of the field that varies.
-        ("CpTotalLoss",
-         settings.get("cpTotalLossColorMap", "bwr"),
-         float(settings.get("cpTotalLossMin", 0.0)),
-         float(settings.get("cpTotalLossMax", 1.0))),
-    )
+    def slice_enabled(key, default=False):
+        return bool(sliceSettings.get(key, default))
 
+    def slice_cmap(key, default="nipy_spectral"):
+        return sliceSettings.get(f"{key}ColorMap", default)
+
+    def slice_minmax(key, default_min=0.0, default_max=1.0):
+        lo = float(sliceSettings.get(f"{key}Min", default_min))
+        hi = float(sliceSettings.get(f"{key}Max", default_max))
+
+        if hi == lo:
+            raise ValueError(
+                f"Invalid normalization range for {key}: "
+                f"{key}Min and {key}Max are both {lo}. "
+                f"Set different values in jsonfile['slices']."
+            )
+
+        return lo, hi
+
+    # Velocity normalization uses inlet X velocity times velocityFactor.
+    velocity_factor = float(sliceSettings.get("velocityFactor", 1.5))
+    velocity_normalize = float(jsonfile["InletBC"]["x"]) * velocity_factor
+
+    if velocity_normalize == 0.0:
+        raise ValueError(
+            "Invalid velocity normalization: "
+            "jsonfile['InletBC']['x'] * jsonfile['slices']['velocityFactor'] is 0."
+        )
+
+    max_workers = max(1, int(os.cpu_count() / 2))
+
+    # -------------------------------------------------------------------------
+    # Convert part size to numeric dimensions.
+    # L, W, H are used to define vehicle-relative slice windows.
+    # -------------------------------------------------------------------------
     partSize = np.array(partSize, dtype=float)
     L, W, H = map(float, partSize)
 
-    # "manual-style" factors (match the example you posted very closely)
-    UPSTREAM_L = 0.5   # -0.5L
-    DOWNSTREAM_L = 2.0 # +2.0L
-    SIDE_W = 0.9       # ~ +/-0.9W (gives ~4.0 wide for your W=2.205)
-    HEIGHT_H = 1.9     # ~1.9H (gives ~3.0 high for your H=1.581)
-    Z_START_OFFSET = 0.0  # manual starts at 0.1 above ground
+    # Vehicle-relative slice window multipliers.
+    # X slices cover upstream to downstream.
+    # Y slices cover side-to-side.
+    # Z slices cover ground to above vehicle height.
+    UPSTREAM_L = 0.5
+    DOWNSTREAM_L = 2.0
+    SIDE_W = 0.9
+    HEIGHT_H = 1.9
+    Z_START_OFFSET = 0.0
 
-    # -----------------------------
-    # True simulation domain bounds
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # Compute true simulation domain bounds in physical coordinates.
+    # -------------------------------------------------------------------------
     shift = np.array(shift, dtype=float)
     domainSize = np.array(grid_shape_zip, dtype=float) * float(voxel_size)
 
@@ -1402,17 +1438,23 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     domain_max = domain_min + domainSize
     dom_extent = domain_max - domain_min
 
-    # -----------------------------
-    # Parse domain multipliers
-    # -----------------------------
+    if np.any(dom_extent <= 0.0):
+        raise ValueError(f"Invalid domain extent: {dom_extent}")
+
+    # -------------------------------------------------------------------------
+    # Parse mesher domain multipliers.
+    # These define where the simulation domain sits relative to the vehicle.
+    # -------------------------------------------------------------------------
     mesher = jsonfile.get("mesher", {})
     mesher_type = mesher.get("type", "mres")
 
     if mesher_type == "mres":
         dom = mesher.get("mres", {}).get("domain", {})
+
         mxm = float(dom.get("-x", 0.0))
         mym = float(dom.get("-y", 0.0))
         mzm = float(dom.get("-z", 0.0))
+
         mxp = float(dom.get("+x", dom.get("x", 0.0)))
         myp = float(dom.get("+y", dom.get("y", 0.0)))
         mzp = float(dom.get("+z", dom.get("z", 0.0)))
@@ -1420,241 +1462,592 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
         dm0 = mesher.get("cuboid", [[0, 0, 0, 0, 0, 0]])[0]
         mxm, mxp, mym, myp, mzm, mzp = map(float, dm0)
 
-    # -----------------------------
-    # CRITICAL FIX: "-x/-y/-z" are NEGATIVE extents, not positive offsets
-    # domain_min = vehicle_min + (-mxm*L, -mym*W, -mzm*H)
-    # => vehicle_min = domain_min - (-mxm*L, -mym*W, -mzm*H)
-    # -----------------------------
-    domain_min_rel = np.array([-mxm * L, -mym * W, -mzm * H], dtype=float)
-    domain_max_rel = np.array([ mxp * L,  myp * W,  mzp * H], dtype=float)
+    # -------------------------------------------------------------------------
+    # Recover vehicle bounds from the domain and mesher multipliers.
+    #
+    # Important sign convention:
+    # "-x/-y/-z" are negative extents from the vehicle, not positive offsets.
+    # -------------------------------------------------------------------------
+    domain_min_rel = np.array(
+        [
+            -mxm * L,
+            -mym * W,
+            -mzm * H,
+        ],
+        dtype=float,
+    )
 
     veh_min = domain_min - domain_min_rel
     veh_max = veh_min + partSize
     veh_center = 0.5 * (veh_min + veh_max)
 
-    # -----------------------------
-    # Diagnostics
-    # -----------------------------
-    # print("\n=== SAVE_SLICES DIAGNOSTICS ===")
-    # print(f"domain_min: {domain_min}, domain_max: {domain_max}, dom_extent: {dom_extent}")
-    # print(f"partSize (L,W,H): {(L, W, H)}")
-    # print(f"multipliers: -x={mxm}, +x={mxp}, -y={mym}, +y={myp}, -z={mzm}, +z={mzp}")
-    # print(f"domain_min_rel (signed): {domain_min_rel}")
-    # print(f"domain_max_rel: {domain_max_rel}")
-    # print(f"veh_min: {veh_min}, veh_max: {veh_max}, veh_center: {veh_center}")
-
-    # Vehicle-referenced "manual-style" windows
-    # X window uses vehicle_min.x as the reference (like your manual slices assume ~0)
+    # -------------------------------------------------------------------------
+    # Define unclipped vehicle-relative target slice windows.
+    # These are later clipped to the true simulation domain.
+    # -------------------------------------------------------------------------
     x0 = float(veh_min[0] - UPSTREAM_L * L)
     x1 = float(veh_min[0] + DOWNSTREAM_L * L)
 
-    # y centered around vehicle center (manual: symmetric around 0)
     y0 = float(veh_center[1] - SIDE_W * W)
     y1 = float(veh_center[1] + SIDE_W * W)
 
-    # z from ground (veh_min.z) + 0.1 to ~1.9H above ground
     z0 = float(veh_min[2] + Z_START_OFFSET)
     z1 = float(veh_min[2] + HEIGHT_H * H)
 
-    # print(f"Target windows (pre-clip): X[{x0:.6g},{x1:.6g}]  Y[{y0:.6g},{y1:.6g}]  Z[{z0:.6g},{z1:.6g}]")
-
-    # Helpers
+    # -------------------------------------------------------------------------
+    # Small local helpers.
+    # These remain inside save_slices so this is still a single drop-in function.
+    # -------------------------------------------------------------------------
     def clamp01(v):
         return 0.0 if v < 0.0 else (1.0 if v > 1.0 else float(v))
 
     def clip_range(axis, a0, a1):
+        """
+        Clip a requested physical range to the simulation domain.
+        Returns None if the requested range does not overlap the domain.
+        """
         if axis == "X":
             lo, hi = domain_min[0], domain_max[0]
         elif axis == "Y":
             lo, hi = domain_min[1], domain_max[1]
-        else:
+        elif axis == "Z":
             lo, hi = domain_min[2], domain_max[2]
-        return float(max(a0, lo)), float(min(a1, hi))
+        else:
+            raise ValueError(f"Unknown axis: {axis}")
+
+        clipped0 = float(max(min(a0, a1), lo))
+        clipped1 = float(min(max(a0, a1), hi))
+
+        if clipped1 <= clipped0:
+            return None
+
+        return clipped0, clipped1
 
     def bounds_axis_aligned(axis, origin, width, height):
-        ox, oy, oz = map(float, origin)
-        eps = 1e-12
-        if axis == "X":
-            u0 = (oy - domain_min[1]) / (dom_extent[1] + eps)
-            u1 = (oy + width - domain_min[1]) / (dom_extent[1] + eps)
-            v0 = (oz - domain_min[2]) / (dom_extent[2] + eps)
-            v1 = (oz + height - domain_min[2]) / (dom_extent[2] + eps)
-        elif axis == "Y":
-            u0 = (ox - domain_min[0]) / (dom_extent[0] + eps)
-            u1 = (ox + width - domain_min[0]) / (dom_extent[0] + eps)
-            v0 = (oz - domain_min[2]) / (dom_extent[2] + eps)
-            v1 = (oz + height - domain_min[2]) / (dom_extent[2] + eps)
-        else:  # Z
-            u0 = (ox - domain_min[0]) / (dom_extent[0] + eps)
-            u1 = (ox + width - domain_min[0]) / (dom_extent[0] + eps)
-            v0 = (oy - domain_min[1]) / (dom_extent[1] + eps)
-            v1 = (oy + height - domain_min[1]) / (dom_extent[1] + eps)
+        """
+        Kept for compatibility/debugging.
 
-        u0, u1, v0, v1 = clamp01(u0), clamp01(u1), clamp01(v0), clamp01(v1)
+        This computes normalized image-space bounds for an axis-aligned slice.
+        The current rendering path pins width/height/width_vec/height_vec instead,
+        so this is not used by default.
+        """
+        ox, oy, oz = map(float, origin)
+
+        if width <= 0.0 or height <= 0.0:
+            return None
+
+        if axis == "X":
+            # X-normal plane: image axes are Y and Z.
+            u0 = (oy - domain_min[1]) / dom_extent[1]
+            u1 = (oy + width - domain_min[1]) / dom_extent[1]
+            v0 = (oz - domain_min[2]) / dom_extent[2]
+            v1 = (oz + height - domain_min[2]) / dom_extent[2]
+
+        elif axis == "Y":
+            # Y-normal plane: image axes are X and Z.
+            u0 = (ox - domain_min[0]) / dom_extent[0]
+            u1 = (ox + width - domain_min[0]) / dom_extent[0]
+            v0 = (oz - domain_min[2]) / dom_extent[2]
+            v1 = (oz + height - domain_min[2]) / dom_extent[2]
+
+        elif axis == "Z":
+            # Z-normal plane: image axes are X and Y.
+            u0 = (ox - domain_min[0]) / dom_extent[0]
+            u1 = (ox + width - domain_min[0]) / dom_extent[0]
+            v0 = (oy - domain_min[1]) / dom_extent[1]
+            v1 = (oy + height - domain_min[1]) / dom_extent[1]
+
+        else:
+            raise ValueError(f"Unknown axis: {axis}")
+
+        u0, u1 = clamp01(u0), clamp01(u1)
+        v0, v1 = clamp01(v0), clamp01(v1)
+
         if (u1 - u0) <= 1e-6 or (v1 - v0) <= 1e-6:
             return None
+
         return (u0, u1, v0, v1)
 
-    axis_to_normal = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}
+    axis_to_normal = {
+        "X": (1, 0, 0),
+        "Y": (0, 1, 0),
+        "Z": (0, 0, 1),
+    }
 
-    # -----------------------------
-    # Main loop
-    # -----------------------------
-    outputSlices = jsonfile.get("outputSlices", [])
+    # -------------------------------------------------------------------------
+    # Clip all target ranges once.
+    # This prevents invalid slice windows and ensures width/height are positive.
+    # -------------------------------------------------------------------------
+    clipped_x = clip_range("X", x0, x1)
+    clipped_y = clip_range("Y", y0, y1)
+    clipped_z = clip_range("Z", z0, z1)
+
+    if clipped_x is None:
+        raise ValueError(
+            f"X slice range is outside domain. "
+            f"raw=({x0}, {x1}), domain=({domain_min[0]}, {domain_max[0]})"
+        )
+    if clipped_y is None:
+        raise ValueError(
+            f"Y slice range is outside domain. "
+            f"raw=({y0}, {y1}), domain=({domain_min[1]}, {domain_max[1]})"
+        )
+    if clipped_z is None:
+        raise ValueError(
+            f"Z slice range is outside domain. "
+            f"raw=({z0}, {z1}), domain=({domain_min[2]}, {domain_max[2]})"
+        )
+
+    x0c, x1c = clipped_x
+    y0c, y1c = clipped_y
+    z0c, z1c = clipped_z
+
+    # -------------------------------------------------------------------------
+    # Finalize time-averaged fields once, before any worker threads.
+    #
+    # This avoids calling finalize_time_average from workers and avoids touching
+    # h5exporter average-cache state concurrently.
+    # -------------------------------------------------------------------------
+    avg_fields = h5exporter.finalize_time_average(keep_state=True)
+
+    # -------------------------------------------------------------------------
+    # Force lazy h5exporter geometry caches before threading.
+    #
+    # MultiresIO.centroids is lazy. Touching it here avoids multiple workers
+    # trying to initialize the same cache at the same time.
+    # -------------------------------------------------------------------------
+    _ = h5exporter.centroids
+
+    # -------------------------------------------------------------------------
+    # Build requested render fields from jsonfile["slices"].
+    #
+    # Each entry is:
+    #   {
+    #       "field": name written into JSON and filename suffix,
+    #       "cell_data": normalized data passed to the renderer,
+    #       "cmap": colormap used for this field,
+    #       "normalize": normalize value passed to _to_slice_image_single_field
+    #   }
+    #
+    # All field data passed to the renderer is already clipped to [0, 1].
+    # -------------------------------------------------------------------------
+    def sorted_component_keys(base_name):
+        """
+        Finds averaged fields such as:
+          velocity_0, velocity_1, velocity_2
+          pressure_0
+          Cp_0
+          CpTotal_0
+          CpTotalLoss_0
+
+        Matching is case-insensitive against the base name.
+        """
+        base_lower = base_name.lower() + "_"
+
+        keys = [
+            k for k in avg_fields.keys()
+            if k.lower().startswith(base_lower)
+        ]
+
+        def component_index(k):
+            try:
+                return int(k.split("_")[-1])
+            except Exception:
+                return 0
+
+        return sorted(keys, key=component_index)
+
+    def normalized_scalar_field(base_name, control_key, default_min=0.0, default_max=1.0):
+        """
+        Builds a normalized scalar field from avg_fields using min/max controls
+        from jsonfile["slices"].
+        """
+        field_keys = sorted_component_keys(base_name)
+
+        if not field_keys:
+            print(
+                f"Warning: no averaged field found for {base_name}; "
+                f"skipping {base_name} slices."
+            )
+            return None
+
+        lo, hi = slice_minmax(control_key, default_min, default_max)
+
+        data = avg_fields[field_keys[0]].astype(np.float64, copy=False)
+
+        normalized = np.clip(
+            (data - lo) / (hi - lo),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+
+        return normalized
+
+    render_fields = []
+
+    # -------------------------------------------------------------------------
+    # Velocity magnitude.
+    #
+    # Controlled by:
+    #   "velocity": true/false
+    #   "velocityFactor": number
+    #   "velocityColorMap": string
+    # -------------------------------------------------------------------------
+    if slice_enabled("velocity"):
+        velocity_keys = sorted_component_keys("velocity")
+
+        if not velocity_keys:
+            raise KeyError(
+                f"No averaged velocity components found. "
+                f"Available fields: {sorted(avg_fields.keys())}"
+            )
+
+        if len(velocity_keys) > 1:
+            velocity_comps = [
+                avg_fields[k].astype(np.float64, copy=False)
+                for k in velocity_keys
+            ]
+
+            velocity_cell_data = np.sqrt(
+                np.sum([c * c for c in velocity_comps], axis=0)
+            ).astype(np.float32)
+
+            velocity_field_name = "velocity_magnitude"
+
+        else:
+            velocity_cell_data = avg_fields[velocity_keys[0]].astype(
+                np.float32,
+                copy=False,
+            )
+            velocity_field_name = velocity_keys[0]
+
+        velocity_cell_data = np.clip(
+            velocity_cell_data / velocity_normalize,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+
+        render_fields.append(
+            {
+                "field": velocity_field_name,
+                "cell_data": velocity_cell_data,
+                "cmap": slice_cmap("velocity"),
+                # Data is already normalized to [0, 1].
+                # normalize=2.0 preserves your existing renderer behavior for pre-normalized fields.
+                "normalize": 2.0,
+            }
+        )
+
+    # -------------------------------------------------------------------------
+    # Scalar slice fields.
+    #
+    # Tuple format:
+    #   control key in JSON,
+    #   averaged-data base field name,
+    #   output field name,
+    #   default min,
+    #   default max
+    # -------------------------------------------------------------------------
+    scalar_slice_specs = (
+        ("pressure", "pressure", "pressure", 101000.0, 102000.0),
+        ("cp", "Cp", "Cp", -1.0, 1.0),
+        ("cptotal", "CpTotal", "CpTotal", -0.5, 0.5),
+        ("cptotalloss", "CpTotalLoss", "CpTotalLoss", 0.0, 0.6),
+    )
+
+    for control_key, avg_base_name, output_field_name, default_min, default_max in scalar_slice_specs:
+        if not slice_enabled(control_key):
+            continue
+
+        scalar_data = normalized_scalar_field(
+            avg_base_name,
+            control_key,
+            default_min,
+            default_max,
+        )
+
+        if scalar_data is None:
+            continue
+
+        render_fields.append(
+            {
+                "field": output_field_name,
+                "cell_data": scalar_data,
+                "cmap": slice_cmap(control_key),
+                # Data is already normalized to [0, 1].
+                "normalize": 2.0,
+            }
+        )
+
+    if not render_fields:
+        raise ValueError(
+            "No slice fields are enabled. "
+            "Set at least one of velocity, pressure, cp, cptotal, or cptotalloss "
+            "to true in jsonfile['slices']."
+        )
+
+    print("\nEnabled slice fields:")
+    for field_spec in render_fields:
+        print(
+            f"  {field_spec['field']} "
+            f"cmap={field_spec['cmap']} "
+        )
+
+    # -------------------------------------------------------------------------
+    # Main slice loop.
+    # -------------------------------------------------------------------------
+    original_output_slices = list(jsonfile.get("outputSlices", []))
+    slice_metadata_by_axis = []
+
     tic = time.time()
 
-    for slice_group in outputSlices:
-        axis = slice_group.get("axis", "X")
-        plane_normal = axis_to_normal.get(axis, (1, 0, 0))
-        n = max(1, int(slice_group.get("numSlices", default_num_slices)))
+    for slice_template in original_output_slices:
+        axis = slice_template.get("axis", "X")
+        plane_normal = axis_to_normal.get(axis)
 
+        if plane_normal is None:
+            raise ValueError(f"Unknown slice axis: {axis}")
+
+        # Universal slice count from jsonfile["slices"].
+        n = default_num_slices
+
+        # ---------------------------------------------------------------------
+        # Build origins and in-plane vectors for this axis.
+        # The origin is the lower-left corner of the slice rectangle.
+        # width_vec and height_vec define the two in-plane directions.
+        # ---------------------------------------------------------------------
         if axis == "X":
-            # Sweep X, plane is YZ
-            sx0, sx1 = clip_range("X", x0, x1)
-            width = float(y1 - y0)
-            height = float(z1 - z0)
+            # Sweep X; each slice plane is YZ.
+            width = float(y1c - y0c)
+            height = float(z1c - z0c)
+
             width_vec = np.array([0.0, 1.0, 0.0], dtype=float)
             height_vec = np.array([0.0, 0.0, 1.0], dtype=float)
 
-            xs = np.linspace(sx0, sx1, n, dtype=float)
-            origins = np.column_stack((xs, np.full(n, y0), np.full(n, z0)))
+            xs = np.linspace(x0c, x1c, n, dtype=float)
+            origins = np.column_stack(
+                (
+                    xs,
+                    np.full(n, y0c),
+                    np.full(n, z0c),
+                )
+            )
 
-            print(f"\n--- X: sweep raw[{x0:.6g},{x1:.6g}] clipped[{sx0:.6g},{sx1:.6g}]  width={width:.6g} height={height:.6g}")
+            print(
+                f"\n--- X: sweep raw[{x0:.6g},{x1:.6g}] "
+                f"clipped[{x0c:.6g},{x1c:.6g}] "
+                f"in-plane Y[{y0c:.6g},{y1c:.6g}] "
+                f"Z[{z0c:.6g},{z1c:.6g}] "
+                f"width={width:.6g} height={height:.6g} "
+                f"numSlices={n}"
+            )
 
         elif axis == "Y":
-            # Sweep Y, plane is XZ
-            sy0, sy1 = clip_range("Y", y0, y1)
-            width = float(x1 - x0)
-            height = float(z1 - z0)
+            # Sweep Y; each slice plane is XZ.
+            width = float(x1c - x0c)
+            height = float(z1c - z0c)
+
             width_vec = np.array([1.0, 0.0, 0.0], dtype=float)
             height_vec = np.array([0.0, 0.0, 1.0], dtype=float)
 
-            ys = np.linspace(sy0, sy1, n, dtype=float)
-            origins = np.column_stack((np.full(n, x0), ys, np.full(n, z0)))
+            ys = np.linspace(y0c, y1c, n, dtype=float)
+            origins = np.column_stack(
+                (
+                    np.full(n, x0c),
+                    ys,
+                    np.full(n, z0c),
+                )
+            )
 
-            print(f"\n--- Y: sweep raw[{y0:.6g},{y1:.6g}] clipped[{sy0:.6g},{sy1:.6g}]  width={width:.6g} height={height:.6g}")
+            print(
+                f"\n--- Y: sweep raw[{y0:.6g},{y1:.6g}] "
+                f"clipped[{y0c:.6g},{y1c:.6g}] "
+                f"in-plane X[{x0c:.6g},{x1c:.6g}] "
+                f"Z[{z0c:.6g},{z1c:.6g}] "
+                f"width={width:.6g} height={height:.6g} "
+                f"numSlices={n}"
+            )
 
-        else:  # Z
-            # Sweep Z, plane is XY
-            sz0, sz1 = clip_range("Z", z0, z1)
-            width = float(x1 - x0)
-            height = float(y1 - y0)
+        elif axis == "Z":
+            # Sweep Z; each slice plane is XY.
+            width = float(x1c - x0c)
+            height = float(y1c - y0c)
+
             width_vec = np.array([1.0, 0.0, 0.0], dtype=float)
             height_vec = np.array([0.0, 1.0, 0.0], dtype=float)
 
-            zs = np.linspace(sz0, sz1, n, dtype=float)
-            origins = np.column_stack((np.full(n, x0), np.full(n, y0), zs))
+            zs = np.linspace(z0c, z1c, n, dtype=float)
+            origins = np.column_stack(
+                (
+                    np.full(n, x0c),
+                    np.full(n, y0c),
+                    zs,
+                )
+            )
 
-            print(f"\n--- Z: sweep raw[{z0:.6g},{z1:.6g}] clipped[{sz0:.6g},{sz1:.6g}]  width={width:.6g} height={height:.6g}")
+            print(
+                f"\n--- Z: sweep raw[{z0:.6g},{z1:.6g}] "
+                f"clipped[{z0c:.6g},{z1c:.6g}] "
+                f"in-plane X[{x0c:.6g},{x1c:.6g}] "
+                f"Y[{y0c:.6g},{y1c:.6g}] "
+                f"width={width:.6g} height={height:.6g} "
+                f"numSlices={n}"
+            )
 
-        # write back to JSON for downstream use
-        slice_group["width"] = width
-        slice_group["height"] = height
-        slice_group["widthVec"] = {"x": float(width_vec[0]), "y": float(width_vec[1]), "z": float(width_vec[2])}
-        slice_group["heightVec"] = {"x": float(height_vec[0]), "y": float(height_vec[1]), "z": float(height_vec[2])}
-        slice_group["origin"] = [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for p in origins]
+        else:
+            raise ValueError(f"Unknown slice axis: {axis}")
 
-        # print a few origins so you can verify quickly
+        # ---------------------------------------------------------------------
+        # Build JSON-ready origin/geometry metadata once for this axis.
+        #
+        # This metadata is reused for every rendered field for this axis.
+        # ---------------------------------------------------------------------
+        origin_json = [
+            {
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "z": float(p[2]),
+            }
+            for p in origins
+        ]
+
+        width_vec_json = {
+            "x": float(width_vec[0]),
+            "y": float(width_vec[1]),
+            "z": float(width_vec[2]),
+        }
+
+        height_vec_json = {
+            "x": float(height_vec[0]),
+            "y": float(height_vec[1]),
+            "z": float(height_vec[2]),
+        }
+
+        # Print a few origins for quick sanity checking.
         for i in range(min(10, origins.shape[0])):
             p = origins[i]
             print(f"  {axis}[{i:03d}] origin=({p[0]:.6g},{p[1]:.6g},{p[2]:.6g})")
 
-        # render
+        # ---------------------------------------------------------------------
+        # Store one completed axis template.
+        #
+        # We do not assign "field" here because final JSON ordering should be
+        # field-major, not axis-major.
+        # ---------------------------------------------------------------------
+        axis_slice_group = dict(slice_template)
+
+        axis_slice_group["axis"] = axis
+        axis_slice_group["numSlices"] = n
+        axis_slice_group["height"] = height
+        axis_slice_group["heightVec"] = height_vec_json
+        axis_slice_group["width"] = width
+        axis_slice_group["widthVec"] = width_vec_json
+        axis_slice_group["origin"] = origin_json
+
+        slice_metadata_by_axis.append(axis_slice_group)
+
+        # ---------------------------------------------------------------------
+        # Build render tasks for this axis.
+        #
+        # Each task renders all enabled fields for one plane index.
+        # Every output file remains unique because the field name is included in
+        # the final filename:
+        #
+        #   X_slice_000_velocity_magnitude.png
+        #   X_slice_000_pressure.png
+        #   X_slice_000_Cp.png
+        #   X_slice_000_CpTotal.png
+        #   X_slice_000_CpTotalLoss.png
+        # ---------------------------------------------------------------------
         prefix = os.path.join(output_dir, f"{axis}_slice_")
+
+        slice_tasks = []
+        for idx in range(origins.shape[0]):
+            output_filename = prefix + f"{idx:03d}"
+
+            # Copy the origin so each worker owns its plane point array.
+            # This avoids sharing a mutable NumPy row view across threads.
+            plane_point = np.asarray(origins[idx], dtype=np.float64).copy()
+
+            slice_tasks.append(
+                (
+                    idx,
+                    plane_point,
+                    plane_normal,
+                    output_filename,
+                    axis,
+                    width,
+                    height,
+                    width_vec.copy(),
+                    height_vec.copy(),
+                )
+            )
+
         rendered = 0
         skipped = 0
 
-        # Extract field data ONCE before parallelization
-        avg_fields = h5exporter.finalize_time_average(keep_state=True)
-        comp_keys = [k for k in avg_fields.keys() if k.startswith("velocity" + "_")]
-        comp_keys = sorted(comp_keys, key=lambda k: int(k.split("_")[-1]))
+        # ---------------------------------------------------------------------
+        # Local worker for one slice plane.
+        # ---------------------------------------------------------------------
+        def render_single_slice(slice_info):
+            (
+                idx,
+                plane_point,
+                plane_normal,
+                output_filename,
+                axis,
+                width,
+                height,
+                width_vec,
+                height_vec,
+            ) = slice_info
 
-        if len(comp_keys) > 1:
-            comps = [avg_fields[k].astype(np.float64) for k in comp_keys]
-            cell_data = np.sqrt(np.sum([c**2 for c in comps], axis=0)).astype(np.float32)
-            field_name = "velocity_magnitude"
-        else:
-            cell_data = avg_fields[comp_keys[0]]
-            field_name = comp_keys[0]
-
-        # Apply normalization clipping (CRITICAL for correct color range)
-        if normalize != 1.0:
-            cell_data = np.clip(cell_data / normalize, 0, 1)
-
-        # Coefficient fields (Cp, CpTotal): proper derived fields from the averaged
-        # density/velocity, linearly mapped from [lo, hi] onto the colormap's [0, 1].
-        # Rendered on the same averaged data / slice geometry as the velocity slices.
-        coeff_slices = []  # list of (field_name, cell_data, cmap)
-        for base_name, coeff_cmap, lo, hi in coeff_slice_specs:
-            keys = sorted(
-                [k for k in avg_fields.keys() if k.startswith(base_name + "_")],
-                key=lambda k: int(k.split("_")[-1]),
-            )
-            if not keys:
-                continue
-            coeff_data = avg_fields[keys[0]].astype(np.float64)
-            coeff_data = np.clip((coeff_data - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
-            coeff_slices.append((base_name, coeff_data, coeff_cmap))
-
-        max_workers = os.cpu_count() or 1
-
-        def render_single_slice_unlocked(slice_info):
-            idx, plane_point, plane_normal, output_filename = slice_info
             try:
-                # Pin the image extent to the published slice rectangle so every
-                # slice in this sweep renders on an identical pixel grid.
-                h5exporter._to_slice_image_single_field(
-                    f"{output_filename}_{field_name}",
-                    cell_data,
-                    plane_point,
-                    plane_normal,
-                    slice_thickness=voxel_size,
-                    bounds=[0, 1, 0, 1],
-                    grid_res=grid_res,
-                    cmap=cmap,
-                    show_axes=False,
-                    show_colorbar=False,
-                    normalize=normalize,
-                    width=width,
-                    height=height,
-                    width_vec=width_vec,
-                    height_vec=height_vec,
-                )
-                # Coefficient slices (Cp, CpTotal) on the identical pixel grid
-                # (different values + filenames). Data is pre-clipped to [0, 1];
-                # normalize != 1.0 locks the PNG color range to vmin=0, vmax=1.
-                for coeff_name, coeff_data, coeff_cmap in coeff_slices:
+                for field_spec in render_fields:
+                    field_name = field_spec["field"]
+                    field_data = field_spec["cell_data"]
+                    field_cmap = field_spec["cmap"]
+                    field_normalize = field_spec["normalize"]
+
                     h5exporter._to_slice_image_single_field(
-                        f"{output_filename}_{coeff_name}",
-                        coeff_data,
+                        f"{output_filename}_{field_name}",
+                        field_data,
                         plane_point,
                         plane_normal,
                         slice_thickness=voxel_size,
                         bounds=[0, 1, 0, 1],
                         grid_res=grid_res,
-                        cmap=coeff_cmap,
+                        cmap=field_cmap,
                         show_axes=False,
                         show_colorbar=False,
-                        normalize=2.0,   # any value != 1.0 -> fixed [0,1] color range
+                        normalize=field_normalize,
                         width=width,
                         height=height,
                         width_vec=width_vec,
                         height_vec=height_vec,
+                        workers=2,
                     )
-                return (idx, True, None)
+
+                return idx, True, None
+
             except Exception as e:
-                return (idx, False, str(e))
+                return idx, False, str(e)
 
-        slice_tasks = []
-        for idx in range(origins.shape[0]):
-            plane_point = origins[idx]
-            output_filename = prefix + f"{idx:03d}"
-            slice_tasks.append((idx, plane_point, plane_normal, output_filename))
-
+        # ---------------------------------------------------------------------
+        # Parallel render for this axis.
+        #
+        # JSON metadata for this axis has already been computed in memory.
+        # Rendering only creates PNGs.
+        # ---------------------------------------------------------------------
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(render_single_slice_unlocked, task): task[0] for task in slice_tasks}
+            futures = {
+                executor.submit(render_single_slice, task): task[0]
+                for task in slice_tasks
+            }
+
             for future in as_completed(futures):
                 idx, success, error = future.result()
+
                 if success:
                     rendered += 1
                 else:
@@ -1662,183 +2055,30 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                     if error:
                         print(f"  Warning: slice {axis}[{idx:03d}] failed: {error}")
 
+        # Keep original post-axis synchronization behavior.
         wp.synchronize()
+
         print(f"Rendered {rendered}, skipped {skipped} for axis {axis}")
+
+    # -------------------------------------------------------------------------
+    # Each section includes the full geometry payload:
+    #   height, heightVec, width, widthVec, origin
+    # -------------------------------------------------------------------------
+    expanded_output_slices = []
+
+    for field_spec in render_fields:
+        field_name = field_spec["field"]
+
+        for axis_slice_group in slice_metadata_by_axis:
+            expanded_slice_group = dict(axis_slice_group)
+            expanded_slice_group["field"] = field_name
+            expanded_output_slices.append(expanded_slice_group)
+
+    jsonfile["outputSlices"] = expanded_output_slices
 
     print(f"\nTime to save all images {time.time() - tic} seconds.")
 
 
-def save_slices0(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile):
-    domainSize = np.array(grid_shape_zip) * voxel_size
-    outputSlices = jsonfile['outputSlices']
-    # Map axis to plane normal
-    axis_to_normal = {
-        'X': [1, 0, 0],
-        'Y': [0, 1, 0],
-        'Z': [0, 0, 1]
-    }
-    domain_min = -shift
-    domain_max = domain_min + domainSize
-    tic = time.time()
-    def compute_slice_bounds_relative_to_domain(origin, width, height, width_vec, height_vec, domain_min, domain_max, plane_normal):        
-        # Build in-plane basis
-        n = np.array(plane_normal) / np.linalg.norm(plane_normal)
-        if np.allclose(n, [1, 0, 0]):
-            u1 = np.array([0, 1, 0])
-        else:
-            u1 = np.array([1, 0, 0])
-        u1 = u1 / np.linalg.norm(u1)
-        u2 = np.cross(n, u1)
-        u2 = u2 / np.linalg.norm(u2)
-        width_vec_norm = width_vec / np.linalg.norm(width_vec)
-        height_vec_norm = height_vec / np.linalg.norm(height_vec)
-        if np.dot(u1, width_vec_norm) < 0:
-            u1 = -u1
-        if np.dot(u2, height_vec_norm) < 0:
-            u2 = -u2
-
-        # Use the lower-left corner of the slice as the reference point
-        ref_point = origin
-
-        # Project domain corners onto the plane and compute in-plane coordinates
-        domain_corners = np.array([
-            [domain_min[0], domain_min[1], domain_min[2]],
-            [domain_max[0], domain_min[1], domain_min[2]],
-            [domain_min[0], domain_max[1], domain_min[2]],
-            [domain_max[0], domain_max[1], domain_min[2]],
-            [domain_min[0], domain_min[1], domain_max[2]],
-            [domain_max[0], domain_min[1], domain_max[2]],
-            [domain_min[0], domain_max[1], domain_max[2]],
-            [domain_max[0], domain_max[1], domain_max[2]]
-        ])
-        local_corners = []
-        for corner in domain_corners:
-            # Project corner onto the plane
-            proj = corner - np.dot(corner - ref_point, n) * n
-            local_x = np.dot(proj - ref_point, u1)
-            local_y = np.dot(proj - ref_point, u2)
-            local_corners.append([local_x, local_y])
-        local_corners = np.array(local_corners)
-        domain_u_min, domain_u_max = local_corners[:, 0].min(), local_corners[:, 0].max()
-        domain_v_min, domain_v_max = local_corners[:, 1].min(), local_corners[:, 1].max()
-
-        # Project slice corners onto the plane and compute in-plane coordinates
-        slice_corners = [
-            origin,
-            origin + width * width_vec,
-            origin + height * height_vec,
-            origin + width * width_vec + height * height_vec
-        ]
-        slice_local = []
-        for corner in slice_corners:
-            proj = corner - np.dot(corner - ref_point, n) * n
-            local_x = np.dot(proj - ref_point, u1)
-            local_y = np.dot(proj - ref_point, u2)
-            slice_local.append([local_x, local_y])
-        slice_local = np.array(slice_local)
-        slice_u_min, slice_u_max = slice_local[:, 0].min(), slice_local[:, 0].max()
-        slice_v_min, slice_v_max = slice_local[:, 1].min(), slice_local[:, 1].max()
-
-        # Convert to fractions
-        u_min = (slice_u_min - domain_u_min) / (domain_u_max - domain_u_min)
-        u_max = (slice_u_max - domain_u_min) / (domain_u_max - domain_u_min)
-        v_min = (slice_v_min - domain_v_min) / (domain_v_max - domain_v_min)
-        v_max = (slice_v_max - domain_v_min) / (domain_v_max - domain_v_min)
-
-        return [max(0,u_min), min(1,u_max), max(0,v_min), min(1,v_max)]
-    
-    for slice_group in outputSlices:
-        field_name = slice_group['field']
-        axis = slice_group['axis']
-        height = slice_group['height']
-        width = slice_group['width']
-    # Extract vectors
-        height_vec = np.array([
-            slice_group['heightVec']['x'],
-            slice_group['heightVec']['y'],
-            slice_group['heightVec']['z']
-        ])
-        width_vec = np.array([
-            slice_group['widthVec']['x'],
-            slice_group['widthVec']['y'],
-            slice_group['widthVec']['z']
-        ])
-        
-        # Get plane normal
-        plane_normal = axis_to_normal[axis]
-        
-        # Process each origin
-        for idx, origin_dict in enumerate(slice_group['origin']):
-            # The origin / plane point is the lower-left corner of the slice
-            plane_point = np.array([
-                origin_dict['x'],
-                origin_dict['y'],
-                origin_dict['z']
-            ])
-            
-            # Calculate bounds in model units
-            
-            # Calculate the bounds
-            # Since we're given absolute dimensions, we need to compute
-            # the bounds relative to the full domain extent in the plane
-            # For now, we'll use bounds [0, 1, 0, 1] to capture the full slice
-            # as defined by the width and height
-            bounds = [0, 1, 0, 1]
-            bounds_x, bounds_x2, bounds_y, bounds_y2 = compute_slice_bounds_relative_to_domain(plane_point, width, height, width_vec, height_vec, domain_min, domain_max, plane_normal)
-            print(f'bounds {bounds_x}, {bounds_x2}, {bounds_y}, {bounds_y2}')
-            # Alternatively, if you want to compute bounds relative to domain:
-            # You would need to:
-            # 1. Project domain extents onto the plane
-            # 2. Calculate where this slice sits within those extents
-            # 3. Set bounds accordingly
-            
-            # Generate output filename
-            output_filename = os.path.join(
-                output_dir,
-                f"{axis}_slice_{idx:03d}"
-            )
-            
-            print(f"Generating slice: {output_filename}")
-            print(f"  Axis: {axis}, Normal: {plane_normal}")
-            print(f"  Plane point: {plane_point}")
-            print(f"  Width: {width}, Height: {height}")
-            
-
-            # h5exporter.to_slice_image(
-            #     output_filename,
-            #     {"velocity": sim.u},
-            #     plane_point=plane_point,
-            #     plane_normal=plane_normal,
-            #     grid_res=jsonfile['settings']['grid_res'],
-            #     bounds=(bounds_x, bounds_x2, bounds_y, bounds_y2),
-            #     show_axes=False,
-            #     show_colorbar=False,
-            #     cmap=jsonfile['settings']['sliceColorMap'],
-            #     normalize=jsonfile['InletBC']['x'] * jsonfile['settings']['sliceFactor'],
-            #     slice_thickness=delta_x_coarse #needed when using model units                
-            # )
-            # output_filename = os.path.join(
-            #     output_dir,
-            #     f"{axis}_slice_{idx:03d}_avg"
-            # )
-            h5exporter.to_slice_image_time_average(
-                output_filename,
-                field_base_name="velocity",
-                plane_point=plane_point,
-                plane_normal=plane_normal,
-                grid_res=jsonfile['settings']['grid_res'],
-                bounds=(bounds_x, bounds_x2, bounds_y, bounds_y2),
-                show_axes=False,
-                show_colorbar=False,
-                cmap=jsonfile['settings']['sliceColorMap'],
-                normalize=jsonfile['InletBC']['x'] * jsonfile['settings']['sliceFactor'],
-                slice_thickness=voxel_size, #finest-cell thickness; per-level scaling handled in mesher
-                keep_state=True,
-            )
-            wp.synchronize()
-    print(f"Time to save all images {time.time()-tic} seconds. ")
-  
-  
 def solve(
         sim, 
         ulb,
@@ -1904,12 +2144,13 @@ def solve(
                     {"velocity": sim.u},
                     plane_point=(1, 0, 0),
                     plane_normal=(0, 1, 0),
-                    grid_res=jsonfile['settings']['grid_res'],
+                    grid_res=jsonfile['slices']['grid_res'],
                     bounds=(0, 1, 0, 1),
                     show_axes=False,
                     show_colorbar=False,
                     slice_thickness=voxel_size, #finest-cell thickness; per-level scaling handled in mesher
-                    normalize=jsonfile['InletBC']['x'] * jsonfile['settings']['sliceFactor'],
+                    normalize=jsonfile['InletBC']['x'] * jsonfile['slices']['velocityFactor'],
+                    cmap=jsonfile['slices']['velocityColorMap'],
                 )
                 if step >= crossover_step:
                     # Derived fields (pressure/Cp/CpTotal) are synthesized per-step
@@ -2006,46 +2247,7 @@ def solve(
             
         filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average")
         h5exporter.to_hdf5_time_average(filename, compression="gzip", compression_opts=0, keep_state=True)
-        filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_density")
-        h5exporter.to_surface_vtk_time_average(
-            output_filename=filename,
-            surface_mesh_filename=surface_mesh_for_vtk,
-            field_base_name="density",
-            component=None,
-            keep_state=True,
-            sample_dx=voxel_size,
-            shell_factors=(2.20, ),
-            k=8,
-            power=2.0,
-            max_distance=1.0 * voxel_size,
-            half_space_tolerance=0.15,
-            aggregate="median",
-            smooth_iterations=2,
-            smooth_relaxation=0.20,
-        )
-
-        filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_vel")
-        h5exporter.to_surface_vtk_time_average(
-            output_filename=filename,
-            surface_mesh_filename=surface_mesh_for_vtk,
-            field_base_name="velocity",
-            component=None,                 # magnitude
-            keep_state=True,
-            sample_dx=voxel_size,
-            shell_factors=(2.20,),
-            k=8,
-            power=2.0,
-            max_distance=1.0 * voxel_size,
-            half_space_tolerance=0.15,
-            aggregate="median",
-            smooth_iterations=2,
-            smooth_relaxation=0.20,
-        )
-
-        # Surface pressure-coefficient maps on the body (Cp, CpTotal) from the
-        # time-averaged derived fields accumulated during the run. field_base_name
-        # selects the stored derived key ("Cp" -> Cp_0, "CpTotal" -> CpTotal_0).
-        for surf_field in ("Cp", "CpTotal", "CpTotalLoss"):
+        for surf_field in ("velocity", "pressure", "Cp", "CpTotalLoss"):
             filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surf_field}")
             h5exporter.to_surface_vtk_time_average(
                 output_filename=filename,
@@ -2054,51 +2256,28 @@ def solve(
                 component=None,
                 keep_state=True,
                 sample_dx=voxel_size,
-                shell_factors=(2.20,),
+                shell_factors=(2.50, ),
                 k=8,
                 power=2.0,
-                max_distance=1.0 * voxel_size,
+                max_distance=2.0 * voxel_size,
                 half_space_tolerance=0.15,
                 aggregate="median",
                 smooth_iterations=2,
                 smooth_relaxation=0.20,
             )
 
-        # Iso-surface STLs (open at the body), on the same vehicle region as the slices.
-        #   - velocity:     iso at half the inlet speed (m/s).
-        #   - CpTotal:      free-stream ~1, wake < 1; iso 0 isolates strong total-pressure-loss cores.
-        #   - CpTotalLoss:  free-stream 0, wake < 0; small negative iso shows the coherent wake envelope.
-        # All are derived fields already accumulated in the time-average (derived=[...] above).
+        # Iso-surface STL (open at the body), on the same vehicle region as the slices.
+        # CpTotalLoss wake surface: total-pressure-loss coefficient, 0 in clean flow and
+        # rising through the wake. The iso level is set by settings.isoCpTotalLossValue
+        # (1.0 = strongest-loss cores). Derived field, already accumulated in the
+        # time-average (derived=[...] above).
         try:
             iso_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
             iso_prefix = os.path.join(output_dir, f"{jsonfile['outputName']}_iso")
             h5exporter.to_isosurface_stl_time_average(
                 output_filename=iso_prefix,
-                field_base_name="velocity",
-                iso_value=0.5 * prescribed_velocity_phys,
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=1024,
-            )
-            h5exporter.to_isosurface_stl_time_average(
-                output_filename=iso_prefix,
-                field_base_name="CpTotal",
-                iso_value=0.0,
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=1024,
-            )
-            # CpTotalLoss wake surface: 0 == clean flow, so an iso AT 0 would wrap
-            # every faintly-lossy cell (a noisy blob), while 1 is the strongest
-            # cores (identical to the CpTotal=0 surface above). 0.5 picks out the
-            # coherent mid-wake -- half a dynamic head of total-pressure loss --
-            # a genuinely different surface from the core view.
-            h5exporter.to_isosurface_stl_time_average(
-                output_filename=iso_prefix,
                 field_base_name="CpTotalLoss",
-                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 0.5)),
+                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 1.0)),
                 bc_mask_neon=sim.bc_mask,
                 keep_state=True,
                 bounds=iso_region,
@@ -2193,41 +2372,18 @@ def solve(
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)
 
-        # Iso-surface STLs (open at the body), on the same vehicle region as the slices.
-        #   - velocity:     iso at half the inlet speed (m/s).
-        #   - CpTotal:      free-stream ~1, wake < 1; iso 0 isolates strong total-pressure-loss cores.
-        #   - CpTotalLoss:  free-stream 0, wake < 0; small negative iso shows the coherent wake envelope.
-        # All are derived fields already accumulated in the time-average (derived=[...] above).
+        # Iso-surface STL (open at the body), on the same vehicle region as the slices.
+        # CpTotalLoss wake surface: total-pressure-loss coefficient, 0 in clean flow and
+        # rising through the wake. The iso level is set by settings.isoCpTotalLossValue
+        # (1.0 = strongest-loss cores). Derived field, already accumulated in the
+        # time-average (derived=[...] above).
         try:
             iso_region = vehicle_slice_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
             iso_prefix = os.path.join(output_dir, f"{jsonfile['outputName']}_iso")
             h5exporter.to_isosurface_stl_time_average(
                 output_filename=iso_prefix,
-                field_base_name="velocity",
-                iso_value=0.5 * prescribed_velocity_phys,
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=1024,
-            )
-            h5exporter.to_isosurface_stl_time_average(
-                output_filename=iso_prefix,
-                field_base_name="CpTotal",
-                iso_value=0.0,
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=1024,
-            )
-            # CpTotalLoss wake surface: 0 == clean flow, so an iso AT 0 would wrap
-            # every faintly-lossy cell (a noisy blob), while 1 is the strongest
-            # cores (identical to the CpTotal=0 surface above). 0.5 picks out the
-            # coherent mid-wake -- half a dynamic head of total-pressure loss --
-            # a genuinely different surface from the core view.
-            h5exporter.to_isosurface_stl_time_average(
-                output_filename=iso_prefix,
                 field_base_name="CpTotalLoss",
-                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 0.5)),
+                iso_value=float(jsonfile['settings'].get('isoCpTotalLossValue', 1.0)),
                 bc_mask_neon=sim.bc_mask,
                 keep_state=True,
                 bounds=iso_region,
