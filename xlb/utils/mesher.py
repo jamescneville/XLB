@@ -1319,7 +1319,7 @@ class MultiresIO(object):
         "pressure": ("density",),            # static pressure -> Pa via name hook
         "Cp": ("density",),                  # static pressure coefficient (dimensionless)
         "CpTotal": ("density", "velocity"),  # total/stagnation pressure coefficient (dimensionless)
-        "CpTotalLoss": ("density", "velocity"),  # total-pressure-loss coeff (0 freestream, >0 in wake)
+        "CpTotalLoss": ("density", "velocity"),  # total-pressure-loss coeff (0 freestream, <0 in wake)
         "qdyn": ("density", "velocity"),     # dynamic pressure 0.5*rho*|u|^2 [Pa]
     }
 
@@ -1384,8 +1384,7 @@ class MultiresIO(object):
 
             elif name == "CpTotalLoss":
                 # Total-pressure loss referenced to freestream total pressure:
-                # loss = (freestream total pressure - local total pressure) / q_dyn,
-                # so it is 0 in clean flow and POSITIVE in the wake. (= 1 - CpTotal)
+                # 0 in clean flow, negative in the wake. (= CpTotal - 1)
                 u_sq = (
                     fields_data["velocity_0"] ** 2
                     + fields_data["velocity_1"] ** 2
@@ -1393,7 +1392,7 @@ class MultiresIO(object):
                 )
                 p_static = cs2 * (rho - rho_ref)
                 p_total = p_static + 0.5 * rho * u_sq
-                fields_data["CpTotalLoss_0"] = (1.0 - p_total / q_dyn).astype(rho.dtype, copy=False)
+                fields_data["CpTotalLoss_0"] = (1.0 - (p_total / q_dyn)).astype(rho.dtype, copy=False)
 
             elif name == "qdyn":
                 # Dynamic pressure 0.5*rho*|u|^2 in Pa (no atmospheric offset, so it
@@ -1566,7 +1565,7 @@ class MultiresIO(object):
         component=None,
         show_axes=False,
         show_colorbar=False,
-        normalize=1.0,
+        normalize=None,
         output=None,
         width=None,
         height=None,
@@ -1598,8 +1597,9 @@ class MultiresIO(object):
             Physical size of slice grid (width, height).
         cmap : str
             Matplotlib colormap.
-        normalize : float
-            Factor to scale and normalize data to ensure consistent images
+        normalize : float or tuple
+            Factor to scale  and normalize data to ensure consistent images
+            (min, max) tuple to scale  and normalize data to ensure consistent images (value - min) / (max- min)
         derived : list[str], optional
             Derived fields to synthesize from the base NEON fields you pass
             (e.g. ["pressure"]). Pass the base fields the derived quantity needs
@@ -1658,10 +1658,18 @@ class MultiresIO(object):
             field_name = list(fields_data.keys())[component]
             cell_data = fields_data[field_name]
 
-        if normalize != 1.0:  
+        if normalize is None:
+            pass
+        elif isinstance(normalize, tuple):
+            vmin, vmax = normalize
+            cell_data = np.clip((cell_data - vmin) / (vmax - vmin), 0, 1)
+        else:
             cell_data = np.clip((cell_data / normalize),0,1)
-        else:   
-            cell_data = cell_data      
+
+        # if normalize != 1.0:  
+        #     cell_data = np.clip((cell_data / normalize),0,1)
+        # else:   
+        #     cell_data = cell_data      
 
         # Plot each field in the dictionary
         self._to_slice_image_single_field(
@@ -1701,6 +1709,7 @@ class MultiresIO(object):
         height,
         width_vec,
         height_vec,
+        workers=-1,
         **kwargs,
     ):
         """
@@ -1815,7 +1824,7 @@ class MultiresIO(object):
 
         # Find k nearest neighbors for smoother interpolation
         k = min(4, len(points))
-        distances, indices = tree.query(query_points, k=k, workers=-1)
+        distances, indices = tree.query(query_points, k=k, workers=workers)
 
         if k == 1:
             distances = distances[:, None]
@@ -2730,7 +2739,7 @@ class MultiresIO(object):
             smooth_relaxation=smooth_relaxation,
             export_debug_arrays=export_debug_arrays,
         )
-
+    
     # ------------------------------------------------------------------
     # Iso-surface STL export (generic over any base or derived scalar)
     # ------------------------------------------------------------------
@@ -2817,6 +2826,79 @@ class MultiresIO(object):
         structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
         return ndimage.binary_propagation(seed, mask=fluid_mask, structure=structure)
 
+    def _remove_small_mesh_components(
+        self,
+        mesh,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Remove tiny disconnected triangle islands from an extracted iso mesh.
+
+        Marching cubes can create small disconnected components when the sampled
+        scalar contains single-cell/voxel-scale noise. This keeps the main
+        connected components and drops islands whose face count or surface area is
+        tiny relative to the full iso-surface. If filtering would remove
+        everything, the largest component is kept as a safe fallback.
+        """
+        if mesh is None or len(mesh.faces) == 0:
+            return mesh
+
+        min_component_faces = int(min_component_faces or 0)
+        min_component_area_fraction = float(min_component_area_fraction or 0.0)
+
+        if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
+            return mesh
+
+        try:
+            components = mesh.split(only_watertight=False)
+        except Exception as exc:
+            print(f"\tConnected-component cleanup skipped: {exc}")
+            return mesh
+
+        if len(components) <= 1:
+            return mesh
+
+        components = list(components)
+        areas = np.asarray([float(getattr(c, "area", 0.0)) for c in components], dtype=np.float64)
+        faces = np.asarray([len(c.faces) for c in components], dtype=np.int64)
+
+        if keep_largest_component:
+            keep = np.zeros(len(components), dtype=bool)
+            keep[int(np.argmax(areas))] = True
+        else:
+            total_area = float(max(mesh.area, 1e-30))
+            min_area = min_component_area_fraction * total_area
+            keep = np.ones(len(components), dtype=bool)
+            if min_component_faces > 0:
+                keep &= faces >= min_component_faces
+            if min_component_area_fraction > 0.0:
+                keep &= areas >= min_area
+
+            if not np.any(keep):
+                keep[int(np.argmax(areas))] = True
+                print(
+                    "\tConnected-component cleanup would remove all components; "
+                    "kept the largest component instead."
+                )
+
+        n_removed = int(np.count_nonzero(~keep))
+        if n_removed == 0:
+            return mesh
+
+        kept_meshes = [components[i] for i in np.flatnonzero(keep)]
+        cleaned = trimesh.util.concatenate(kept_meshes)
+        try:
+            cleaned.remove_unreferenced_vertices()
+        except Exception:
+            pass
+
+        print(
+            f"\tConnected-component cleanup: removed {n_removed} small component(s); "
+            f"kept {len(kept_meshes)} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
+        )
+        return cleaned
+
     def _scalar_to_isosurface_stl(
         self,
         output_filename,
@@ -2830,12 +2912,17 @@ class MultiresIO(object):
         k=8,
         power=2.0,
         smooth_iterations=10,
-        smooth_taubin_lambda=0.5,
-        smooth_taubin_nu=0.53,
+        smooth_taubin_lambda=0.6,
+        smooth_taubin_nu=0.55,
         step_size=1,
         body_handling="cap",
         fill_value=None,
         remove_trapped_fluid=True,
+        lengthScale=1000.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
 
@@ -2873,6 +2960,16 @@ class MultiresIO(object):
           narrower than ``pitch`` reads as sealed, so the dropped-point count is
           logged. Requires a ``solid_mask``; a no-op when none is given.
 
+        ``lengthScale`` multiplies only the final STL vertices. For example,
+        ``lengthScale=1000`` exports a mesh whose coordinates are 1000x larger
+        (1 m becomes 1000 mm) without translating the origin or changing the
+        solver/model data.
+
+        ``remove_small_components`` removes tiny disconnected triangle islands
+        after marching cubes. This is useful for CpTotalLoss iso-surfaces where
+        voxel-scale noise can create small speckle components away from the main
+        structure.
+
         Returns the trimesh.Trimesh, or None if the iso-value is outside the
         sampled range (no surface).
         """
@@ -2885,6 +2982,10 @@ class MultiresIO(object):
             ) from e
 
         tic = time.perf_counter()
+
+        lengthScale = float(lengthScale)
+        if not np.isfinite(lengthScale) or lengthScale <= 0.0:
+            raise ValueError(f"lengthScale must be a positive finite value, got {lengthScale!r}")
 
         cell_scalar = np.asarray(cell_scalar, dtype=np.float32)
         centroids = self.centroids
@@ -3057,6 +3158,14 @@ class MultiresIO(object):
 
         mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
+        if remove_small_components:
+            mesh = self._remove_small_mesh_components(
+                mesh,
+                min_component_faces=min_component_faces,
+                min_component_area_fraction=min_component_area_fraction,
+                keep_largest_component=keep_largest_component,
+            )
+
         # Taubin smoothing: removes residual marching-cubes faceting without the
         # volumetric shrinkage of plain Laplacian smoothing.
         if smooth_iterations and int(smooth_iterations) > 0:
@@ -3071,6 +3180,10 @@ class MultiresIO(object):
                 )
             except Exception as _e:
                 print(f"\tTaubin smoothing skipped: {_e}")
+
+        if lengthScale != 1.0:
+            mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * lengthScale
+            print(f"	Applied STL lengthScale={lengthScale:.6g} about the global origin")
 
         out = output_filename if output_filename.lower().endswith(".stl") else output_filename + ".stl"
         mesh.export(out)
@@ -3100,6 +3213,11 @@ class MultiresIO(object):
         power=2.0,
         smooth_iterations=10,
         step_size=1,
+        lengthScale=1.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
     ):
         """Export an iso-surface of any base or derived scalar as an STL file.
 
@@ -3134,6 +3252,15 @@ class MultiresIO(object):
             for known quantities (Cp=0, CpTotal=1, CpTotalLoss=0, velocity
             magnitude=U_inf, density/pressure/qdyn from the UnitConvertor). If it
             cannot be inferred (and none is given), capping falls back to "open".
+        lengthScale : float, optional
+            Multiplies final STL vertex coordinates about the global origin only.
+            Use 1000.0 to export meter-based results as millimeter-sized STL
+            coordinates without shifting the origin.
+        remove_small_components : bool, optional
+            Remove tiny disconnected iso-surface islands created by sampled-field
+            noise/voxel artifacts. ``min_component_faces`` and
+            ``min_component_area_fraction`` control the threshold; set
+            ``keep_largest_component=True`` for aggressive cleanup.
 
         Remaining parameters control the resample grid / smoothing; see
         :meth:`_scalar_to_isosurface_stl`.
@@ -3161,6 +3288,11 @@ class MultiresIO(object):
             body_handling=body_handling,
             fill_value=fill_value,
             remove_trapped_fluid=remove_trapped_fluid,
+            lengthScale=lengthScale,
+            remove_small_components=remove_small_components,
+            min_component_faces=min_component_faces,
+            min_component_area_fraction=min_component_area_fraction,
+            keep_largest_component=keep_largest_component,
         )
 
     def to_isosurface_stl_time_average(
@@ -3183,6 +3315,11 @@ class MultiresIO(object):
         power=2.0,
         smooth_iterations=10,
         step_size=1,
+        lengthScale=1.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
     ):
         """Export a time-averaged iso-surface of any accumulated base/derived scalar.
 
@@ -3226,4 +3363,9 @@ class MultiresIO(object):
             body_handling=body_handling,
             fill_value=fill_value,
             remove_trapped_fluid=remove_trapped_fluid,
+            lengthScale=lengthScale,
+            remove_small_components=remove_small_components,
+            min_component_faces=min_component_faces,
+            min_component_area_fraction=min_component_area_fraction,
+            keep_largest_component=keep_largest_component,
         )
