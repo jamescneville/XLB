@@ -545,7 +545,7 @@ wp.clear_kernel_cache()
 wp.config.quiet = True
 
 def prep_inputs(input_file):
-    version = '1.0'
+    version = '2027.0'
     start_time = time.time()
     f = open(input_file)
     jsonfile = json.load(f)
@@ -1908,51 +1908,6 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
 
         return clipped0, clipped1
 
-    def bounds_axis_aligned(axis, origin, width, height):
-        """
-        Kept for compatibility/debugging.
-
-        This computes normalized image-space bounds for an axis-aligned slice.
-        The current rendering path pins width/height/width_vec/height_vec instead,
-        so this is not used by default.
-        """
-        ox, oy, oz = map(float, origin)
-
-        if width <= 0.0 or height <= 0.0:
-            return None
-
-        if axis == "X":
-            # X-normal plane: image axes are Y and Z.
-            u0 = (oy - domain_min[1]) / dom_extent[1]
-            u1 = (oy + width - domain_min[1]) / dom_extent[1]
-            v0 = (oz - domain_min[2]) / dom_extent[2]
-            v1 = (oz + height - domain_min[2]) / dom_extent[2]
-
-        elif axis == "Y":
-            # Y-normal plane: image axes are X and Z.
-            u0 = (ox - domain_min[0]) / dom_extent[0]
-            u1 = (ox + width - domain_min[0]) / dom_extent[0]
-            v0 = (oz - domain_min[2]) / dom_extent[2]
-            v1 = (oz + height - domain_min[2]) / dom_extent[2]
-
-        elif axis == "Z":
-            # Z-normal plane: image axes are X and Y.
-            u0 = (ox - domain_min[0]) / dom_extent[0]
-            u1 = (ox + width - domain_min[0]) / dom_extent[0]
-            v0 = (oy - domain_min[1]) / dom_extent[1]
-            v1 = (oy + height - domain_min[1]) / dom_extent[1]
-
-        else:
-            raise ValueError(f"Unknown axis: {axis}")
-
-        u0, u1 = clamp01(u0), clamp01(u1)
-        v0, v1 = clamp01(v0), clamp01(v1)
-
-        if (u1 - u0) <= 1e-6 or (v1 - v0) <= 1e-6:
-            return None
-
-        return (u0, u1, v0, v1)
-
     axis_to_normal = {
         "X": (1, 0, 0),
         "Y": (0, 1, 0),
@@ -2078,7 +2033,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     #   "velocityFactor": number
     #   "velocityColorMap": string
     # -------------------------------------------------------------------------
-    if slice_enabled("velocity"):
+    if slice_enabled("velocity", default=True):
         velocity_keys = sorted_component_keys("velocity")
 
         if not velocity_keys:
@@ -2134,10 +2089,10 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     #   default max
     # -------------------------------------------------------------------------
     scalar_slice_specs = (
-        ("pressure", "pressure", "pressure", 101000.0, 102000.0),
+        ("pressure", "pressure", "pressure", 101300.0, 101800.0),
         ("cp", "Cp", "Cp", -1.0, 1.0),
-        ("cptotal", "CpTotal", "CpTotal", -0.5, 0.5),
-        ("cptotalloss", "CpTotalLoss", "CpTotalLoss", 0.0, 0.6),
+        ("cptotal", "CpTotal", "CpTotal", 0.4, 1.0),
+        ("cptotalloss", "CpTotalLoss", "CpTotalLoss", 0.0, 0.8),
     )
 
     for control_key, avg_base_name, output_field_name, default_min, default_max in scalar_slice_specs:
@@ -2635,18 +2590,20 @@ def solve(
                 smooth_iterations=2,
                 smooth_relaxation=0.20,
             )
-        filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
-        iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
-        h5exporter.to_isosurface_stl_time_average(
-                output_filename=filename,
-                field_base_name=jsonfile['settings']['isoQuantity'],
-                iso_value=float(jsonfile['settings']['isoValue']),
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=jsonfile['settings']['isoGrid'],
-                lengthScale=1000
-            )
+        iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
+        if isinstance(iso_quantity, str) and iso_quantity.strip():
+            filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
+            iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
+            h5exporter.to_isosurface_stl_time_average(
+                    output_filename=filename,
+                    field_base_name=jsonfile['settings']['isoQuantity'],
+                    iso_value=float(jsonfile['settings']['isoValue']),
+                    bc_mask_neon=sim.bc_mask,
+                    keep_state=True,
+                    bounds=iso_region,
+                    grid_resolution=jsonfile['settings']['isoGrid'],
+                    lengthScale=jsonfile['settings']['isoScale']
+                )
 
         jsonfile['cd'] = avg_cd
         jsonfile['avg_cl'] = avg_cl
@@ -2695,18 +2652,20 @@ def solve(
             wp.synchronize()
             scm_results_available() 
 
-        filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
-        iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
-        h5exporter.to_isosurface_stl_time_average(
-                output_filename=filename,
-                field_base_name=jsonfile['settings']['isoQuantity'],
-                iso_value=float(jsonfile['settings']['isoValue']),
-                bc_mask_neon=sim.bc_mask,
-                keep_state=True,
-                bounds=iso_region,
-                grid_resolution=jsonfile['settings']['isoGrid'],
-                lengthScale = 1000,
-            )
+        iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
+        if isinstance(iso_quantity, str) and iso_quantity.strip():
+            filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
+            iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
+            h5exporter.to_isosurface_stl_time_average(
+                    output_filename=filename,
+                    field_base_name=jsonfile['settings']['isoQuantity'],
+                    iso_value=float(jsonfile['settings']['isoValue']),
+                    bc_mask_neon=sim.bc_mask,
+                    keep_state=True,
+                    bounds=iso_region,
+                    grid_resolution=jsonfile['settings']['isoGrid'],
+                    lengthScale=jsonfile['settings']['isoScale']
+                )
 
         # Save drag and lift data to CSV
         if len(drag_values) > 0:
