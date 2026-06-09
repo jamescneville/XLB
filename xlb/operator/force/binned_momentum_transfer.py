@@ -85,6 +85,15 @@ class MultiresBinnedMomentumTransfer(MultiresMomentumTransfer):
         _no_slip_id = self.no_slip_bc_instance.id
         lattice_central_index = self.velocity_set.center_index
 
+        # Lattice weights and reference (rest) density, used to remove the
+        # uniform-pressure background from the per-node momentum exchange. Over
+        # the closed body this background sums to ~0 (so the total force is
+        # unchanged), but it dominates the *partial* (cumulative) integral in the
+        # streamwise direction. Subtracting w_i * rho_ref gives a gauge-pressure
+        # based distribution, yielding a physical Cd(x) development curve.
+        _w = self.velocity_set.w
+        _rho_ref = self.compute_dtype(1.0)
+
         # Binning constants
         _bin_x0 = self.compute_dtype(self.bin_origin_x)
         _inv_bin_width = self.compute_dtype(1.0 / self.bin_width_cells)
@@ -129,7 +138,13 @@ class MultiresBinnedMomentumTransfer(MultiresMomentumTransfer):
                     m[d] = self.compute_dtype(0.0)
                     for l in range(self.velocity_set.q):
                         if _missing_mask[l] == wp.uint8(1):
-                            phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
+                            # Gauge form: subtract the rest-state populations so the
+                            # uniform-pressure background cancels per node.
+                            phi = (
+                                f_post_collision[_opp_indices[l]]
+                                + f_post_stream[l]
+                                - _rho_ref * (_w[_opp_indices[l]] + _w[l])
+                            )
                             if _c[d, _opp_indices[l]] == 1:
                                 m[d] += phi
                             elif _c[d, _opp_indices[l]] == -1:
