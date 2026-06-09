@@ -31,6 +31,13 @@ from xlb.utils.mesher import prepare_sparsity_pattern, make_cuboid_mesh, Multire
 from xlb.utils import UnitConvertor
 from xlb.utils.makemesh import generate_mesh
 from xlb.operator.force import MultiresMomentumTransfer
+from xlb.operator.force.binned_momentum_transfer import MultiresBinnedMomentumTransfer
+from xlb.operator.force.cumulative_force_utils import (
+    plot_cumulative_cl,
+    save_force_distribution_csv,
+    compute_force_statistics,
+    print_force_statistics,
+)
 from xlb.helper.initializers import CustomMultiresInitializer
 from xlb import MresPerfOptimizationType
 import httpx, logging, getopt, json
@@ -751,7 +758,9 @@ def prep_inputs(input_file):
     total_lattice_updates_per_step = stats["total_lattice_updates_per_step"]
     reference_area = stats["reference_area"]
     reference_area_physical = stats["reference_area_physical"]
-             
+    car_x_min_global = stats["car_x_min_global"]
+    car_x_max_global = stats["car_x_max_global"]
+
     wp.synchronize()
 
     
@@ -762,9 +771,29 @@ def prep_inputs(input_file):
         mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
         compute_backend=compute_backend,
     )
+    # Setup streamwise-binned momentum transfer for cumulative Cd(x)/Cl(x) along
+    # the vehicle. Bins span the car body's streamwise extent at the finest level.
+    num_force_bins = int(jsonfile['settings'].get('numForceBins', 200))
+    car_length_cells = max(1, car_x_max_global - car_x_min_global + 1)
+    force_bin_width_cells = car_length_cells / num_force_bins
+    binned_momentum_transfer = MultiresBinnedMomentumTransfer(
+        boundary_conditions[0],
+        num_bins=num_force_bins,
+        bin_origin_x=car_x_min_global,
+        bin_width_cells=force_bin_width_cells,
+        mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
+        compute_backend=compute_backend,
+    )
+
     wheel_momentum = None
+    # Binned wheel operators share the body's streamwise bin grid (wheels lie
+    # within the vehicle extent), so their contributions land in the correct
+    # bins and are simply added to the body's accumulator. Rotational wheel
+    # velocity is handled identically to wheel_momentum (same BC/fetcher).
+    binned_wheel_momentum = None
     if wheel_vertices is not None:
         wheel_momentum = []
+        binned_wheel_momentum = []
         for i, _ in enumerate(wheel_vertices):
             mt = MultiresMomentumTransfer(
                 boundary_conditions[-1-i],
@@ -772,6 +801,16 @@ def prep_inputs(input_file):
                 compute_backend=compute_backend,
             )
             wheel_momentum.append(mt)
+            binned_wheel_momentum.append(
+                MultiresBinnedMomentumTransfer(
+                    boundary_conditions[-1-i],
+                    num_bins=num_force_bins,
+                    bin_origin_x=car_x_min_global,
+                    bin_width_cells=force_bin_width_cells,
+                    mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
+                    compute_backend=compute_backend,
+                )
+            )
     
     #if settings['debug'] == True: 
         # bcMask = os.path.join(output_dir, f"{jsonfile['outputName']}_initial_bc_mask") 
@@ -857,7 +896,10 @@ def prep_inputs(input_file):
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        binned_momentum_transfer,
+        force_bin_width_cells,
+        binned_wheel_momentum,
         )
 
 
@@ -1239,6 +1281,25 @@ def plot_drag_lift(drag_values, output_dir, script_name, percentile_range=(15, 8
     plt.savefig(os.path.join(output_dir, 'drag_lift_plot.png'))
     plt.close()
 
+def output_cumulative_force(force_bins_accum, num_samples, ulb, reference_area, voxel_size, bin_width_cells, output_dir, label="XLB"):
+    """Write cumulative Cd(x)/Cl(x) PNG plots and a CSV from the accumulated
+    per-bin boundary force, then log summary statistics."""
+    if num_samples == 0:
+        print("No post-crossover samples accumulated; skipping cumulative force output.")
+        return
+    output_prefix = os.path.join(output_dir, "force_development")
+    plot_cumulative_cl(
+        force_bins_accum, ulb, reference_area, voxel_size, bin_width_cells,
+        output_prefix, num_samples=num_samples, label=label,
+    )
+    save_force_distribution_csv(
+        force_bins_accum, ulb, reference_area, voxel_size, bin_width_cells,
+        os.path.join(output_dir, "force_development.csv"), num_samples=num_samples,
+    )
+    stats = compute_force_statistics(force_bins_accum, ulb, reference_area, num_samples=num_samples)
+    print_force_statistics(stats)
+
+
 def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, level_data, actual_num_levels, sparsity_pattern, boundary_conditions, voxel_size, wheel_ids=[]):
     """
     Compute active/solid voxels, totals, lattice updates, and reference area based on simulation data.
@@ -1276,11 +1337,19 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
     else:
         is_target_voxel = bc_mask_finest == 255
     
-    solid_voxels_indices = active_indices_finest[is_target_voxel]    
+    solid_voxels_indices = active_indices_finest[is_target_voxel]
     unique_jk = np.unique(solid_voxels_indices[:, 1:3], axis=0)
     reference_area = unique_jk.shape[0]
-    
+
     reference_area_physical = reference_area * (voxel_size ** 2)
+
+    # Streamwise (x) extent of the car body at the finest level, expressed in the
+    # global finest-index frame used by wp.neon_get_x (local index + finest origin).
+    # Used to bin the boundary force along the vehicle length for cumulative
+    # Cd(x)/Cl(x) plots.
+    finest_origin_x = int(level_data[0][2][0])
+    car_x_min_global = int(solid_voxels_indices[:, 0].min()) + finest_origin_x
+    car_x_max_global = int(solid_voxels_indices[:, 0].max()) + finest_origin_x
 
     # -------------------------------------------------------------------------
     # ALTERNATE (faster) reference-area method, kept commented for reference.
@@ -1303,7 +1372,9 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
         "total_voxels": total_voxels,
         "total_lattice_updates_per_step": total_lattice_updates_per_step,
         "reference_area": reference_area,
-        "reference_area_physical": reference_area_physical
+        "reference_area_physical": reference_area_physical,
+        "car_x_min_global": car_x_min_global,
+        "car_x_max_global": car_x_max_global,
     }
 
 def save_slices1(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize):
@@ -2482,9 +2553,12 @@ def solve(
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        binned_momentum_transfer,
+        force_bin_width_cells,
+        binned_wheel_momentum,
         ):
-    
+
     # -------------------------- Simulation Loop --------------------------
     wp.synchronize()
     print(f"\n*******\nSolver Started\n*******\n")
@@ -2494,6 +2568,9 @@ def solve(
     steps_since_last_print = 0
     time_out = False
     drag_values = []
+    # Accumulator for streamwise-binned boundary force (post-crossover average)
+    force_bins_accum = np.zeros((binned_momentum_transfer.num_bins, 3), dtype=np.float64)
+    force_bins_samples = 0
     
     # Calculate print and file output intervals
     print_interval = max(1, int(num_steps * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))
@@ -2538,6 +2615,11 @@ def solve(
                 )
                 if step >= crossover_step:
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
+                    force_bins_accum += binned_momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
+                    if binned_wheel_momentum is not None:
+                        for bwm in binned_wheel_momentum:
+                            force_bins_accum += bwm(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
+                    force_bins_samples += 1
                 wp.synchronize()
                 total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
                 MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
@@ -2576,6 +2658,7 @@ def solve(
                     fd.write(f"{step},{cd},{cl}\n")
 
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
+            output_cumulative_force(force_bins_accum, force_bins_samples, ulb, reference_area, voxel_size, force_bin_width_cells, output_dir, label=jsonfile['outputName'])
 
             # Calculate and print average Cd and Cl for the last cutover%
             drag_values_array = np.array(drag_values)
@@ -2676,8 +2759,13 @@ def solve(
             if (step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)) or time_out:
                     print(f"Step {step} completed out of {num_steps}")
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                    
-                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)              
+                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
+                    force_bins_accum += binned_momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
+                    if binned_wheel_momentum is not None:
+                        for bwm in binned_wheel_momentum:
+                            force_bins_accum += bwm(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
+                    force_bins_samples += 1
                     wp.synchronize()
                     scm_results_available() 
 
@@ -2715,6 +2803,7 @@ def solve(
                 for step, cd, cl in drag_values:
                     fd.write(f"{step},{cd},{cl}\n")
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
+            output_cumulative_force(force_bins_accum, force_bins_samples, ulb, reference_area, voxel_size, force_bin_width_cells, output_dir, label=jsonfile['outputName'])
 
             # Calculate and print average Cd and Cl after crossover step
             drag_values_array = np.array(drag_values)
