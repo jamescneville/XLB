@@ -2574,12 +2574,15 @@ def solve(
         h5exporter.to_hdf5_time_average(filename, compression="gzip", compression_opts=0, keep_state=True)
         for surf_field in ("velocity", "pressure", "Cp", "CpTotalLoss"):
             filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surf_field}")
+            usd_clim, usd_cmap = MultiresIO.usd_color_spec(surf_field, jsonfile)
             h5exporter.to_surface_vtk_time_average(
                 output_filename=filename,
                 surface_mesh_filename=surface_mesh_for_vtk,
                 field_base_name=surf_field,
                 component=None,
                 keep_state=True,
+                usd_clim=usd_clim,
+                usd_cmap=usd_cmap,
                 sample_dx=voxel_size,
                 shell_factors=(2.50, ),
                 k=8,

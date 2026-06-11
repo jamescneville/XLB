@@ -2587,7 +2587,275 @@ class MultiresIO(object):
         # Single disk write
         with open(vtk_filename, "w") as f:
             f.write(buf.getvalue())
-            
+
+    # ------------------------------------------------------------------
+    # USD (OpenUSD .usda) surface export
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_cmap(cmap):
+        """Fetch a matplotlib colormap across matplotlib versions."""
+        import matplotlib
+
+        try:
+            return matplotlib.colormaps[cmap]  # matplotlib >= 3.5
+        except (AttributeError, KeyError):
+            import matplotlib.cm as cm
+
+            return cm.get_cmap(cmap)
+
+    @staticmethod
+    def _scalar_to_rgb(values, cmap="turbo", clim=None):
+        """Map a 1-D scalar array to an (N, 3) float32 RGB array in [0, 1].
+
+        Uses matplotlib's colormaps when available (the main solver already
+        depends on matplotlib); falls back to a simple blue-white-red ramp so
+        the USD export never hard-fails on a missing colormap backend. Returns
+        ``(rgb, (vmin, vmax))`` so callers can report the range that was baked in.
+        """
+        values = np.asarray(values, dtype=np.float64).ravel()
+        finite = np.isfinite(values)
+
+        if clim is not None:
+            vmin, vmax = float(clim[0]), float(clim[1])
+        elif finite.any():
+            vmin = float(np.min(values[finite]))
+            vmax = float(np.max(values[finite]))
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1.0
+
+        t = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
+        t[~finite] = 0.0
+
+        try:
+            rgb = np.asarray(MultiresIO._get_cmap(cmap)(t)[:, :3], dtype=np.float32)
+        except Exception:
+            # Blue (low) -> white (mid) -> red (high) fallback.
+            r = np.clip(2.0 * t, 0.0, 1.0)
+            b = np.clip(2.0 * (1.0 - t), 0.0, 1.0)
+            g = 1.0 - np.abs(2.0 * t - 1.0)
+            rgb = np.stack([r, g, b], axis=1).astype(np.float32)
+
+        return rgb, (vmin, vmax)
+
+    @staticmethod
+    def _write_colormap_texture(png_path, cmap="turbo", width=256, height=8):
+        """Write a horizontal colormap ramp PNG used as the surface-field texture.
+
+        Column ``i`` holds ``cmap(i / (width - 1))`` so that a UV coordinate of
+        ``u = (value - vmin) / (vmax - vmin)`` samples the matching colour. The
+        ramp is constant vertically (``v`` is ignored), so a few rows are enough.
+        Falls back to a blue-white-red ramp if matplotlib is unavailable.
+        """
+        t = np.linspace(0.0, 1.0, int(width))
+        try:
+            row = np.asarray(MultiresIO._get_cmap(cmap)(t)[:, :3], dtype=np.float32)
+        except Exception:
+            r = np.clip(2.0 * t, 0.0, 1.0)
+            b = np.clip(2.0 * (1.0 - t), 0.0, 1.0)
+            g = 1.0 - np.abs(2.0 * t - 1.0)
+            row = np.stack([r, g, b], axis=1).astype(np.float32)
+
+        img = np.repeat(row[None, :, :], int(height), axis=0)
+
+        try:
+            import matplotlib.image as mpimg
+
+            mpimg.imsave(png_path, img)
+        except Exception:
+            # Minimal PNG writer fallback via PIL if matplotlib's saver is absent.
+            from PIL import Image
+
+            Image.fromarray((img * 255.0 + 0.5).astype(np.uint8)).save(png_path)
+        return png_path
+
+    @staticmethod
+    def _usd_vec_array(arr, ncomp):
+        """Format an (N, ncomp) float array as a USD tuple array body: '(a, b, c), ...'."""
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1, ncomp)
+        cols = [np.char.mod("%.6g", arr[:, i]) for i in range(ncomp)]
+        joined = cols[0]
+        for c in cols[1:]:
+            joined = np.char.add(np.char.add(joined, ", "), c)
+        rows = np.char.add(np.char.add("(", joined), ")")
+        return ", ".join(rows.tolist())
+
+    @staticmethod
+    def _usd_scalar_array(arr, fmt="%.6g"):
+        """Format a 1-D array as a USD scalar array body: 'a, b, c'."""
+        arr = np.asarray(arr).ravel()
+        return ", ".join(np.char.mod(fmt, arr).tolist())
+
+    def _write_polydata_usd(
+        self,
+        usd_filename,
+        vertices,
+        faces,
+        point_data=None,
+        cell_data=None,
+        color_field=None,
+        cmap="turbo",
+        clim=None,
+        uniform_color=None,
+        up_axis="Z",
+        meters_per_unit=1.0,
+        prim_name="surface",
+    ):
+        """Write a triangle mesh + scalar fields to an OpenUSD ASCII (.usda) file.
+
+        Mirrors :meth:`_write_polydata_vtk` but emits USD that Autodesk VRED (and
+        other USD-aware tools) imports natively. Every entry in ``point_data`` /
+        ``cell_data`` is written as a primvar (``vertex`` / ``uniform``
+        interpolation respectively). ``color_field`` names a 1-D scalar in
+        ``point_data`` that is additionally baked into a per-vertex
+        ``primvars:displayColor`` via ``cmap`` so the result renders in colour
+        immediately without a shader network. For Autodesk VRED, which ignores
+        ``displayColor`` vertex primvars on import, the field is also baked into a
+        colormap texture sampled through a ``UsdPreviewSurface`` material via
+        per-vertex UV (``st``) coordinates.
+        """
+        import io
+        import os
+        import re
+
+        vertices = np.asarray(vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        point_data = point_data or {}
+        cell_data = cell_data or {}
+
+        n_verts = len(vertices)
+        n_faces = len(faces)
+
+        usd_filename = usd_filename if usd_filename.endswith((".usda", ".usd")) else usd_filename + ".usda"
+
+        def sanitize(name):
+            s = re.sub(r"[^0-9a-zA-Z_]", "_", str(name))
+            return ("_" + s) if (not s or s[0].isdigit()) else s
+
+        buf = io.StringIO()
+        buf.write("#usda 1.0\n")
+        buf.write("(\n")
+        buf.write(f'    defaultPrim = "{prim_name}"\n')
+        buf.write(f"    metersPerUnit = {float(meters_per_unit)}\n")
+        buf.write(f'    upAxis = "{up_axis}"\n')
+        buf.write(")\n\n")
+
+        buf.write(f'def Mesh "{prim_name}"\n')
+        buf.write("{\n")
+
+        # Topology
+        buf.write(f"    int[] faceVertexCounts = [{self._usd_scalar_array(np.full(n_faces, 3, dtype=np.int32), fmt='%d')}]\n")
+        buf.write(f"    int[] faceVertexIndices = [{self._usd_scalar_array(faces.ravel(), fmt='%d')}]\n")
+        buf.write(f"    point3f[] points = [{self._usd_vec_array(vertices, 3)}]\n")
+        buf.write('    uniform token subdivisionScheme = "none"\n')
+
+        # Colour from the chosen scalar field, baked as a colormap texture +
+        # per-vertex UVs + a UsdPreviewSurface material (what VRED renders), plus
+        # displayColor as a fallback for viewers that honour vertex colours.
+        texture_field = color_field is not None and color_field in point_data
+        if texture_field:
+            field = np.asarray(point_data[color_field], dtype=np.float32)
+            if field.ndim == 2 and field.shape[1] == 3:
+                # Vector field -> colour by magnitude.
+                field = np.linalg.norm(field, axis=1)
+            field = field.ravel()
+
+            finite = np.isfinite(field)
+            if clim is not None:
+                vmin, vmax = float(clim[0]), float(clim[1])
+            elif finite.any():
+                vmin, vmax = float(np.min(field[finite])), float(np.max(field[finite]))
+            else:
+                vmin, vmax = 0.0, 1.0
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                vmax = vmin + 1.0
+
+            # UV: u = normalized value -> column in the ramp, v = mid-row.
+            u = np.clip((field - vmin) / (vmax - vmin), 0.0, 1.0)
+            u[~finite] = 0.0
+            st = np.column_stack([u, np.full_like(u, 0.5)])
+
+            # Write the colormap ramp PNG next to the USD file.
+            tex_name = os.path.splitext(os.path.basename(usd_filename))[0] + "_cmap.png"
+            tex_path = os.path.join(os.path.dirname(usd_filename), tex_name)
+            self._write_colormap_texture(tex_path, cmap=cmap)
+
+            # displayColor fallback for displayColor-aware viewers.
+            rgb, _ = self._scalar_to_rgb(field, cmap=cmap, clim=(vmin, vmax))
+            buf.write(f"    color3f[] primvars:displayColor = [{self._usd_vec_array(rgb, 3)}] (\n")
+            buf.write('        interpolation = "vertex"\n')
+            buf.write("    )\n")
+
+            buf.write(f"    texCoord2f[] primvars:st = [{self._usd_vec_array(st, 2)}] (\n")
+            buf.write('        interpolation = "vertex"\n')
+            buf.write("    )\n")
+            buf.write(f"    rel material:binding = </{prim_name}/Material>\n")
+
+            print(f"\tUSD field '{color_field}' textured via {tex_name} (cmap={cmap}, range=[{vmin:.4g}, {vmax:.4g}])")
+        elif uniform_color is not None:
+            r, g, b = (float(c) for c in uniform_color)
+            buf.write(f"    color3f[] primvars:displayColor = [({r:.6g}, {g:.6g}, {b:.6g})] (\n")
+            buf.write('        interpolation = "constant"\n')
+            buf.write("    )\n")
+
+        # Raw scalar/vector primvars (point data -> vertex, cell data -> uniform).
+        for interp, data, expected in (("vertex", point_data, n_verts), ("uniform", cell_data, n_faces)):
+            for name, arr in data.items():
+                arr = np.asarray(arr, dtype=np.float32)
+                pv = sanitize(name)
+                if arr.ndim == 1:
+                    buf.write(f"    float[] primvars:{pv} = [{self._usd_scalar_array(arr)}] (\n")
+                elif arr.ndim == 2 and arr.shape[1] == 3:
+                    buf.write(f"    float3[] primvars:{pv} = [{self._usd_vec_array(arr, 3)}] (\n")
+                else:
+                    raise ValueError(f"Unsupported primvar shape for '{name}': {arr.shape}")
+                buf.write(f'        interpolation = "{interp}"\n')
+                buf.write("    )\n")
+
+        # UsdPreviewSurface material that samples the colormap texture using the
+        # 'st' primvar. This is the path VRED honours for baked field colours.
+        if texture_field:
+            buf.write(f'    def Material "Material"\n')
+            buf.write("    {\n")
+            buf.write("        token outputs:surface.connect = "
+                      f"</{prim_name}/Material/Shader.outputs:surface>\n")
+            buf.write('        def Shader "Shader"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdPreviewSurface"\n')
+            buf.write("            color3f inputs:diffuseColor.connect = "
+                      f"</{prim_name}/Material/Tex.outputs:rgb>\n")
+            buf.write("            float inputs:roughness = 1\n")
+            buf.write("            float inputs:metallic = 0\n")
+            buf.write("            token outputs:surface\n")
+            buf.write("        }\n")
+            buf.write('        def Shader "Tex"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdUVTexture"\n')
+            buf.write(f"            asset inputs:file = @./{tex_name}@\n")
+            buf.write("            float2 inputs:st.connect = "
+                      f"</{prim_name}/Material/Reader.outputs:result>\n")
+            buf.write('            token inputs:wrapS = "clamp"\n')
+            buf.write('            token inputs:wrapT = "clamp"\n')
+            buf.write("            float3 outputs:rgb\n")
+            buf.write("        }\n")
+            buf.write('        def Shader "Reader"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdPrimvarReader_float2"\n')
+            buf.write('            token inputs:varname = "st"\n')
+            buf.write("            float2 outputs:result\n")
+            buf.write("        }\n")
+            buf.write("    }\n")
+
+        buf.write("}\n")
+
+        with open(usd_filename, "w") as f:
+            f.write(buf.getvalue())
+
+        print(f"\tUSD surface ({n_verts:,} verts, {n_faces:,} tris) written to {usd_filename}")
+        return usd_filename
+
     def _fields_data_to_surface_vtk(
         self,
         output_filename,
@@ -2605,9 +2873,20 @@ class MultiresIO(object):
         smooth_iterations=2,
         smooth_relaxation=0.25,
         export_debug_arrays=True,
+        usd_clim=None,
+        usd_cmap=None,
     ):
         tic_write = time.perf_counter()
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
+
+        # Resolve the USD colour range / colormap from the field's conventions
+        # when the caller did not pass them explicitly. Keeps the standard ranges
+        # (velocity 0..1.5*U_inf, Cp -1..1, CpTotal 0.4..1, CpTotalLoss 0..0.8,
+        # pressure 101300..101800 Pa) baked in without the caller needing to know.
+        if usd_clim is None:
+            usd_clim = self._infer_surface_field_clim(field_base_name, component=component)
+        if usd_cmap is None:
+            usd_cmap = self._infer_surface_field_cmap(field_base_name)
 
         mesh = surface_mesh_filename
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -2661,7 +2940,22 @@ class MultiresIO(object):
             point_data=point_data,
             cell_data=None,
         )
-        
+
+        # Also emit USD (.usda) alongside the VTK for Autodesk VRED and other
+        # USD-aware tools. The mapped scalar is baked into displayColor so it
+        # renders in colour, and kept as a raw primvar for downstream use.
+        usd_filename = vtk_filename[:-4] + ".usda" if vtk_filename.endswith(".vtk") else vtk_filename + ".usda"
+        self._write_polydata_usd(
+            usd_filename,
+            vertices,
+            faces,
+            point_data=point_data,
+            cell_data=None,
+            color_field=field_name,
+            cmap=usd_cmap,
+            clim=usd_clim,
+        )
+
         toc_write = time.perf_counter()
         print(f"\tSurface field written to {vtk_filename} in {toc_write - tic_write:0.1f} seconds")
         return mapped
@@ -2683,6 +2977,8 @@ class MultiresIO(object):
         smooth_iterations=2,
         smooth_relaxation=0.2,
         export_debug_arrays=True,
+        usd_clim=None,
+        usd_cmap=None,
     ):
         fields_data = self.get_fields_data(field_neon_dict)
         return self._fields_data_to_surface_vtk(
@@ -2701,6 +2997,8 @@ class MultiresIO(object):
             smooth_iterations=smooth_iterations,
             smooth_relaxation=smooth_relaxation,
             export_debug_arrays=export_debug_arrays,
+            usd_clim=usd_clim,
+            usd_cmap=usd_cmap,
         )
 
     def to_surface_vtk_time_average(
@@ -2720,6 +3018,8 @@ class MultiresIO(object):
         smooth_iterations=2,
         smooth_relaxation=0.2,
         export_debug_arrays=True,
+        usd_clim=None,
+        usd_cmap=None,
     ):
         avg_fields = self.finalize_time_average(keep_state=keep_state)
         return self._fields_data_to_surface_vtk(
@@ -2738,8 +3038,10 @@ class MultiresIO(object):
             smooth_iterations=smooth_iterations,
             smooth_relaxation=smooth_relaxation,
             export_debug_arrays=export_debug_arrays,
+            usd_clim=usd_clim,
+            usd_cmap=usd_cmap,
         )
-    
+
     # ------------------------------------------------------------------
     # Iso-surface STL export (generic over any base or derived scalar)
     # ------------------------------------------------------------------
@@ -2754,6 +3056,97 @@ class MultiresIO(object):
             )
         bc = np.asarray(fields_data[bc_mask_key])
         return np.rint(bc).astype(np.int32) == int(BC_SOLID)
+
+    def _infer_surface_field_clim(self, field_base_name, component=None):
+        """Default colour range (vmin, vmax) for a surface field's USD export.
+
+        Mirrors the fixed ranges used for the slice images so the baked surface
+        colours are directly comparable:
+          - velocity (magnitude): 0 .. 1.5 * free-stream speed (the slice
+            ``velocityFactor`` default), via the UnitConvertor.
+          - Cp: -1 .. 1, CpTotal: 0.4 .. 1, CpTotalLoss: 0 .. 0.8 (dimensionless).
+          - pressure: 101300 .. 101800 Pa.
+        Returns None (auto-range from the data) when no convention applies, e.g.
+        a single signed velocity component whose sign is flow-orientation dependent.
+        """
+        name = str(field_base_name).lower()
+
+        if name == "cp":
+            return (-1.0, 1.0)
+        if name == "cptotal":
+            return (0.4, 1.0)
+        if name == "cptotalloss":
+            return (0.0, 0.8)
+        if name == "pressure":
+            return (101300.0, 101800.0)
+
+        if name == "velocity":
+            # Magnitude scales with the free-stream speed; a single signed
+            # component is direction-dependent, so leave it auto-ranged.
+            if component is not None:
+                return None
+            uc = self.unit_convertor
+            u_inf = getattr(uc, "velocity_phys_unit", None) if uc is not None else None
+            if u_inf:
+                return (0.0, 1.5 * abs(float(u_inf)))
+            return None
+
+        return None
+
+    def _infer_surface_field_cmap(self, field_base_name):
+        """Default colormap for a surface field's USD export.
+
+        Diverging map for the signed pressure coefficients (centred at the
+        free-stream reference), a perceptually-uniform sequential map otherwise.
+        """
+        name = str(field_base_name).lower()
+        if name in ("cp", "cptotalloss"):
+            return "coolwarm"
+        return "turbo"
+
+    @staticmethod
+    def usd_color_spec(field_base_name, jsonfile):
+        """Resolve (clim, cmap) for a surface field's USD export from a job JSON.
+
+        Reads the same ``jsonfile['slices']`` conventions used for the slice
+        images so the baked USD surface colours match the slices:
+          - velocity: [0, InletBC.x * velocityFactor]
+          - pressure/cp/cptotal/cptotalloss: ``<key>Min`` / ``<key>Max``
+          - colormap: ``<key>ColorMap``
+        Any value not present in the JSON is returned as None so the writer falls
+        back to its built-in default (see :meth:`_infer_surface_field_clim` /
+        :meth:`_infer_surface_field_cmap`). Intended to be called inline at the
+        export site, e.g.::
+
+            clim, cmap = MultiresIO.usd_color_spec(surf_field, jsonfile)
+            h5exporter.to_surface_vtk_time_average(..., usd_clim=clim, usd_cmap=cmap)
+        """
+        s = (jsonfile or {}).get("slices", {})
+        name = str(field_base_name).lower()
+
+        cmap = s.get(f"{name}ColorMap")  # None -> writer default
+
+        clim = None
+        if name == "velocity":
+            velocity_factor = float(s.get("velocityFactor", 1.5))
+            try:
+                u_inf = abs(float(jsonfile["InletBC"]["x"]))
+            except (KeyError, TypeError, ValueError):
+                u_inf = None
+            if u_inf:
+                clim = (0.0, u_inf * velocity_factor)
+        else:
+            defaults = {
+                "pressure": (101300.0, 101800.0),
+                "cp": (-1.0, 1.0),
+                "cptotal": (0.4, 1.0),
+                "cptotalloss": (0.0, 0.8),
+            }
+            if name in defaults:
+                dmin, dmax = defaults[name]
+                clim = (float(s.get(f"{name}Min", dmin)), float(s.get(f"{name}Max", dmax)))
+
+        return clim, cmap
 
     def _infer_ambient_fill(self, field_base_name, component=None):
         """Free-stream/ambient value used to cap an iso-surface at the body.
@@ -3191,6 +3584,21 @@ class MultiresIO(object):
             f"\tIso-surface ({len(mesh.vertices):,} verts, {len(mesh.faces):,} tris) written to {out} "
             f"in {time.perf_counter() - tic:.1f} s"
         )
+
+        # Also emit USD (.usda) alongside the STL for Autodesk VRED. The iso-surface
+        # is a single iso-value contour with no per-vertex scalar to map, so it gets
+        # a uniform displayColor rather than a baked colormap.
+        usd_out = out[:-4] + ".usda"
+        self._write_polydata_usd(
+            usd_out,
+            np.asarray(mesh.vertices, dtype=np.float32),
+            np.asarray(mesh.faces, dtype=np.int32),
+            point_data=None,
+            cell_data=None,
+            uniform_color=(0.6, 0.6, 0.85),
+            prim_name="isosurface",
+        )
+
         return mesh
 
     def to_isosurface_stl(
