@@ -2581,6 +2581,7 @@ def solve(
                 field_base_name=surf_field,
                 component=None,
                 keep_state=True,
+                bc_mask_neon=sim.bc_mask,
                 usd_clim=usd_clim,
                 usd_cmap=usd_cmap,
                 sample_dx=voxel_size,

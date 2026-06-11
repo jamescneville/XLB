@@ -2382,12 +2382,23 @@ class MultiresIO(object):
         max_distance=None,
         half_space_tolerance=0.25,
         aggregate="median",
+        tree=None,
+        centroids=None,
     ):
-        
+
         sample_dx = float(sample_dx)
         surface_points = np.asarray(surface_points, dtype=np.float32)
         surface_normals = np.asarray(surface_normals, dtype=np.float32)
         cell_values = np.asarray(cell_values, dtype=np.float32)
+
+        # Sampling source: an explicit (tree, centroids, cell_values) triple lets
+        # callers restrict sampling to fluid cells only, so the invalid data held
+        # in the solid shell voxels intersecting the body never contributes.
+        # Default to the all-cells tree/centroids for backward compatibility.
+        if tree is None:
+            tree = self.kd_tree
+        if centroids is None:
+            centroids = self.centroids
 
         surface_normals /= np.maximum(np.linalg.norm(surface_normals, axis=1, keepdims=True), 1e-20)
 
@@ -2402,15 +2413,14 @@ class MultiresIO(object):
         base_points_flat = np.repeat(surface_points, n_shells, axis=0)
         normals_flat = np.repeat(surface_normals, n_shells, axis=0)
 
-        tree = self.kd_tree 
-        kk = min(int(k), len(self.centroids))
+        kk = min(int(k), len(centroids))
         distances, indices = tree.query(queries_flat, k=kk)
 
         if kk == 1:
             distances = distances[:, None]
             indices = indices[:, None]
 
-        neighbor_points = self.centroids[indices]
+        neighbor_points = centroids[indices]
         neighbor_values = cell_values[indices]
 
         signed = np.einsum("qki,qi->qk", neighbor_points - base_points_flat[:, None, :], normals_flat)
@@ -2458,11 +2468,39 @@ class MultiresIO(object):
         max_distance=None,
         half_space_tolerance=0.25,
         aggregate="median",
+        solid_mask=None,
+        faces=None,
+        side_smooth_iterations=0,
+        side_smooth_relaxation=0.5,
+        selector_values=None,
     ):
+        # When a solid mask is supplied, restrict the sampling source to fluid
+        # cells. The solid shell voxels (those the body mesh intersects) hold
+        # invalid, un-updated data; including them is the dominant cause of the
+        # "splotchy" surface field, because they are the nearest cells to the
+        # surface. Build the fluid-only tree once and share it across both sides.
+        tree = None
+        centroids = None
+        sample_values = cell_values
+        selector_sample = selector_values
+        if solid_mask is not None:
+            solid_mask = np.asarray(solid_mask, dtype=bool)
+            assert solid_mask.shape[0] == self.centroids.shape[0], (
+                "solid_mask must align with centroids."
+            )
+            fluid = ~solid_mask
+            if not fluid.any():
+                raise ValueError("solid_mask excludes all cells; no fluid data to sample.")
+            centroids = np.ascontiguousarray(self.centroids[fluid])
+            sample_values = np.ascontiguousarray(np.asarray(cell_values, dtype=np.float32)[fluid])
+            tree = cKDTree(centroids)
+            if selector_values is not None:
+                selector_sample = np.ascontiguousarray(np.asarray(selector_values, dtype=np.float32)[fluid])
+
         plus_vals, plus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
             surface_normals=surface_normals,
-            cell_values=cell_values,
+            cell_values=sample_values,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
             k=k,
@@ -2470,12 +2508,14 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            tree=tree,
+            centroids=centroids,
         )
 
         minus_vals, minus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
             surface_normals=-surface_normals,
-            cell_values=cell_values,
+            cell_values=sample_values,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
             k=k,
@@ -2483,9 +2523,67 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            tree=tree,
+            centroids=centroids,
         )
 
-        use_minus = ~(minus_score > plus_score)
+        # Decide which side to trust per vertex.
+        #
+        # Preferred signal (selector_values, normally velocity magnitude): the
+        # exterior of the body carries real flow while the interior/trapped fluid
+        # is ~stagnant, so the higher-|u| side is the outside. This single signal
+        # is reused for every quantity, so pressure/Cp never independently flip to
+        # the wrong side. side_pref > 0 means the +normal side has more flow.
+        #
+        # Optional spatial regularization (side_smooth_iterations > 0) smooths the
+        # signed preference over the mesh graph so isolated vertices can't flip
+        # against their neighbours. Off by default.
+        #
+        # Fallback (no selector / no velocity field): the original per-field
+        # score-based choice.
+        if selector_sample is not None:
+            sel_plus, _ = self._sample_surface_scalar_one_side(
+                surface_points=surface_points,
+                surface_normals=surface_normals,
+                cell_values=selector_sample,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                tree=tree,
+                centroids=centroids,
+            )
+            sel_minus, _ = self._sample_surface_scalar_one_side(
+                surface_points=surface_points,
+                surface_normals=-surface_normals,
+                cell_values=selector_sample,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                tree=tree,
+                centroids=centroids,
+            )
+            side_pref = (sel_plus - sel_minus).astype(np.float32)
+
+            if faces is not None and side_smooth_iterations > 0:
+                side_pref = self._smooth_surface_scalar(
+                    side_pref,
+                    faces,
+                    iterations=side_smooth_iterations,
+                    relaxation=side_smooth_relaxation,
+                )
+
+            use_minus = side_pref < 0.0
+        else:
+            # Original baseline selection (the version that worked well).
+            use_minus = ~(minus_score > plus_score)
 
         mapped = plus_vals.copy()
         mapped[use_minus] = minus_vals[use_minus]
@@ -2875,9 +2973,34 @@ class MultiresIO(object):
         export_debug_arrays=True,
         usd_clim=None,
         usd_cmap=None,
+        solid_mask=None,
+        side_selector="velocity",
     ):
         tic_write = time.perf_counter()
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
+
+        # Side selection signal shared across all quantities. With
+        # side_selector="velocity" the +normal/-normal choice is driven by which
+        # side carries more flow (the exterior), not by the per-field score, so
+        # pressure/Cp inherit a consistent side instead of flipping on their own.
+        # Falls back to the score signal when velocity isn't in fields_data.
+        selector_values = None
+        if side_selector == "velocity":
+            vel_keys = sorted(
+                (kk for kk in fields_data if kk.startswith("velocity_")),
+                key=lambda kk: int(kk.rsplit("_", 1)[1]),
+            )
+            if vel_keys:
+                vmag_sq = None
+                for kk in vel_keys:
+                    comp = np.asarray(fields_data[kk], dtype=np.float64)
+                    vmag_sq = comp * comp if vmag_sq is None else vmag_sq + comp * comp
+                selector_values = np.sqrt(vmag_sq).astype(np.float32)
+            else:
+                print("\tside_selector='velocity' but no velocity field present; "
+                      "falling back to per-field score selection.")
+        elif side_selector not in ("velocity", "score"):
+            raise ValueError(f"Unknown side_selector '{side_selector}' (use 'velocity' or 'score').")
 
         # Resolve the USD colour range / colormap from the field's conventions
         # when the caller did not pass them explicitly. Keeps the standard ranges
@@ -2916,6 +3039,9 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            solid_mask=solid_mask,
+            faces=faces,
+            selector_values=selector_values,
         )
         toc_write = time.perf_counter()
         print(f"\tSurface field mapped in {toc_write - tic_write:0.1f} seconds")
@@ -2979,8 +3105,15 @@ class MultiresIO(object):
         export_debug_arrays=True,
         usd_clim=None,
         usd_cmap=None,
+        exclude_solids=True,
+        side_selector="velocity",
     ):
         fields_data = self.get_fields_data(field_neon_dict)
+        # Exclude solid shell voxels from the sampling source. Their data is
+        # invalid (un-updated by the solver) and they sit closest to the surface,
+        # so leaving them in produces a splotchy field. Requires 'bc_mask' in
+        # field_neon_dict.
+        solid_mask = self._solid_mask_from_fields_data(fields_data) if exclude_solids else None
         return self._fields_data_to_surface_vtk(
             output_filename=output_filename,
             surface_mesh_filename=surface_mesh_filename,
@@ -2999,6 +3132,8 @@ class MultiresIO(object):
             export_debug_arrays=export_debug_arrays,
             usd_clim=usd_clim,
             usd_cmap=usd_cmap,
+            solid_mask=solid_mask,
+            side_selector=side_selector,
         )
 
     def to_surface_vtk_time_average(
@@ -3020,8 +3155,23 @@ class MultiresIO(object):
         export_debug_arrays=True,
         usd_clim=None,
         usd_cmap=None,
+        exclude_solids=True,
+        bc_mask_neon=None,
+        side_selector="velocity",
     ):
         avg_fields = self.finalize_time_average(keep_state=keep_state)
+        # bc_mask is not part of the time-average accumulator, so pass the static
+        # bc_mask NEON field via bc_mask_neon (e.g. sim.bc_mask) to exclude solids.
+        solid_mask = None
+        if exclude_solids:
+            if bc_mask_neon is None:
+                raise ValueError(
+                    "exclude_solids=True requires bc_mask_neon (e.g. sim.bc_mask); "
+                    "bc_mask is not part of the time-average accumulator. Pass "
+                    "exclude_solids=False to sample all cells."
+                )
+            bc_fields = self.get_fields_data({"bc_mask": bc_mask_neon})
+            solid_mask = self._solid_mask_from_fields_data(bc_fields)
         return self._fields_data_to_surface_vtk(
             output_filename=output_filename,
             surface_mesh_filename=surface_mesh_filename,
@@ -3040,6 +3190,8 @@ class MultiresIO(object):
             export_debug_arrays=export_debug_arrays,
             usd_clim=usd_clim,
             usd_cmap=usd_cmap,
+            solid_mask=solid_mask,
+            side_selector=side_selector,
         )
 
     # ------------------------------------------------------------------
