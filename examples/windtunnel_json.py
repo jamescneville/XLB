@@ -2569,19 +2569,31 @@ def solve(
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
                 
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize) 
+        
             
         filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average")
         h5exporter.to_hdf5_time_average(filename, compression="gzip", compression_opts=0, keep_state=True)
-        for surf_field in ("velocity", "pressure", "Cp", "CpTotalLoss"):
-            filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surf_field}")
+
+        surfaceField = jsonfile.get("settings", {}).get("surfaceField", "")
+        if isinstance(surfaceField, str) and surfaceField.strip():    
+            filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surfaceField}_{jsonfile['settings']['surfaceFieldColorMap']}")
+
+            if surfaceField == "velocity":
+                    cMin=0.0
+                    cMax=jsonfile['InletBC']['x'] * jsonfile['slices']['velocityFactor']
+            else:
+                cMin=jsonfile['settings']['surfaceFieldMin']
+                cMax=jsonfile['settings']['surfaceFieldMax']
+            clim = cMin, cMax
+            
             h5exporter.to_surface_vtk_time_average(
                 output_filename=filename,
                 surface_mesh_filename=surface_mesh_for_vtk,
-                field_base_name=surf_field,
+                field_base_name=surfaceField,
                 component=None,
                 keep_state=True,
                 sample_dx=voxel_size,
-                shell_factors=(2.50, ),
+                shell_factors=(1.50, ),
                 k=8,
                 power=2.0,
                 max_distance=2.0 * voxel_size,
@@ -2589,10 +2601,16 @@ def solve(
                 aggregate="median",
                 smooth_iterations=2,
                 smooth_relaxation=0.20,
+                bc_mask=sim.bc_mask,
+                export=jsonfile['settings']['surfaceFieldExport'],
+                usd_clim=clim,
+                usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
+                side_selector="velocity",
             )
+            scm_results_available() 
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
-            filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
+            filename = os.path.join(output_dir, f"average_iso")
             iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
             h5exporter.to_isosurface_stl_time_average(
                     output_filename=filename,
@@ -2604,6 +2622,7 @@ def solve(
                     grid_resolution=jsonfile['settings']['isoGrid'],
                     lengthScale=jsonfile['settings']['isoScale']
                 )
+            scm_results_available() 
 
         jsonfile['cd'] = avg_cd
         jsonfile['avg_cl'] = avg_cl
@@ -2652,9 +2671,43 @@ def solve(
             wp.synchronize()
             scm_results_available() 
 
+        surfaceField = jsonfile.get("settings", {}).get("surfaceField", "")
+        if isinstance(surfaceField, str) and surfaceField.strip():    
+            filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average_{surfaceField}_{jsonfile['settings']['surfaceFieldColorMap']}")
+            if surfaceField == "velocity":
+                    cMin=0.0
+                    cMax=jsonfile['InletBC']['x'] * jsonfile['slices']['velocityFactor']
+            else:
+                cMin=jsonfile['settings']['surfaceFieldMin']
+                cMax=jsonfile['settings']['surfaceFieldMax']
+            clim = cMin, cMax
+            
+            h5exporter.to_surface_vtk_time_average(
+                output_filename=filename,
+                surface_mesh_filename=surface_mesh_for_vtk,
+                field_base_name=surfaceField,
+                component=None,
+                keep_state=True,
+                sample_dx=voxel_size,
+                shell_factors=(1.50, ),
+                k=8,
+                power=2.0,
+                max_distance=2.0 * voxel_size,
+                half_space_tolerance=0.15,
+                aggregate="median",
+                smooth_iterations=2,
+                smooth_relaxation=0.20,
+                bc_mask=sim.bc_mask,
+                export=jsonfile['settings']['surfaceFieldExport'],
+                usd_clim=clim,
+                usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
+                side_selector="velocity",
+            )
+            scm_results_available() 
+
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
-            filename = os.path.join(output_dir, f"{jsonfile['settings']['isoQuantity']}_iso")
+            filename = os.path.join(output_dir, f"average_iso")
             iso_region = iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size)
             h5exporter.to_isosurface_stl_time_average(
                     output_filename=filename,
@@ -2666,6 +2719,7 @@ def solve(
                     grid_resolution=jsonfile['settings']['isoGrid'],
                     lengthScale=jsonfile['settings']['isoScale']
                 )
+            scm_results_available() 
 
         # Save drag and lift data to CSV
         if len(drag_values) > 0:
