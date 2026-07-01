@@ -2982,8 +2982,12 @@ class MultiresIO(object):
                 vmax = vmin + 1.0
 
             # UV: u = normalized value -> column in the ramp, v = mid-row.
-            u = np.clip((field - vmin) / (vmax - vmin), 0.0, 1.0)
-            u[~finite] = 0.0
+            # Inset the clamp to [0.005, 0.99] so clamped extremes never land exactly
+            # on the 0.0/1.0 texture edge; renderers that don't honor wrapS="clamp"
+            # (or use half-texel bilinear sampling) otherwise read u=0.0 across the
+            # wrap boundary and pick up the opposite ramp end (low-clip -> max color).
+            u = np.clip((field - vmin) / (vmax - vmin), 0.005, 0.995)
+            u[~finite] = 0.01
             st = np.column_stack([u, np.full_like(u, 0.5)])
 
             # Write the colormap ramp PNG next to the USD file.

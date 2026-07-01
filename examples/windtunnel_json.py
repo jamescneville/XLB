@@ -635,8 +635,8 @@ def prep_inputs(input_file):
                 wheel_mesh = trimesh.load_mesh(wheel, process=False)
             w+=1                
             wheel_meshes.append(wheel_mesh) 
-            del wheel_mesh
-            gc.collect()
+            #del wheel_mesh
+            #gc.collect()
         print(' Wheels Loaded....') 
         print(' Concatenate...')     
         car_mesh = trimesh.util.concatenate([body_mesh] + wheel_meshes)
@@ -652,12 +652,17 @@ def prep_inputs(input_file):
         default_backend=compute_backend,
         default_precision_policy=precision_policy,
     )
-
-    surface_mesh_for_vtk = car_mesh.copy()
+    surfaceFieldScope = jsonfile.get("settings", {}).get("surfaceFieldScope", "car")
+    if surfaceFieldScope == "car":
+        surface_mesh_for_vtk = car_mesh.copy()
+    else:
+        surface_mesh_for_vtk = body_mesh.copy()
+    scm_progress(2)
+    print(f"Progress 2%")
     level_data, body_vertices, wheel_vertices, wheel_centers, grid_shape_zip, partSize, actual_num_levels, shift, sparsity_pattern, level_origins = mesh_prep(
             voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile
         )
-  
+    
     #Material Setup
     material = jsonfile['fluid']
     density = material['density']
@@ -693,6 +698,8 @@ def prep_inputs(input_file):
         offset=-shift,
         unit_convertor=unit_convertor,
         )   
+    scm_progress(5)
+    print(f"Progress 5%")
 
     # Create grid
     grid = multires_grid_factory(
@@ -709,10 +716,11 @@ def prep_inputs(input_file):
     else:
         num_steps = int(jsonfile['settings']['iterations'])
     
-
+    
     # Setup boundary conditions
     boundary_conditions = setup_boundary_conditions(grid, level_data, body_vertices, wheel_vertices, wheel_centers, ulb, lbm_visc, grid_shape_zip, precision_policy, jsonfile, compute_backend)
-
+    scm_progress(10)
+    print(f"Progress 10%")
     # Create initializer
     initializer = CustomMultiresInitializer(
         bc_id=boundary_conditions[1].id,  # bc_outlet
@@ -742,7 +750,8 @@ def prep_inputs(input_file):
     if wheel_vertices is not None:
         for i, _ in enumerate(wheel_vertices):
             wheel_ids.append(boundary_conditions[-1-i])
-
+    
+    
     # Compute voxel statistics and reference area
     stats = compute_voxel_statistics_and_reference_area(jsonfile, sim, h5exporter, level_data, actual_num_levels, sparsity_pattern, boundary_conditions, voxel_size, wheel_ids)
     active_voxels = stats["active_voxels"]
@@ -754,7 +763,8 @@ def prep_inputs(input_file):
              
     wp.synchronize()
 
-    
+    scm_progress(15)
+    print(f"Progress 15%")
 
     # Setup momentum transfer    
     momentum_transfer = MultiresMomentumTransfer(
@@ -837,7 +847,7 @@ def prep_inputs(input_file):
         fd.write('___________________\n')
         fd.write(f'Time to initialize:   {(time.time()-start_time)/60:.2f} min\n')  
     
-  
+    gc.collect()
     solve(
         sim, 
         ulb,
@@ -888,7 +898,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
         _ = car_mesh.vertex_normals
         car_mesh.export("temp.stl")
         del car_mesh
-        gc.collect()
+       #gc.collect()
         print(' Generate Mesh...') 
         # Generate mesh using generate_mesh with ground refinement
         level_data = generate_mesh(
@@ -954,7 +964,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
                 wheel_mesh = trimesh.load_mesh(wheel_stl, process=False)
                 wheel_vertices.append(np.asarray(wheel_mesh.vertices, dtype=vertex_dtype) / vertex_dtype(voxel_size))
                 del wheel_mesh
-                gc.collect()
+                #gc.collect()
                 # print(f"DEBUG: Wheel {mesh}")
                 # print(f"  - Bounding Box Size (Model Units): {wheelSize }")
                 # print(f"  - Bounding Box Size (Lattice Units): {wheelSize / voxel_size}")
@@ -966,7 +976,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
             else:
                 wheel_vertices.append(np.asarray(mesh.vertices, dtype=vertex_dtype) / vertex_dtype(voxel_size))
                 del mesh
-                gc.collect()
+                #gc.collect()
     else:
         #No Wheels trim body as needed
         
@@ -990,7 +1000,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
         else:
             body_vertices = np.asarray(body_mesh.vertices, dtype=vertex_dtype) / vertex_dtype(voxel_size)
         del body_mesh
-        gc.collect()
+        #gc.collect()
         
 
     actual_num_levels = len(level_data)
@@ -1281,21 +1291,6 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
     reference_area = unique_jk.shape[0]
     
     reference_area_physical = reference_area * (voxel_size ** 2)
-
-    # -------------------------------------------------------------------------
-    # ALTERNATE (faster) reference-area method, kept commented for reference.
-    #
-    # Projects the solid voxels onto the YZ plane with a 2D boolean grid in
-    # O(N), avoiding the lexicographic sort that np.unique(..., axis=0) performs
-    # on the (j, k) pairs above. Produces an identical reference_area; swap in if
-    # the np.unique path becomes a bottleneck on large meshes.
-    #
-    # finest_shape = level_data[0][0].shape
-    # yz_hit = np.zeros((finest_shape[1], finest_shape[2]), dtype=bool)
-    # yz_hit[solid_voxels_indices[:, 1], solid_voxels_indices[:, 2]] = True
-    # reference_area = int(yz_hit.sum())
-    # reference_area_physical = reference_area * (voxel_size ** 2)
-    # -------------------------------------------------------------------------
 
     return {
         "active_voxels": active_voxels,
@@ -2013,7 +2008,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
 
         lo, hi = slice_minmax(control_key, default_min, default_max)
 
-        data = avg_fields[field_keys[0]].astype(np.float64, copy=False)
+        data = avg_fields[field_keys[0]].astype(np.float32, copy=False)
 
         normalized = np.clip(
             (data - lo) / (hi - lo),
@@ -2044,7 +2039,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
 
         if len(velocity_keys) > 1:
             velocity_comps = [
-                avg_fields[k].astype(np.float64, copy=False)
+                avg_fields[k].astype(np.float32, copy=False)
                 for k in velocity_keys
             ]
 
@@ -2307,7 +2302,7 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
 
             # Copy the origin so each worker owns its plane point array.
             # This avoids sharing a mutable NumPy row view across threads.
-            plane_point = np.asarray(origins[idx], dtype=np.float64).copy()
+            plane_point = np.asarray(origins[idx], dtype=np.float32).copy()
 
             slice_tasks.append(
                 (
@@ -2449,7 +2444,8 @@ def solve(
     steps_since_last_print = 0
     time_out = False
     drag_values = []
-    
+    scm_progress(20)
+    print(f"Progress 20%")
     # Calculate print and file output intervals
     print_interval = max(1, int(num_steps * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))
     crossover_step = int(num_steps * (jsonfile['settings']['crossover'] / 100.0))
@@ -2457,6 +2453,7 @@ def solve(
     file_output_interval_post_crossover = max(1, int((num_steps - crossover_step) / jsonfile['settings']['postCrossover_frames'])) if jsonfile['settings']['postCrossover_frames'] > 0 else num_steps + 1
     final_print_interval = max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq']  / 100.0)))
     h5exporter.start_time_average()
+
     if jsonfile['settings']['debug']:
         for step in range(num_steps):
             solution_time =(time.time()-solve_start)/60
@@ -2464,8 +2461,14 @@ def solve(
             sim.step()
             compute_time += time.time() - step_start
             steps_since_last_print += 1
-            percent_complete = (step + 1) / num_steps * 100
-            scm_progress(np.floor(percent_complete))
+            percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
+            #scm_progress(np.floor(percent_complete))
+            if step % int(num_steps / 100) == 0:
+                scm_progress(np.floor(percent_complete))
+                print(f"Percent Complete {percent_complete}") 
+                print(f"Step {step} completed out of {num_steps}") 
+                
+
             end_time = time.time()
             elapsed = end_time - start_time
             
@@ -2585,7 +2588,7 @@ def solve(
                 cMin=jsonfile['settings']['surfaceFieldMin']
                 cMax=jsonfile['settings']['surfaceFieldMax']
             clim = cMin, cMax
-            
+
             h5exporter.to_surface_vtk_time_average(
                 output_filename=filename,
                 surface_mesh_filename=surface_mesh_for_vtk,
@@ -2623,13 +2626,15 @@ def solve(
                     lengthScale=jsonfile['settings']['isoScale']
                 )
             scm_results_available() 
-
-        jsonfile['cd'] = avg_cd
-        jsonfile['avg_cl'] = avg_cl
-        jsonfile['cda'] = avg_cd * reference_area_physical
-        jsonfile['cla'] = avg_cl * reference_area_physical
-        jsonfile['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
-        jsonfile['aero_power_hp'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746
+        scm_progress(95)
+        print(f"Progress 95%")
+        jsonfile['results'] ={}
+        jsonfile['results']['cd'] = avg_cd
+        jsonfile['results']['avg_cl'] = avg_cl
+        jsonfile['results']['cda'] = avg_cd * reference_area_physical
+        jsonfile['results']['cla'] = avg_cl * reference_area_physical
+        jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
+        jsonfile['results']['aero_power_hp'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746
         with open(os.path.join(output_dir, "source.json"), 'w') as file:
             json.dump(jsonfile, file, indent=4) # indent for pretty-printing
             print(f"Source Json written to {os.path.join(output_dir, 'source.json')} successfully.")
@@ -2639,14 +2644,16 @@ def solve(
         print_interval=max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))        
         for step in range(num_steps):
             sim.step()
-            percent_complete = (step + 1) / num_steps * 100
-            scm_progress(np.floor(percent_complete))
+            percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
+            
             end_time = time.time()
             elapsed = end_time - start_time
             if elapsed/60 >= jsonfile['settings']['limit']:
                 time_out = True               
                 
             if step % int(num_steps / 100) == 0:
+                scm_progress(np.floor(percent_complete))
+                print(f"Percent Complete {percent_complete}") 
                 print(f"Step {step} completed out of {num_steps}") 
 
             if (step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)) or time_out:
@@ -2720,7 +2727,8 @@ def solve(
                     lengthScale=jsonfile['settings']['isoScale']
                 )
             scm_results_available() 
-
+        scm_progress(95)
+        print(f"Progress 95%")
         # Save drag and lift data to CSV
         if len(drag_values) > 0:
             with open(os.path.join(output_dir, "drag_lift.csv"), 'w') as fd:
@@ -2757,8 +2765,16 @@ def solve(
                 fd.write(f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical / 746:.4f}\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)  
+        jsonfile['results'] ={}
+        jsonfile['results']['cd'] = avg_cd
+        jsonfile['results']['avg_cl'] = avg_cl
+        jsonfile['results']['cda'] = avg_cd * reference_area_physical
+        jsonfile['results']['cla'] = avg_cl * reference_area_physical
+        jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
+        jsonfile['results']['aero_power_hp'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746
         with open(os.path.join(output_dir, "Results.json"), 'w') as file:
             json.dump({
+                "results": jsonfile['results'],
                 "outputName": jsonfile['outputName'],
                 "outputSlices": jsonfile['outputSlices']
                 }, file, indent=4) # indent for pretty-printing
