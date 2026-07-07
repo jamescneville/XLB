@@ -607,7 +607,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 pull_direction = wp.neon_ngh_idx(wp.int8(-_c[0, l]), wp.int8(-_c[1, l]), wp.int8(-_c[2, l]))
 
                 has_ngh_at_same_level = wp.bool(False)
-                accumulated = wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level)
+                accumulated = self.compute_dtype(wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level))
                 accumulated = wp.max(accumulated, self.compute_dtype(0.0))
 
                 if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
@@ -631,7 +631,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         # Finer ngh in pull direction: YES
                         # Same-level ngh:              YES
                         # -> Coalescence
-                        coalescence_factor = wp.neon_read(coalescence_factor_pn, index, l)
+                        coalescence_factor = self.compute_dtype(wp.neon_read(coalescence_factor_pn, index, l))
                         accumulated = accumulated * coalescence_factor
                         _f_post_stream[l] = self.compute_dtype(accumulated)
 

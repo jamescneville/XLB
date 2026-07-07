@@ -577,7 +577,7 @@ def prep_inputs(input_file):
     if settings['doublePrecision']==True:
         precision_policy = PrecisionPolicy.FP64FP64
     elif settings['doublePrecision']==-1:
-        precision_policy = PrecisionPolicy.FP16FP16
+        precision_policy = PrecisionPolicy.FP32FP16
     else:
         precision_policy = PrecisionPolicy.FP32FP32
     
@@ -2457,8 +2457,12 @@ def solve(
     if jsonfile['settings']['debug']:
         for step in range(num_steps):
             solution_time =(time.time()-solve_start)/60
+            # Pure MLUPS timing: bracket sim.step() with synchronize so compute_time
+            # reflects only actual GPU compute, never I/O, prints, or debug cadence.
+            wp.synchronize()
             step_start = time.time()
             sim.step()
+            wp.synchronize()
             compute_time += time.time() - step_start
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
@@ -2643,13 +2647,20 @@ def solve(
     else:
         print_interval=max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))        
         for step in range(num_steps):
+            # Pure MLUPS timing: bracket sim.step() with synchronize so compute_time
+            # reflects only actual GPU compute, never I/O, prints, or debug cadence.
+            wp.synchronize()
+            step_start = time.time()
             sim.step()
+            wp.synchronize()
+            compute_time += time.time() - step_start
+            steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
-            
+
             end_time = time.time()
             elapsed = end_time - start_time
             if elapsed/60 >= jsonfile['settings']['limit']:
-                time_out = True               
+                time_out = True
                 
             if step % int(num_steps / 100) == 0:
                 scm_progress(np.floor(percent_complete))
@@ -2662,7 +2673,12 @@ def solve(
                     cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)              
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
                     wp.synchronize()
-                    scm_results_available() 
+                    total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
+                    MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
+                    print(f"  MLUPS: {MLUPS:.1f}")
+                    compute_time = 0.0
+                    steps_since_last_print = 0
+                    scm_results_available()
 
             if time_out:
                 with open(os.path.join(output_dir, "project.log"),'a') as fd:

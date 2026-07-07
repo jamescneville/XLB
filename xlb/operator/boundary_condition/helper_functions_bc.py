@@ -285,7 +285,7 @@ class HelperFunctionsBC(object):
             # [1] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
             # in: 41st aerospace sciences meeting and exhibit, p. 953.
 
-            rho  = wp.neon_read(_rho, index, 0) 
+            rho  = compute_dtype(wp.neon_read(_rho, index, 0))
             zero = compute_dtype(0.0)
             half = compute_dtype(0.5)
             one = compute_dtype(1.0)
@@ -539,7 +539,7 @@ class HelperFunctionsBC(object):
             u_neighbor = _u_vec()
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     u_neighbor[d] = f_aux
 
@@ -593,14 +593,14 @@ class HelperFunctionsBC(object):
             f_rho_upstream = rho_center
             has_upstrem = wp.bool(False)
             f_aux = compute_dtype(
-            wp.neon_read_ngh(_rho, index, ngh_uf, 0, compute_dtype(0.0), has_upstrem))
+            wp.neon_read_ngh(_rho, index, ngh_uf, 0, store_dtype(0.0), has_upstrem))
             if has_upstrem:                    
                 f_rho_upstream = f_aux
 
             f_u_upstream = u_neighbor
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     f_u_upstream[d] = f_aux
 
@@ -611,14 +611,14 @@ class HelperFunctionsBC(object):
             f_rho_downstream = rho_center
             has_downstream = wp.bool(False)
             f_aux = compute_dtype(
-                wp.neon_read_ngh(_rho, index, ngh_df, 0, compute_dtype(0.0), has_downstream))
+                wp.neon_read_ngh(_rho, index, ngh_df, 0, store_dtype(0.0), has_downstream))
             if has_downstream:                    
                 f_rho_downstream = f_aux  
                 
             f_u_downstream = u_neighbor
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     f_u_downstream[d] = f_aux    
 
