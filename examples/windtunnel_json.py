@@ -2440,8 +2440,11 @@ def solve(
     print(f"\n*******\nSolver Started\n*******\n")
     start_time = time.time()
     solve_start = start_time
-    compute_time = 0.0
     steps_since_last_print = 0
+    # Wall-clock start of the current MLUPS measurement interval. sim.step() is an
+    # async Neon dispatch, so throughput is measured over a whole interval with a
+    # single sync at each MLUPS print (snapshotting before I/O so output isn't counted).
+    interval_start = time.time()
     time_out = False
     drag_values = []
     scm_progress(20)
@@ -2457,21 +2460,25 @@ def solve(
     if jsonfile['settings']['debug']:
         for step in range(num_steps):
             solution_time =(time.time()-solve_start)/60
-            # Pure MLUPS timing: bracket sim.step() with synchronize so compute_time
-            # reflects only actual GPU compute, never I/O, prints, or debug cadence.
-            wp.synchronize()
-            step_start = time.time()
+            # Async dispatch: no per-step sync (that would serialize CPU/GPU every
+            # step and prevent Neon from pipelining). Throughput is measured over the
+            # whole interval at each MLUPS print instead.
             sim.step()
-            wp.synchronize()
-            compute_time += time.time() - step_start
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
             #scm_progress(np.floor(percent_complete))
             if step % int(num_steps / 100) == 0:
                 scm_progress(np.floor(percent_complete))
-                print(f"Percent Complete {percent_complete}") 
-                print(f"Step {step} completed out of {num_steps}") 
-                
+                print(f"Percent Complete {percent_complete}")
+                print(f"Step {step} completed out of {num_steps}")
+                if steps_since_last_print > 0:
+                    wp.synchronize()
+                    interval_time = time.time() - interval_start
+                    MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6 if interval_time > 0 else 0.0
+                    print(f"  MLUPS: {MLUPS:.1f}")
+                    interval_start = time.time()
+                    steps_since_last_print = 0
+
 
             end_time = time.time()
             elapsed = end_time - start_time
@@ -2482,7 +2489,15 @@ def solve(
 
             print_output_interval = print_interval if step < crossover_step else final_print_interval
             if step % print_output_interval == 0 or step == num_steps - 1 or time_out:
-                sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                
+                # Measure compute throughput over the interval BEFORE any I/O below,
+                # so slice/HDF5 output time is never charged against MLUPS.
+                wp.synchronize()
+                interval_time = time.time() - interval_start
+                if steps_since_last_print > 0 and interval_time > 0:
+                    MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6
+                else:
+                    MLUPS = 0.0
+                sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
                 cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
                 filename = os.path.join(output_dir, f"{jsonfile['outputName']}_{step:04d}")                
                 h5exporter.to_slice_image(
@@ -2500,22 +2515,20 @@ def solve(
                 )
                 if step >= crossover_step:
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
-                wp.synchronize()
-                total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
-                MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
                 current_flow_passes = step * ulb / grid_shape_x_coarsest
                 remaining_steps = num_steps - step - 1
                 time_remaining = 0.0 if MLUPS == 0 else (total_lattice_updates_per_step * remaining_steps) / (MLUPS * 1e6)
                 hours, rem = divmod(time_remaining, 3600)
                 minutes, seconds = divmod(rem, 60)
                 time_remaining_str = f"{int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s"
-                
+
                 print(f"Completed step {step}/{num_steps} ({percent_complete:.2f}% complete)")
                 print(f"  Flow Passes: {current_flow_passes:.2f}")
-                print(f"  Time elapsed: {elapsed:.1f}s, Compute time: {compute_time:.1f}s, ETA: {time_remaining_str}")
+                print(f"  Time elapsed: {elapsed:.1f}s, Compute interval: {interval_time:.1f}s, ETA: {time_remaining_str}")
                 print(f"  MLUPS: {MLUPS:.1f}")
                 print(f"  Cd={cd:.3f}, Cl={cl:.3f}, Drag Force (lattice units)={drag:.3f}")
-                compute_time = 0.0
+                # Reset the interval AFTER I/O so output time is excluded from the next interval.
+                interval_start = time.time()
                 steps_since_last_print = 0
                 scm_results_available() 
                 
@@ -2526,6 +2539,8 @@ def solve(
                 filename = os.path.join(output_dir, f"{jsonfile['outputName']}_{step:04d}")
                 h5exporter.to_hdf5(filename, {"velocity": sim.u, "density": sim.rho, "bc_mask": sim.bc_mask}, compression="gzip", compression_opts=1, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"],)
                 wp.synchronize()
+                # Exclude this HDF5 write from the next MLUPS interval.
+                interval_start = time.time()
             if time_out:
                 break
             
@@ -2647,13 +2662,10 @@ def solve(
     else:
         print_interval=max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))        
         for step in range(num_steps):
-            # Pure MLUPS timing: bracket sim.step() with synchronize so compute_time
-            # reflects only actual GPU compute, never I/O, prints, or debug cadence.
-            wp.synchronize()
-            step_start = time.time()
+            # Async dispatch: no per-step sync (that would serialize CPU/GPU every
+            # step and prevent Neon from pipelining). Throughput is measured over the
+            # whole interval at each MLUPS print instead.
             sim.step()
-            wp.synchronize()
-            compute_time += time.time() - step_start
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
 
@@ -2664,19 +2676,30 @@ def solve(
                 
             if step % int(num_steps / 100) == 0:
                 scm_progress(np.floor(percent_complete))
-                print(f"Percent Complete {percent_complete}") 
-                print(f"Step {step} completed out of {num_steps}") 
+                print(f"Percent Complete {percent_complete}")
+                print(f"Step {step} completed out of {num_steps}")
+                if steps_since_last_print > 0:
+                    wp.synchronize()
+                    interval_time = time.time() - interval_start
+                    MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6 if interval_time > 0 else 0.0
+                    print(f"  MLUPS: {MLUPS:.1f}")
+                    interval_start = time.time()
+                    steps_since_last_print = 0
 
             if (step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)) or time_out:
                     print(f"Step {step} completed out of {num_steps}")
-                    sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                    
-                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)              
+                    # Measure compute throughput over the interval BEFORE any I/O below.
+                    wp.synchronize()
+                    interval_time = time.time() - interval_start
+                    total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
+                    MLUPS = total_lattice_updates / interval_time / 1e6 if (steps_since_last_print > 0 and interval_time > 0) else 0.0
+                    print(f"  MLUPS: {MLUPS:.1f}")
+                    sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
+                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
                     wp.synchronize()
-                    total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
-                    MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
-                    print(f"  MLUPS: {MLUPS:.1f}")
-                    compute_time = 0.0
+                    # Reset the interval AFTER I/O so output time is excluded from the next interval.
+                    interval_start = time.time()
                     steps_since_last_print = 0
                     scm_results_available()
 
