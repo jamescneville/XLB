@@ -206,6 +206,12 @@ class SmagorinskyLESKBC(Collision):
         _epsilon = wp.constant(self.compute_dtype(self.epsilon))
         _cs2_delta2 = wp.constant(self.compute_dtype(self.cs2_delta2))
         _inv_cs2 = wp.constant(self.compute_dtype(self.velocity_set.inv_cs2))
+        # Second-moment tensor of the lattice velocities and its packed dimension,
+        # used to compute the non-equilibrium momentum flux (Pi_neq) inline from
+        # (f - feq) without materializing an fneq vector (see functional below).
+        _cc = self.velocity_set.cc
+        _pi_dim = self.velocity_set.d * (self.velocity_set.d + 1) // 2
+        _pi_vec = wp.vec(_pi_dim, dtype=self.compute_dtype)
 
         @wp.func
         def decompose_shear_d2q9(pineq: Any):
@@ -274,7 +280,6 @@ class SmagorinskyLESKBC(Collision):
             f: Any,
             feq: Any,
             delta_s: Any,
-            delta_h: Any,
             beta: Any,
             f_floor: Any,   # e.g. _epsilon
         ):
@@ -282,6 +287,12 @@ class SmagorinskyLESKBC(Collision):
             Single-pass over q:
             - compute entropic scalar products sp1, sp2 (with Neumaier compensation)
             - compute gamma feasibility bounds [gamma_min, gamma_max] from fout >= f_floor
+
+            delta_h[i] = (f[i] - feq[i]) - delta_s[i] is recomputed per-direction here
+            rather than passed in as a materialized 27-vector, to shorten the live
+            register footprint of the collision kernel (delta_h never exists as a full
+            vector). The single extra subtract per direction is far cheaper than the
+            occupancy cost of keeping delta_h resident.
 
             Returns: (sp1, sp2, gamma_min, gamma_max)
             """
@@ -303,11 +314,15 @@ class SmagorinskyLESKBC(Collision):
             _ratio_max = self.compute_dtype(1e4)
 
             for i in range(wp.static(self.velocity_set.q)):
+                # delta_h[i] recomputed on the fly (see docstring) instead of read
+                # from a resident vector.
+                _dh_i = (f[i] - feq[i]) - delta_s[i]
+
                 # -------- entropic scalar products (sp1/sp2) --------
                 # Floor feq to prevent catastrophic division
                 feq_safe = wp.max(feq[i], _feq_floor)
 
-                temp_i = delta_h[i] / feq_safe
+                temp_i = _dh_i / feq_safe
                 temp_i = wp.clamp(temp_i, -_ratio_max, _ratio_max)
 
                 # sp1 += temp_i * delta_s[i]  (compensated)
@@ -318,7 +333,7 @@ class SmagorinskyLESKBC(Collision):
                 sp1 = t1
 
                 # sp2 += temp_i * delta_h[i]  (compensated)
-                x2 = temp_i * delta_h[i]
+                x2 = temp_i * _dh_i
                 y2 = x2 - c2
                 t2 = sp2 + y2
                 c2 = (t2 - sp2) - y2
@@ -331,7 +346,7 @@ class SmagorinskyLESKBC(Collision):
 
                 # fout_i = pre_i - beta*gamma*delta_h[i] >= f_floor
                 # => headroom - gamma*(beta*delta_h[i]) >= 0
-                coeff = beta * delta_h[i]
+                coeff = beta * _dh_i
 
                 if coeff > _epsilon:
                     # gamma <= headroom/coeff
@@ -459,33 +474,58 @@ class SmagorinskyLESKBC(Collision):
             u: Any,
             omega: Any,
         ):
+            # Compute the non-equilibrium momentum flux (Pi_neq) directly from
+            # fneq = f - feq, accumulating with the same compensated (Kahan) sum as
+            # the SecondMoment operator but WITHOUT materializing the full fneq
+            # vector: each fneq[q] is a transient scalar. This is bit-identical to
+            # momentum_flux.warp_functional(f - feq) (same terms, same order) and
+            # removes the longest-lived 27-wide intermediate from the collision
+            # kernel, lowering register pressure / raising occupancy.
+            pineq = _pi_vec()
+            _pi_corr = _pi_vec()
+            for d in range(_pi_dim):
+                pineq[d] = self.compute_dtype(0.0)
+                _pi_corr[d] = self.compute_dtype(0.0)
+            for q in range(self.velocity_set.q):
+                _fneq_q = f[q] - feq[q]
+                for d in range(_pi_dim):
+                    t = _cc[q, d] * _fneq_q - _pi_corr[d]
+                    y = pineq[d] + t
+                    _pi_corr[d] = (pineq[d] - y) + t
+                    pineq[d] = y
+            for d in range(_pi_dim):
+                pineq[d] = pineq[d] + _pi_corr[d]
+
             # Compute shear and delta_s
-            fneq = f - feq
-            pineq = self.momentum_flux.warp_functional(fneq)
             if wp.static(self.velocity_set.d == 3):
                 shear = decompose_shear_d3q27(pineq)
-                delta_s = shear 
+                delta_s = shear
                 omega_eff = compute_smagorinsky_omega_d3q27(omega, rho, pineq)
             else:
                 shear = decompose_shear_d2q9(pineq)
-                delta_s = shear  / self.compute_dtype(4.0)
+                delta_s = shear / self.compute_dtype(4.0)
                 omega_eff = compute_smagorinsky_omega_d2q9(omega, rho, pineq)
 
             # Compute required constants based on the input omega (omega is the inverse relaxation time)
             _beta = self.compute_dtype(0.5) * self.compute_dtype(omega_eff)
             _inv_beta = self.compute_dtype(1.0) / _beta
 
-            # Perform collision
-            delta_h = fneq - delta_s
+            # Perform collision. delta_h = fneq - delta_s is never materialized as a
+            # full vector; it is recomputed per-direction inside the fused products
+            # pass and again in the fout write below, trading one subtract per
+            # direction for a smaller live-register footprint.
             two = self.compute_dtype(2.0)
-            sp1, sp2, gmin, gmax = fused_entropic_products_and_gamma_bounds(f, feq, delta_s, delta_h, _beta, _epsilon)
-             
+            sp1, sp2, gmin, gmax = fused_entropic_products_and_gamma_bounds(f, feq, delta_s, _beta, _epsilon)
+
             gamma = _inv_beta - (two - _inv_beta) * sp1 / wp.max(sp2, _epsilon)
             # Update Gamma based on Positivity Range enforcement
             gamma = apply_gamma_bounds(gamma, gmin, gmax)
-            
-            fout = f - _beta * (two * delta_s + gamma * delta_h)
-            
+
+            fout = _f_vec()
+            for i in range(wp.static(self.velocity_set.q)):
+                _dh_i = (f[i] - feq[i]) - delta_s[i]
+                fout[i] = f[i] - _beta * (two * delta_s[i] + gamma * _dh_i)
+
             return fout
 
             
