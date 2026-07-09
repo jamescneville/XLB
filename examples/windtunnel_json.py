@@ -543,6 +543,10 @@ def obj_to_binary_stl_stream(
 
 wp.clear_kernel_cache()
 wp.config.quiet = True
+# The solver is forward-only (no autodiff / .backward()), so skip generating and
+# compiling adjoint kernels — roughly halves cold kernel-compile time.
+wp.config.enable_backward = False
+wp.config.line_directives= False
 
 def prep_inputs(input_file):
     version = '2027.0'
