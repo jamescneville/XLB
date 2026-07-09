@@ -1301,7 +1301,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
                     if _boundary_id != wp.uint8(BC_SFV):
                         return
-                    _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
+                    # collide_simple has do_bc=False, so it uses neither f_pre nor the
+                    # missing mask (those branches are wp.static-compiled out). Skip
+                    # neon_get_thread_data entirely: it was reading 27 populations + 27
+                    # mask entries per cell only to discard them. This is the dominant
+                    # kernel (~89% of active cells are BC_SFV), so removing 54 reads +
+                    # conversions per cell is a real bandwidth and register win.
+                    _missing_mask = _missing_mask_vec()
                     _f_post_stream = self.stream.neon_functional(f_0_pn, index)
                     collide_simple(
                         index,

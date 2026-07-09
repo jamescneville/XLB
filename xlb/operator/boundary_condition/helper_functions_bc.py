@@ -14,6 +14,7 @@ BC profiles into the ``f_1`` buffer during initialization.
 import inspect
 from typing import Any, Callable
 
+import numpy as np
 import warp as wp
 
 from xlb.velocity_set.velocity_set import VelocitySet
@@ -59,6 +60,19 @@ class HelperFunctionsBC(object):
         _w = self.velocity_set.w
         _c = self.velocity_set.c
         _c_float = self.velocity_set.c_float
+        # Precomputed per-direction unit vectors and magnitudes of the lattice
+        # velocities. These depend only on the (constant) stencil, so the wall
+        # model's neighbor-search loops can select directions with a single dot
+        # against a constant unit vector instead of recomputing wp.length()+divide
+        # for every direction on every wall node. Built in float32 so the values
+        # match the runtime's correctly-rounded fp32 sqrt/divide bit-for-bit.
+        _c_f_np = np.asarray(self.velocity_set._c_float, dtype=np.float32)
+        _mag_np = np.sqrt((_c_f_np * _c_f_np).sum(axis=0, dtype=np.float32)).astype(np.float32)
+        _unit_np = np.zeros_like(_c_f_np)
+        _nz_dir = _mag_np > np.float32(0.0)
+        _unit_np[:, _nz_dir] = _c_f_np[:, _nz_dir] / _mag_np[_nz_dir]
+        _c_unit = wp.constant(wp.mat((_d, _q), dtype=compute_dtype)(_unit_np))
+        _c_mag = wp.constant(wp.vec(_q, dtype=compute_dtype)(_mag_np))
         _cs2 = compute_dtype(self.velocity_set.cs2)
         _qi = self.velocity_set.qi
         _u_vec = wp.vec(_d, dtype=compute_dtype)
@@ -508,18 +522,10 @@ class HelperFunctionsBC(object):
             best_n_l   = wp.int32(0)
             best_n_dot = compute_dtype(-1.0e9)
             for l in range(1, _q):
-                # Start with 1 as zero is rest position
-                cx = _c_float[0, l]
-                cy = _c_float[1, l]
-                cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
-                c    = wp.vec3(cx, cy, cz)
-                cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
-                c_unit = c / cmag
-                a = wp.dot(c_unit, normal)
+                # Start with 1 as zero is rest position. Unit direction is precomputed
+                # (_c_unit), so this is just a dot against the wall normal — no per-
+                # direction sqrt/divide.
+                a = _c_unit[0, l] * normal[0] + _c_unit[1, l] * normal[1] + _c_unit[2, l] * normal[2]
                 if a > best_n_dot:
                     best_n_dot = a
                     best_n_l   = wp.int32(l)
@@ -543,7 +549,8 @@ class HelperFunctionsBC(object):
                 if has_neihbor:                    
                     u_neighbor[d] = f_aux
 
-            neighbor_dist = wp.length(wp.vec3(compute_dtype(step_dir[0]), compute_dtype(step_dir[1]), compute_dtype(step_dir[2]), ))
+            # |step_dir| == |c[best_n_l]| (sign flip does not change magnitude), precomputed.
+            neighbor_dist = _c_mag[best_n_l]
     
             # ============================================================
             # Find best lattice link aligned with the STREAMWISE
@@ -551,18 +558,8 @@ class HelperFunctionsBC(object):
             best_s_l   = wp.int32(0)
             best_s_dot = compute_dtype(-1.0e9)
             for l in range(1, _q):
-                # Start with 1 as zero is rest position
-                cx = _c_float[0, l]
-                cy = _c_float[1, l]
-                cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
-                c    = wp.vec3(cx, cy, cz)
-                cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
-                c_unit = c / cmag
-                a = wp.dot(c_unit, streamwise)                
+                # Start with 1 as zero is rest position. Unit direction precomputed (_c_unit).
+                a = _c_unit[0, l] * streamwise[0] + _c_unit[1, l] * streamwise[1] + _c_unit[2, l] * streamwise[2]
                 if a > best_s_dot:
                     best_s_dot = a
                     best_s_l   = wp.int32(l)
@@ -573,11 +570,9 @@ class HelperFunctionsBC(object):
                 stream_step = -stream_step
             #Test reaching 2 voxels away rather than just 1 out from center
             stream_step *= 2
-            upstream_dist = wp.length(wp.vec3(
-                compute_dtype(stream_step[0]),
-                compute_dtype(stream_step[1]),
-                compute_dtype(stream_step[2]),
-            )) 
+            # |stream_step| == 2*|c[best_s_l]|; precomputed (bit-identical to wp.length,
+            # since sqrt(4n) == 2*sqrt(n) in fp32).
+            upstream_dist = compute_dtype(2.0) * _c_mag[best_s_l]
             # Upstream dist is for neighbor to upstream 
             # To include Downstream we x2 the length
             streamwise_dist = wp.max(compute_dtype(2.0) * upstream_dist, _epsilon)
@@ -752,20 +747,9 @@ class HelperFunctionsBC(object):
             u_f_rel = u_f - u_wall
             u_f_mag = wp.length(u_f_rel)
 
-            # Tangential direction at F (safe fallback)
-            u_f_norm = wp.dot(u_f_rel, normal)
-            u_f_tangent = u_f_rel - normal * u_f_norm
-            u_f_tangent_len = wp.length(u_f_tangent)
-            if u_f_tangent_len > _epsilon:
-                streamwisef = u_f_tangent / u_f_tangent_len
-            else:
-                streamwisef = streamwise          
-
             # Use B-streamwise for signed streamwise speed
             u_f_signed = wp.dot(u_f_rel, streamwise)
             u_f_par_mag = wp.abs(u_f_signed)
-
-            u_f_fwd = wp.dot(u_f_rel, streamwiseb)
 
             if u_f_par_mag < _epsilon:
                 return u_wall, _relax
