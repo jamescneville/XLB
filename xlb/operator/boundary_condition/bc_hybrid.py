@@ -398,7 +398,7 @@ class HybridBC(BoundaryCondition):
                 #u_wall_effective = u_wall_physical
                 relax = compute_dtype(wp.neon_read(_relax, index, 0))
                 u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
-                    index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
+                    index, _missing_mask, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
                 )
                 wp.neon_write(_relax, index, 0, store_dtype(relax_new))
             else:

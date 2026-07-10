@@ -177,9 +177,10 @@ class HelperFunctionsBC(object):
             Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
             """
             # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
-            f_neq = fpop - feq
-            PiNeq = momentum_flux.warp_functional(f_neq)
-            zero = compute_dtype(0.0)
+            for l in range(_q):
+                fpop[l] = fpop[l] - feq[l]
+
+            PiNeq = momentum_flux.warp_functional(fpop)
             three = compute_dtype(3.0)
             trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
 
@@ -285,7 +286,7 @@ class HelperFunctionsBC(object):
             # [1] Yu, D., Mei, R., Shyy, W., 2003. A unified boundary treatment in lattice boltzmann method,
             # in: 41st aerospace sciences meeting and exhibit, p. 953.
 
-            rho  = compute_dtype(wp.neon_read(_rho, index, 0))
+            rho  = wp.neon_read(_rho, index, 0) 
             zero = compute_dtype(0.0)
             half = compute_dtype(0.5)
             one = compute_dtype(1.0)
@@ -452,7 +453,82 @@ class HelperFunctionsBC(object):
             return wp.max(d_log + d_damping, _epsilon)
 
         @wp.func
+        def reichardt_profile_and_derivative(y_plus: Any):
+            """
+            Fused Reichardt profile and derivative for Newton iteration.
+
+            Keeps the same arithmetic structure as reichardt_profile() and
+            reichardt_derivative(), but shares exp(-y/C) and exp(-y/3).
+            """
+            C = compute_dtype(11.0)
+            C3 = compute_dtype(3.0)
+
+            inv_C = compute_dtype(1.0) / C
+            inv_C3 = compute_dtype(1.0) / C3
+
+            exp_C = wp.exp(-y_plus / C)
+            exp_C3 = wp.exp(-y_plus / C3)
+
+            log_term = (compute_dtype(1.0) / _kappa) * wp.log(
+                compute_dtype(1.0) + _kappa * y_plus
+            )
+
+            damping = compute_dtype(8.5) * (
+                compute_dtype(1.0)
+                - exp_C
+                - (y_plus / C) * exp_C3
+            )
+
+            u_plus = log_term + damping
+            u_plus = wp.max(u_plus, compute_dtype(0.0))
+
+            d_log = compute_dtype(1.0) / (compute_dtype(1.0) + _kappa * y_plus)
+
+            d_damping = compute_dtype(8.5) * (
+                exp_C * inv_C
+                - inv_C * exp_C3
+                + (y_plus * inv_C * inv_C3) * exp_C3
+            )
+
+            du_dy = wp.max(d_log + d_damping, _epsilon)
+
+            return u_plus, du_dy
+        
+        @wp.func
         def solve_wall_function(K: Any) -> Any:
+            """
+            Solve for u_plus given K = |u_parallel| * y / nu = y+ * u+.
+            Uses Newton iteration with the Reichardt profile.
+            Returns u_plus.
+            """
+            if K < _epsilon:
+                return wp.sqrt(wp.max(K, compute_dtype(0.0)))
+
+            if K < compute_dtype(25.0):
+                u_plus = wp.sqrt(K)
+            else:
+                u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
+
+            for _ in range(15):
+                y_plus = K / wp.max(u_plus, _epsilon)
+
+                u_profile, du_dy = reichardt_profile_and_derivative(y_plus)
+
+                residual = u_plus - u_profile
+
+                if wp.abs(residual) < compute_dtype(1e-6) * wp.max(u_plus, compute_dtype(1.0)):
+                    break
+
+                g_prime = compute_dtype(1.0) + du_dy * K / (u_plus * u_plus + _epsilon)
+
+                delta = residual / wp.max(g_prime, _epsilon)
+                u_plus = u_plus - delta
+                u_plus = wp.max(u_plus, _epsilon)
+
+            return wp.max(u_plus, _epsilon)
+
+        @wp.func
+        def solve_wall_function0(K: Any) -> Any:
             """
             Solve for u_plus given K = |u_parallel| * y / nu = y+ * u+.
             Uses Newton iteration with the Reichardt profile.
@@ -491,7 +567,6 @@ class HelperFunctionsBC(object):
             normal: Any,
             _rho: Any, 
             _u: Any,
-            f_1: Any,
             streamwise: Any,
         ):
             """
@@ -645,38 +720,13 @@ class HelperFunctionsBC(object):
             dot_tol = compute_dtype(0.25) #~80deg    0.5 ~60deg higher = tighter 0.45was working well
             
             if (dot_up > dot_tol) and (dot_dn > dot_tol):
-                u_up = f_u_upstream
                 rho_up = f_rho_upstream
-                u_down = f_u_downstream
                 rho_down = f_rho_downstream
                 coherent = compute_dtype(1.0)
             else:
-                u_up = u_neighbor
                 rho_up = rho_center
-                u_down = u_neighbor
                 rho_down = rho_center
-                coherent = compute_dtype(0.0)
-
-            # --- Debug print (unchanged) ---
-            # idx_wp = neon_index_to_warp(f_1, index)
-            # nx = normal[0]
-            # ny = normal[1]
-            # nz = normal[2]
-            # theta = wp.atan2(nz, -nx) * compute_dtype(57.29577951308232)
-            # if theta < compute_dtype(0.0):
-            #     theta += compute_dtype(360.0)
-
-            # #12mm
-            # if (idx_wp[1] > 429) and (idx_wp[1] < 431) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            # #10mm
-            # #if (idx_wp[1] > 515) and (idx_wp[1] < 517) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            # #8mm
-            # #if (idx_wp[1] > 644) and (idx_wp[1] < 646) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            #     wp.printf(
-            #         "WM idx,%4d,%4d,%4d, theta, %1.1f, normal,%1.2f,%1.2f,%1.2f, streamwise,%1.2f,%1.2f,%1.2f, streamstep,%1d,%1d,%1d, f_rho_up, %1.6e f_rho_dn, %1.6e, rho_n, %1.6e, dot_up, %1.1e, dot_dn, %1.1e \n",
-            #         idx_wp[0], idx_wp[1], idx_wp[2], theta, 
-            #         normal[0], normal[1], normal[2],streamwise[0], streamwise[1], streamwise[2],stream_step[0], stream_step[1], stream_step[2], f_rho_upstream, f_rho_downstream, rho_center, dot_up, dot_dn
-            #     )
+                coherent = compute_dtype(0.0)          
          
                                      
             return u_neighbor, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent
@@ -685,8 +735,6 @@ class HelperFunctionsBC(object):
         def compute_wall_modeled_velocity(
             index: Any,
             _missing_mask: Any,
-            f_1: Any,
-            f_pre: Any,
             u_wall: Any,
             nu: Any,
             _rho: Any,
@@ -722,14 +770,14 @@ class HelperFunctionsBC(object):
             for d in range(_d):
                 u_B[d] = compute_dtype(wp.neon_read(_u, index, d))
 
-            nu = wp.max(nu, _epsilon)
+            nu = wp.max(compute_dtype(nu), _epsilon)
 
             # -----------------------------------------------------------------
             # TANGENTIAL VELOCITY AND STREAMWISE DIRECTION AT B
             # -----------------------------------------------------------------
-            u_rel_B = u_B - u_wall
-            u_b_norm = wp.dot(u_rel_B, normal)
-            u_b_tangent = u_rel_B - normal * u_b_norm
+            u_B = u_B - u_wall
+            u_b_norm = wp.dot(u_B, normal)
+            u_b_tangent = u_B - normal * u_b_norm
             u_b_tangent_len = wp.length(u_b_tangent)
 
             if u_b_tangent_len < _epsilon:
@@ -741,7 +789,7 @@ class HelperFunctionsBC(object):
             # NEIGHBOR SAMPLING
             # -----------------------------------------------------------------
             u_f, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent = sample_neighbor(
-                index, normal, _rho, _u, f_1, streamwiseb
+                index, normal, _rho, _u, streamwiseb
             )
 
             # =================================================================
@@ -749,23 +797,21 @@ class HelperFunctionsBC(object):
             # =================================================================
             y_f = y_b + neighbor_dist
 
-            u_f_rel = u_f - u_wall
-            u_f_mag = wp.length(u_f_rel)
+            u_f = u_f - u_wall
+            u_f_mag = wp.length(u_f)
 
             # Tangential direction at F (safe fallback)
-            u_f_norm = wp.dot(u_f_rel, normal)
-            u_f_tangent = u_f_rel - normal * u_f_norm
-            u_f_tangent_len = wp.length(u_f_tangent)
-            if u_f_tangent_len > _epsilon:
-                streamwisef = u_f_tangent / u_f_tangent_len
-            else:
-                streamwisef = streamwise          
+            # u_f_norm = wp.dot(u_f, normal)
+            # u_f_tangent = u_f - normal * u_f_norm
+            # u_f_tangent_len = wp.length(u_f_tangent)
+            # if u_f_tangent_len > _epsilon:
+            #     streamwisef = u_f_tangent / u_f_tangent_len
+            # else:
+            #     streamwisef = streamwise          
 
             # Use B-streamwise for signed streamwise speed
-            u_f_signed = wp.dot(u_f_rel, streamwise)
+            u_f_signed = wp.dot(u_f, streamwise)
             u_f_par_mag = wp.abs(u_f_signed)
-
-            u_f_fwd = wp.dot(u_f_rel, streamwiseb)
 
             if u_f_par_mag < _epsilon:
                 return u_wall, _relax
@@ -845,10 +891,8 @@ class HelperFunctionsBC(object):
                    
             separation_gate = one
             if pg_avg > zero:
-                f_angle = wp.dot(u_f_rel / wp.max(u_f_mag, _epsilon), normal) 
+                f_angle = wp.dot(u_f / wp.max(u_f_mag, _epsilon), normal) 
                 deg_to_rad = compute_dtype(0.017453292519943295)
-                rad_to_deg = compute_dtype(57.29577951308232)
-                f_angle_deg = wp.asin(f_angle) * rad_to_deg  
 
                 # Base liftoff rolloff in separation-angle space
                 separation_rolloff_start_deg = compute_dtype(2.5)
@@ -859,15 +903,15 @@ class HelperFunctionsBC(object):
                 # fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
                 # fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
 
-                shield_shift_deg = compute_dtype(0.0)
+               
                 # if pg_avg < fpg_shield_start_pg:
                 #     shield_shift_deg = wp.min(
                 #         (fpg_shield_start_pg - pg_avg) * fpg_shield_deg_per_pg,
                 #         fpg_shield_max_deg,
                 #     )
 
-                rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
-                rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+                rolloff_start_deg = separation_rolloff_start_deg 
+                rolloff_full_deg  = separation_rolloff_full_deg  
 
                 rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
                 rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
@@ -899,30 +943,7 @@ class HelperFunctionsBC(object):
                 compute_dtype(2.0) * u_f_par_mag,  
             )
 
-            u_wall_eff = u_wall + U_wm_B_final * streamwise
-
-            # # =================================================================
-            # # DEBUG OUTPUT
-            # # =================================================================
-            # idx_wp = neon_index_to_warp(f_1, index)
-            # nx = normal[0]
-            # ny = normal[1]
-            # nz = normal[2]
-            # theta = wp.atan2(nz, -nx) * compute_dtype(57.29577951308232)
-            # #theta = wp.atan2(ny, -nx) * compute_dtype(57.29577951308232)
-            # if theta < compute_dtype(0.0):
-            #     theta += compute_dtype(360.0)
-            # #drivaer = 656  429
-            # if (idx_wp[1] == 922) and (idx_wp[2] > 35) and (theta > compute_dtype(1.0)) and (theta < compute_dtype(170.0)):
-            # #if (idx_wp[2] == 44) and (ny < 0.0):                          
-            #     wp.printf(
-            #         "WM idx,%4d,%4d,%4d, streamwise ,%1.1f,%1.1f,%1.1f, normal ,%0.3f,%0.3f,%0.3f,theta, %1.1f, pg_instant, %1.4f, pg_avg, %1.4f, pressure_gate, %1.4f, separation_gate, %1.4f, f_angle_deg, %1.2f, rolloff_start_deg, %1.2f, u_zpg, %0.4f, uFinal, %0.4f, u_b, %0.4f, u_f, %0.4f, coh, %1.0f,\n",
-            #         idx_wp[0], idx_wp[1], idx_wp[2],
-            #         streamwise[0], streamwise[1], streamwise[2],normal[0], normal[1], normal[2],theta,
-            #  pg_instant, pg_avg, pressure_gate, separation_gate, f_angle_deg, rolloff_start_deg, 
-            #  U_wm_B_zpg, U_wm_B_final, u_b_tangent_len, u_f_par_mag,
-            # coherent,
-            # )
+            u_wall_eff = u_wall + U_wm_B_final * streamwise           
 
             return u_wall_eff, pg_avg
         
