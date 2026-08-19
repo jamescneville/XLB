@@ -14,6 +14,7 @@ BC profiles into the ``f_1`` buffer during initialization.
 import inspect
 from typing import Any, Callable
 
+import numpy as np
 import warp as wp
 
 from xlb.velocity_set.velocity_set import VelocitySet
@@ -66,6 +67,16 @@ class HelperFunctionsBC(object):
         _missing_mask_vec = wp.vec(_q, dtype=wp.uint8)  # TODO fix vec bool
         _nt = _d * (_d + 1) // 2
         _epsilon = compute_dtype(1e-6)
+
+        # Precomputed unit lattice vectors c/|c| (constant; used by the wall-model
+        # neighbor sampling to avoid recomputing sqrt/divide per direction per voxel).
+        # The rest direction and any zero vectors map to 0 (loops skip l == 0).
+        _c_np = np.asarray(self.velocity_set._c_float, dtype=np.float64)
+        _cmag_np = np.linalg.norm(_c_np, axis=0)
+        _c_unit_np = np.zeros_like(_c_np)
+        _nonzero = _cmag_np > 1e-12
+        _c_unit_np[:, _nonzero] = _c_np[:, _nonzero] / _cmag_np[_nonzero]
+        _c_unit = wp.constant(wp.mat((_d, _q), dtype=compute_dtype)(_c_unit_np))
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
 
@@ -509,7 +520,9 @@ class HelperFunctionsBC(object):
             else:
                 u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
 
-            for _ in range(15):
+            # 8 iterations is enough given the seeded initial guess below; the
+            # tolerance break usually exits earlier. (Was 15.)
+            for _ in range(8):
                 y_plus = K / wp.max(u_plus, _epsilon)
 
                 u_profile, du_dy = reichardt_profile_and_derivative(y_plus)
@@ -583,17 +596,8 @@ class HelperFunctionsBC(object):
             best_n_l   = wp.int32(0)
             best_n_dot = compute_dtype(-1.0e9)
             for l in range(1, _q):
-                # Start with 1 as zero is rest position
-                cx = _c_float[0, l]
-                cy = _c_float[1, l]
-                cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
-                c    = wp.vec3(cx, cy, cz)
-                cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
-                c_unit = c / cmag
+                # Start with 1 as zero is rest position; unit vectors are precomputed.
+                c_unit = _u_vec(_c_unit[0, l], _c_unit[1, l], _c_unit[2, l])
                 a = wp.dot(c_unit, normal)
                 if a > best_n_dot:
                     best_n_dot = a
@@ -626,18 +630,9 @@ class HelperFunctionsBC(object):
             best_s_l   = wp.int32(0)
             best_s_dot = compute_dtype(-1.0e9)
             for l in range(1, _q):
-                # Start with 1 as zero is rest position
-                cx = _c_float[0, l]
-                cy = _c_float[1, l]
-                cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
-                c    = wp.vec3(cx, cy, cz)
-                cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
-                c_unit = c / cmag
-                a = wp.dot(c_unit, streamwise)                
+                # Start with 1 as zero is rest position; unit vectors are precomputed.
+                c_unit = _u_vec(_c_unit[0, l], _c_unit[1, l], _c_unit[2, l])
+                a = wp.dot(c_unit, streamwise)
                 if a > best_s_dot:
                     best_s_dot = a
                     best_s_l   = wp.int32(l)

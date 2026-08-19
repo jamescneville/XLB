@@ -205,7 +205,8 @@ class SmagorinskyLESKBC(Collision):
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _epsilon = wp.constant(self.compute_dtype(self.epsilon))
         _cs2_delta2 = wp.constant(self.compute_dtype(self.cs2_delta2))
-        _inv_cs2 = wp.constant(self.compute_dtype(self.velocity_set.inv_cs2))
+        _inv_four = wp.constant(self.compute_dtype(1.0/4.0))
+        _inv_six = wp.constant(self.compute_dtype(1.0/6.0))
 
         @wp.func
         def decompose_shear_d2q9(pineq: Any):
@@ -239,33 +240,31 @@ class SmagorinskyLESKBC(Collision):
 
             # For c = (i, 0, 0), c = (0, j, 0) and c = (0, 0, k)
             two = self.compute_dtype(2.0)
-            four = self.compute_dtype(1.0/4.0)
-            six = self.compute_dtype(1.0/6.0)
 
-            s[9] = (two * nxz - nyz) * six
-            s[18] = (two * nxz - nyz) * six
-            s[3] = (-nxz + two * nyz) * six
-            s[6] = (-nxz + two * nyz) * six
-            s[1] = (-nxz - nyz) * six
-            s[2] = (-nxz - nyz) * six
+            s[9] = (two * nxz - nyz) * _inv_six
+            s[18] = (two * nxz - nyz) * _inv_six
+            s[3] = (-nxz + two * nyz) * _inv_six
+            s[6] = (-nxz + two * nyz) * _inv_six
+            s[1] = (-nxz - nyz) * _inv_six
+            s[2] = (-nxz - nyz) * _inv_six
 
             # For c = (i, j, 0)
-            s[12] = pineq[1] * four
-            s[24] = pineq[1] * four
-            s[21] = -pineq[1] * four
-            s[15] = -pineq[1] * four
+            s[12] = pineq[1] * _inv_four
+            s[24] = pineq[1] * _inv_four
+            s[21] = -pineq[1] * _inv_four
+            s[15] = -pineq[1] * _inv_four
 
             # For c = (i, 0, k)
-            s[10] = pineq[2] * four
-            s[20] = pineq[2] * four
-            s[19] = -pineq[2] * four
-            s[11] = -pineq[2] * four
+            s[10] = pineq[2] * _inv_four
+            s[20] = pineq[2] * _inv_four
+            s[19] = -pineq[2] * _inv_four
+            s[11] = -pineq[2] * _inv_four
 
             # For c = (0, j, k)
-            s[8] = pineq[4] * four
-            s[4] = pineq[4] * four
-            s[7] = -pineq[4] * four
-            s[5] = -pineq[4] * four
+            s[8] = pineq[4] * _inv_four
+            s[4] = pineq[4] * _inv_four
+            s[7] = -pineq[4] * _inv_four
+            s[5] = -pineq[4] * _inv_four
 
             return s
 
@@ -296,7 +295,6 @@ class SmagorinskyLESKBC(Collision):
             gamma_max = self.compute_dtype( 1.0e6)
 
             # constants
-            zero = self.compute_dtype(0.0)
             two  = self.compute_dtype(2.0)
 
             _feq_floor = _epsilon
@@ -375,20 +373,17 @@ class SmagorinskyLESKBC(Collision):
             #pi_neq = self.momentum_flux.warp_functional(fneq)
             
             # Extract stress components: [Pi_xx, Pi_xy, Pi_xz, Pi_yy, Pi_yz, Pi_zz]
-            Pi_xx = pineq[0]
-            Pi_xy = pineq[1]
-            Pi_xz = pineq[2]
-            Pi_yy = pineq[3]
-            Pi_yz = pineq[4]
-            Pi_zz = pineq[5]
+            Pi_xx = pineq[0] * pineq[0]
+            Pi_xy = pineq[1] * pineq[1]
+            Pi_xz = pineq[2] * pineq[2]
+            Pi_yy = pineq[3] * pineq[3]
+            Pi_yz = pineq[4] * pineq[4]
+            Pi_zz = pineq[5] * pineq[5]
             
             # Compute |Pi_neq|
             two = self.compute_dtype(2.0)
-            Pi_neq_magnitude_sq = (
-                Pi_xx * Pi_xx + Pi_yy * Pi_yy + Pi_zz * Pi_zz +
-                two * (Pi_xy * Pi_xy + Pi_xz * Pi_xz + Pi_yz * Pi_yz)
-            )
-            Pi_neq_magnitude = wp.sqrt(Pi_neq_magnitude_sq + _epsilon)
+            Pi_neq_magnitude_sq = (Pi_xx + Pi_yy + Pi_zz + two * (Pi_xy + Pi_xz  + Pi_yz)) + _epsilon
+            Pi_neq_magnitude = wp.sqrt(Pi_neq_magnitude_sq)
             
             # Base relaxation time
             one = self.compute_dtype(1.0)
@@ -396,11 +391,12 @@ class SmagorinskyLESKBC(Collision):
             
             # Compute discriminant
             eighteen = self.compute_dtype(18.0)
-            discriminant = tau_0 * tau_0 + eighteen * _cs2_delta2 * Pi_neq_magnitude / (rho + _epsilon)
+            inv_rho = one / (rho + _epsilon)
+            discriminant = (tau_0 * tau_0 + eighteen * _cs2_delta2 * Pi_neq_magnitude * inv_rho) + _epsilon
             
             # Effective relaxation time
             half = self.compute_dtype(0.5)
-            tau_eff = half * (tau_0 + wp.sqrt(discriminant + _epsilon))
+            tau_eff = half * (tau_0 + wp.sqrt(discriminant))
             
             # Clamp for stability
             tau_min = self.compute_dtype(0.5001)
@@ -463,12 +459,11 @@ class SmagorinskyLESKBC(Collision):
             fneq = f - feq
             pineq = self.momentum_flux.warp_functional(fneq)
             if wp.static(self.velocity_set.d == 3):
-                shear = decompose_shear_d3q27(pineq)
-                delta_s = shear 
+                delta_s = decompose_shear_d3q27(pineq)
                 omega_eff = compute_smagorinsky_omega_d3q27(omega, rho, pineq)
             else:
-                shear = decompose_shear_d2q9(pineq)
-                delta_s = shear  / self.compute_dtype(4.0)
+                delta_s = decompose_shear_d2q9(pineq)
+                delta_s = delta_s  / self.compute_dtype(4.0)
                 omega_eff = compute_smagorinsky_omega_d2q9(omega, rho, pineq)
 
             # Compute required constants based on the input omega (omega is the inverse relaxation time)
@@ -476,18 +471,25 @@ class SmagorinskyLESKBC(Collision):
             _inv_beta = self.compute_dtype(1.0) / _beta
 
             # Perform collision
-            delta_h = fneq - delta_s
+            # delta_h = fneq - delta_s
+            # reusing fneq to minimize register pressure resulting fneq = delta_h here
+            for i in range(wp.static(self.velocity_set.q)):
+                fneq[i] = fneq[i] - delta_s[i]
+
             two = self.compute_dtype(2.0)
-            sp1, sp2, gmin, gmax = fused_entropic_products_and_gamma_bounds(f, feq, delta_s, delta_h, _beta, _epsilon)
+            sp1, sp2, gmin, gmax = fused_entropic_products_and_gamma_bounds(f, feq, delta_s, fneq, _beta, _epsilon)
              
             gamma = _inv_beta - (two - _inv_beta) * sp1 / wp.max(sp2, _epsilon)
             # Update Gamma based on Positivity Range enforcement
             gamma = apply_gamma_bounds(gamma, gmin, gmax)
             
-            fout = f - _beta * (two * delta_s + gamma * delta_h)
-            
-            return fout
+            #fout = f - _beta * (two * delta_s + gamma * fneq)
+            # fneq becomes fout
+            for i in range(wp.static(self.velocity_set.q)):
+                fneq[i] = f[i] - _beta * (two * delta_s[i] + gamma * fneq[i])
 
+            return fneq          
+           
             
 
         # Construct the warp kernel
