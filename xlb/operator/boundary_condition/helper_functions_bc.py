@@ -468,7 +468,12 @@ class HelperFunctionsBC(object):
                 u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
 
             # Newton iteration: solve g(u+) = u+ - profile(K/u+) = 0
-            for _ in range(15):
+            #
+            # Capped at 3 iterations.  Each iteration costs 1 log + 4 exp
+            # (reichardt_profile + reichardt_derivative), and on GPU the whole
+            # warp runs until its slowest lane converges, so the early-exit
+            # break below saves far less than the iteration count suggests.
+            for _ in range(3):
                 y_plus = K / wp.max(u_plus, _epsilon)
                 u_profile = reichardt_profile(y_plus)
                 residual = u_plus - u_profile

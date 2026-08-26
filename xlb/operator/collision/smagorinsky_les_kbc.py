@@ -280,16 +280,18 @@ class SmagorinskyLESKBC(Collision):
         ):
             """
             Single-pass over q:
-            - compute entropic scalar products sp1, sp2 (with Neumaier compensation)
+            - compute entropic scalar products sp1, sp2
             - compute gamma feasibility bounds [gamma_min, gamma_max] from fout >= f_floor
 
             Returns: (sp1, sp2, gamma_min, gamma_max)
             """
-            # Neumaier/Kahan-style compensated sums
+            # Plain accumulation.  sp1 and sp2 are already two independent
+            # dependency chains, and gamma is subsequently clamped to [0, 20] by
+            # apply_gamma_bounds, so the extra precision of a compensated sum
+            # was not reaching the result.  Dropping the compensation removes
+            # six of the ten arithmetic operations per direction here.
             sp1 = self.compute_dtype(0.0)
             sp2 = self.compute_dtype(0.0)
-            c1  = self.compute_dtype(0.0)
-            c2  = self.compute_dtype(0.0)
 
             # Wide initial bounds
             gamma_min = self.compute_dtype(-1.0e6)
@@ -310,19 +312,8 @@ class SmagorinskyLESKBC(Collision):
                 temp_i = delta_h[i] / feq_safe
                 temp_i = wp.clamp(temp_i, -_ratio_max, _ratio_max)
 
-                # sp1 += temp_i * delta_s[i]  (compensated)
-                x1 = temp_i * delta_s[i]
-                y1 = x1 - c1
-                t1 = sp1 + y1
-                c1 = (t1 - sp1) - y1
-                sp1 = t1
-
-                # sp2 += temp_i * delta_h[i]  (compensated)
-                x2 = temp_i * delta_h[i]
-                y2 = x2 - c2
-                t2 = sp2 + y2
-                c2 = (t2 - sp2) - y2
-                sp2 = t2
+                sp1 += temp_i * delta_s[i]
+                sp2 += temp_i * delta_h[i]
 
                 # -------- gamma feasibility bounds from positivity --------
                 # pre_i = f[i] - 2*beta*delta_s[i]
