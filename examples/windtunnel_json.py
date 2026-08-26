@@ -543,6 +543,7 @@ def obj_to_binary_stl_stream(
 
 wp.clear_kernel_cache()
 wp.config.quiet = True
+wp.enable_backward = False
 
 def prep_inputs(input_file):
     version = '2027.0'
