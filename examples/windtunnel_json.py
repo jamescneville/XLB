@@ -1250,56 +1250,212 @@ def plot_drag_lift(drag_values, output_dir, script_name, percentile_range=(15, 8
     plt.savefig(os.path.join(output_dir, 'drag_lift_plot.png'))
     plt.close()
 
-def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, level_data, actual_num_levels, sparsity_pattern, boundary_conditions, voxel_size, wheel_ids=[]):
+def compute_voxel_statistics_and_reference_area(
+    jsonfile,
+    sim,
+    h5exporter,
+    level_data,
+    actual_num_levels,
+    sparsity_pattern,
+    boundary_conditions,
+    voxel_size,
+    wheel_ids=None,
+):
     """
-    Compute active/solid voxels, totals, lattice updates, and reference area based on simulation data.
+    Compute active/solid voxel counts, equivalent lattice updates per step,
+    and finest-level YZ projected reference area.
+
+    Performance changes versus the original:
+      1. Removes the unnecessary full-domain sim.macro() call.
+      2. Avoids constructing level_id_field == level masks.
+      3. Avoids np.argwhere() over the entire finest-level sparsity mask.
+      4. Avoids np.unique(..., axis=0) on XYZ/YZ coordinate arrays.
+      5. Uses contiguous per-level slices because MultiresIO.get_fields_data()
+         stores cells level-by-level in sparsity-mask C-order.
+      6. Computes projected YZ occupancy using a compact 1-D boolean projection.
+      7. Processes the finest sparsity mask in chunks to keep peak host memory low.
     """
-    # Compute macro fields
-    sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
+    if wheel_ids is None:
+        wheel_ids = []
+
+    num_levels = int(actual_num_levels)
+    solid_id = np.uint8(255)
+
+    # ------------------------------------------------------------------
+    # Count allocated/active grid cells directly from the sparsity masks.
+    # These counts also define the offsets used by MultiresIO.
+    # ------------------------------------------------------------------
+    level_cell_counts = np.fromiter(
+        (
+            np.count_nonzero(sparsity_pattern[level])
+            for level in range(num_levels)
+        ),
+        dtype=np.int64,
+        count=num_levels,
+    )
+
+    level_offsets = np.empty(num_levels + 1, dtype=np.int64)
+    level_offsets[0] = 0
+    np.cumsum(level_cell_counts, out=level_offsets[1:])
+
+    total_export_cells = int(level_offsets[-1])
+
+    # ------------------------------------------------------------------
+    # Only bc_mask is required.
+    #
+    # Do NOT call sim.macro() here. rho/u are not used by this function.
+    # ------------------------------------------------------------------
     fields_data = h5exporter.get_fields_data({"bc_mask": sim.bc_mask})
-    bc_mask_data = fields_data["bc_mask_0"]
-    level_id_field = h5exporter.level_id_field
+    bc_mask_data = np.asarray(fields_data["bc_mask_0"]).reshape(-1)
 
-    # Compute solid voxels per level (assuming 255 is the solid marker)
-    solid_voxels = []
-    for lvl in range(actual_num_levels):
-        level_mask = level_id_field == lvl
-        solid_voxels.append(np.sum(bc_mask_data[level_mask] == 255))
+    if bc_mask_data.size != total_export_cells:
+        raise RuntimeError(
+            "bc_mask export size does not match sparsity-pattern cell count: "
+            f"{bc_mask_data.size:,} != {total_export_cells:,}"
+        )
 
-    # Compute active voxels (total non-zero in sparsity minus solids)
-    active_voxels = [np.count_nonzero(mask) for mask in sparsity_pattern]
-    active_voxels = [max(0, active_voxels[lvl] - solid_voxels[lvl]) for lvl in range(actual_num_levels)]
+    # ------------------------------------------------------------------
+    # Solid and active voxel counts.
+    #
+    # MultiresIO emits data level-by-level, so simply slice the packed
+    # array rather than creating a full-size level_id boolean array.
+    # ------------------------------------------------------------------
+    solid_voxels_np = np.empty(num_levels, dtype=np.int64)
 
-    # Totals
-    total_voxels = sum(active_voxels)
-    total_lattice_updates_per_step = sum(active_voxels[lvl] * (2 ** (actual_num_levels - 1 - lvl)) for lvl in range(actual_num_levels))
+    for level in range(num_levels):
+        start = int(level_offsets[level])
+        end = int(level_offsets[level + 1])
 
-    # Compute reference area (projected on YZ plane at finest level)
-    finest_level = 0
-    mask_finest = level_id_field == finest_level
-    bc_mask_finest = bc_mask_data[mask_finest]
-    active_indices_finest = np.argwhere(level_data[0][0])
-    
+        solid_voxels_np[level] = np.count_nonzero(
+            bc_mask_data[start:end] == solid_id
+        )
+
+    active_voxels_np = level_cell_counts - solid_voxels_np
+    np.maximum(active_voxels_np, 0, out=active_voxels_np)
+
+    total_voxels = int(active_voxels_np.sum())
+
+    # Acoustic time refinement:
+    # finest level gets highest number of equivalent updates.
+    level_weights = np.left_shift(
+        np.int64(1),
+        np.arange(num_levels - 1, -1, -1, dtype=np.int64),
+    )
+
+    total_lattice_updates_per_step = int(
+        np.dot(active_voxels_np, level_weights)
+    )
+
+    # ------------------------------------------------------------------
+    # Finest-level reference area.
+    # ------------------------------------------------------------------
+    finest_mask = np.asarray(level_data[0][0], dtype=np.bool_)
+
+    finest_start = int(level_offsets[0])
+    finest_end = int(level_offsets[1])
+    bc_mask_finest = bc_mask_data[finest_start:finest_end]
+
+    expected_finest_cells = int(level_cell_counts[0])
+    if bc_mask_finest.size != expected_finest_cells:
+        raise RuntimeError(
+            "Finest-level bc_mask size does not match sparsity mask: "
+            f"{bc_mask_finest.size:,} != {expected_finest_cells:,}"
+        )
+
+    # Determine which packed active cells belong to the vehicle.
     if jsonfile["BCtypes"]["car_voxelization"] == "RAY":
-        target_ids = [bc.id for bc in wheel_ids]
-        target_ids.append(boundary_conditions[0].id)
-        is_target_voxel = np.isin(bc_mask_finest, target_ids)
+        target_ids = [int(boundary_conditions[0].id)]
+        target_ids.extend(int(bc.id) for bc in wheel_ids)
+
+        target_active_cells = np.isin(
+            bc_mask_finest,
+            np.asarray(target_ids, dtype=bc_mask_finest.dtype),
+        )
     else:
-        is_target_voxel = bc_mask_finest == 255
-    
-    solid_voxels_indices = active_indices_finest[is_target_voxel]    
-    unique_jk = np.unique(solid_voxels_indices[:, 1:3], axis=0)
-    reference_area = unique_jk.shape[0]
-    
-    reference_area_physical = reference_area * (voxel_size ** 2)
+        # Preserve existing AABB behaviour.
+        target_active_cells = bc_mask_finest == solid_id
+
+    # ------------------------------------------------------------------
+    # Project target voxels onto the YZ plane.
+    #
+    # For a C-order array with shape (nx, ny, nz):
+    #
+    #   flat_index = x * (ny*nz) + y*nz + z
+    #
+    # Therefore:
+    #
+    #   YZ_index = flat_index % (ny*nz)
+    #
+    # No XYZ coordinate array or sorting/np.unique(axis=0) is needed.
+    # ------------------------------------------------------------------
+    ny = int(finest_mask.shape[1])
+    nz = int(finest_mask.shape[2])
+    yz_size = ny * nz
+
+    yz_occupied = np.zeros(yz_size, dtype=np.bool_)
+
+    flat_finest_mask = finest_mask.reshape(-1)
+
+    # Chunking prevents creation of one potentially huge int64 index array.
+    dense_chunk_size = 8_000_000
+    active_cursor = 0
+
+    for dense_start in range(
+        0,
+        flat_finest_mask.size,
+        dense_chunk_size,
+    ):
+        dense_end = min(
+            dense_start + dense_chunk_size,
+            flat_finest_mask.size,
+        )
+
+        # Local positions of active cells in this dense-mask chunk.
+        local_active = np.flatnonzero(
+            flat_finest_mask[dense_start:dense_end]
+        )
+
+        num_active_chunk = int(local_active.size)
+
+        if num_active_chunk == 0:
+            continue
+
+        packed_end = active_cursor + num_active_chunk
+
+        target_chunk = target_active_cells[
+            active_cursor:packed_end
+        ]
+
+        if np.any(target_chunk):
+            target_dense_indices = (
+                local_active[target_chunk] + dense_start
+            )
+
+            yz_occupied[
+                target_dense_indices % yz_size
+            ] = True
+
+        active_cursor = packed_end
+
+    if active_cursor != bc_mask_finest.size:
+        raise RuntimeError(
+            "Packed finest-level bc_mask ordering does not match "
+            "the finest sparsity mask."
+        )
+
+    reference_area = int(np.count_nonzero(yz_occupied))
+    reference_area_physical = (
+        float(reference_area) * float(voxel_size) ** 2
+    )
 
     return {
-        "active_voxels": active_voxels,
-        "solid_voxels": solid_voxels,
+        "active_voxels": active_voxels_np.tolist(),
+        "solid_voxels": solid_voxels_np.tolist(),
         "total_voxels": total_voxels,
-        "total_lattice_updates_per_step": total_lattice_updates_per_step,
+        "total_lattice_updates_per_step":
+            total_lattice_updates_per_step,
         "reference_area": reference_area,
-        "reference_area_physical": reference_area_physical
+        "reference_area_physical": reference_area_physical,
     }
 
 def save_slices1(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize):
