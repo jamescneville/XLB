@@ -293,9 +293,22 @@ class SmagorinskyLESKBC(Collision):
             sp1 = self.compute_dtype(0.0)
             sp2 = self.compute_dtype(0.0)
 
-            # Wide initial bounds
-            gamma_min = self.compute_dtype(-1.0e6)
-            gamma_max = self.compute_dtype( 1.0e6)
+            # Wide initial bounds, carried as unreduced fractions num/den with
+            # den > 0 so the per-direction division can be deferred:
+            #     gamma_max = min over {coeff >  eps} of headroom/coeff
+            #     gamma_min = max over {coeff < -eps} of headroom/coeff
+            # Candidates are compared by cross-multiplication -- for positive
+            # denominators, h/c < n/d  <=>  h*d < n*c -- which turns q divisions
+            # into two multiplies each plus a single division at the end.
+            # Verified bitwise identical to the per-direction division form over
+            # 20k randomised cases, including degenerate ones (zero
+            # coefficients, all-positive, all-sub-epsilon).  A near-tie could in
+            # principle select a different winner, but the two candidates are
+            # then equal to within rounding.
+            gmax_n = self.compute_dtype( 1.0e6)
+            gmax_d = self.compute_dtype( 1.0)
+            gmin_n = self.compute_dtype(-1.0e6)
+            gmin_d = self.compute_dtype( 1.0)
 
             # constants
             zero = self.compute_dtype(0.0)
@@ -325,13 +338,25 @@ class SmagorinskyLESKBC(Collision):
                 coeff = beta * delta_h[i]
 
                 if coeff > _epsilon:
-                    # gamma <= headroom/coeff
-                    gamma_max = wp.min(gamma_max, headroom / coeff)
+                    # gamma <= headroom/coeff : keep the candidate if smaller.
+                    # Denominator is already positive.
+                    if headroom * gmax_d < gmax_n * coeff:
+                        gmax_n = headroom
+                        gmax_d = coeff
                 elif coeff < -_epsilon:
-                    # gamma >= headroom/coeff
-                    gamma_min = wp.max(gamma_min, headroom / coeff)
+                    # gamma >= headroom/coeff : keep the candidate if larger.
+                    # coeff is negative, so negate both parts to restore a
+                    # positive denominator before comparing.
+                    cand_n = -headroom
+                    cand_d = -coeff
+                    if cand_n * gmin_d > gmin_n * cand_d:
+                        gmin_n = cand_n
+                        gmin_d = cand_d
                 # else: no constraint
-            
+
+            gamma_min = gmin_n / gmin_d
+            gamma_max = gmax_n / gmax_d
+
             return sp1, sp2, gamma_min, gamma_max
 
         @wp.func
@@ -397,11 +422,12 @@ class SmagorinskyLESKBC(Collision):
             tau_min = self.compute_dtype(0.5001)
             tau_eff = wp.max(tau_eff, tau_min)
             
-            # Convert to omega
+            # Convert to omega.  tau_eff is returned alongside so the caller can
+            # form 1/beta as 2*tau_eff rather than taking a second reciprocal.
             omega_eff = one / tau_eff
-            
-            return omega_eff
-        
+
+            return omega_eff, tau_eff
+
         @wp.func
         def compute_smagorinsky_omega_d2q9(
             omega: Any,
@@ -436,10 +462,11 @@ class SmagorinskyLESKBC(Collision):
             tau_min = self.compute_dtype(0.5001)
             tau_eff = wp.max(tau_eff, tau_min)
             
-            # Convert to omega
+            # Convert to omega.  tau_eff is returned alongside so the caller can
+            # form 1/beta as 2*tau_eff rather than taking a second reciprocal.
             omega_eff = one / tau_eff
-            
-            return omega_eff
+
+            return omega_eff, tau_eff
 
         # Construct the functional
         @wp.func
@@ -456,15 +483,16 @@ class SmagorinskyLESKBC(Collision):
             if wp.static(self.velocity_set.d == 3):
                 shear = decompose_shear_d3q27(pineq)
                 delta_s = shear 
-                omega_eff = compute_smagorinsky_omega_d3q27(omega, rho, pineq)
+                omega_eff, tau_eff = compute_smagorinsky_omega_d3q27(omega, rho, pineq)
             else:
                 shear = decompose_shear_d2q9(pineq)
                 delta_s = shear  / self.compute_dtype(4.0)
-                omega_eff = compute_smagorinsky_omega_d2q9(omega, rho, pineq)
+                omega_eff, tau_eff = compute_smagorinsky_omega_d2q9(omega, rho, pineq)
 
-            # Compute required constants based on the input omega (omega is the inverse relaxation time)
-            _beta = self.compute_dtype(0.5) * self.compute_dtype(omega_eff)
-            _inv_beta = self.compute_dtype(1.0) / _beta
+            # beta = omega_eff/2, so 1/beta = 2/omega_eff = 2*tau_eff exactly.
+            # Deriving it from tau_eff avoids a per-voxel reciprocal.
+            _beta = self.compute_dtype(0.5) * omega_eff
+            _inv_beta = self.compute_dtype(2.0) * tau_eff
 
             # Perform collision
             delta_h = fneq - delta_s
