@@ -1,0 +1,201 @@
+{
+
+"mesher":{
+	"type":"mres",
+	"cuboid": [
+	[3, 4, 2.5, 2.5, 0, 4], 
+	[1.2, 1.25, 1.75, 1.75, 0, 1.65],
+	[0.8, 1, 1.25, 1.25, 0, 1.25],
+	[0.4, 0.4, 0.25, 0.25, 0, 0.2]
+	],
+	"mres":{
+		"levels":6,
+		"domain":{
+			"-x": 1.5,
+			"x": 3.0,
+			"-y": 5.0,
+			"y": 5.0,
+			"-z": 0.0,
+			"z": 5.0
+			},	
+		
+		"padding":[
+		[20, 100, 20, 20, 20, 20],
+		[10, 100, 10, 10, 10, 10],
+		[8, 300, 8, 8, 8, 8],
+		[8, 100, 8, 8, 8, 8],
+        [8, 20, 8, 8, 8, 8],
+		[8, 20, 8, 8, 8, 8],
+		[8, 20, 8, 8, 8, 8]
+		],
+		"padding_interior":[
+		[8, 8, 8, 8, 8, 8],
+		[8, 8, 8, 8, 8, 8],
+		[8, 8, 8, 8, 8, 8],
+		[8, 8, 8, 8, 8, 8],
+        [8, 8, 8, 8, 8, 8],
+		[8, 8, 8, 8, 8, 8],
+		[8, 8, 8, 8, 8, 8]
+		],
+		"interior_detect":{
+			"enabled":true,
+			"resolution_level":1,
+			"seal_voxels":4,
+			"smooth_voxels":1,
+			"export_vti":true,
+			"force_exterior":[],
+			"force_interior":[]
+		},
+		"ground_refinement_level":3,
+		"ground_voxel_height":4		
+	},
+	"trim":true,
+	"trim_voxels":4,
+	"close_voxels":0
+},			
+"vehicle":{
+	"body": ["R2_Fixed.stl"],
+	"wheels":[],
+	"targets":{
+		"cd":0.37,
+		"cl":-0.1
+		}
+	
+},
+"outputName": "R2 8mm Perf2 NEW_MAKEMESH_1", 
+"fluid": {
+	"density": 1.2047,
+	"diffusivity": 1.0,
+	"viscosity": 1.817e-05
+		},
+"InletBC":{
+	"x": 27.0,
+	"y": 0.0,
+	"z": 0.0
+	},
+"settings": {	
+	"debug": true,
+	"doublePrecision": false,
+	"iterations": 100,
+	"solutionPrintFreq": 1,
+	"crossover":80, 
+	"preCrossover_frames":1,
+	"postCrossover_frames":1,
+	"ulb":0.12,			
+	"fullData": true,
+	"flowPasses": 2.0,
+	"voxelSize": 0.008,
+	"limit": 500,
+    "optimization":"254",
+    "sgs": 0.1,
+	"isoQuantity":"CpTotalLoss",
+	"isoValue":0.85,
+	"isoGrid": 1024,
+	"isoScale": 1000,
+	"surfaceField": "velocity",
+	"surfaceFieldMin": -1.0,
+	"surfaceFieldMax": 1.0,
+	"surfaceFieldColorMap": "turbo",
+	"surfaceFieldExport":"both",
+	"surfaceFieldScope": "body"
+},
+
+"slices":{
+	"grid_res": 1500, 
+	"velocity": false,
+	"velocityFactor": 1.5,
+	"velocityColorMap":"nipy_spectral",
+	"pressure":false,
+	"pressureMin": 101300,
+	"pressureMax": 101600,
+	"pressureColorMap":"turbo",
+	"cp":false,
+	"cpMin": -1.0,
+	"cpMax": 1.0,
+	"cpColorMap":"bwr",
+	"cptotal":false,
+	"cptotalMin": 0.5,
+	"cptotalMax": 1.0,
+	"cptotalColorMap":"turbo",
+	"cptotalloss":false,
+	"cptotallossMin": 0.0,
+	"cptotallossMax": 0.9,
+	"cptotallossColorMap":"seismic",
+    "numSlices": 51
+
+},
+"BCtypes": {
+	"inlet": "nonequilibrium_regularized",
+	"car": "nonequilibrium_regularized",
+    "car_voxelization":"AABB",    
+	"wheels": "nonequilibrium_regularized",
+    "wheel_voxelization":"AABB",
+    "wheel_motion":true,
+	"ground": "moving",
+	"walls": "moving"
+},	
+"outputSlices": [
+	{
+	"field": "velocity_magnitude",
+	"axis": "X",
+	"height": 3,
+	"heightVec": {
+		"x": 0.0,
+		"y": 0.0,
+		"z": 1.0
+	},
+	"width": 4,
+	"widthVec": {
+		"x": 0.0,
+		"y": 1.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	},
+	{
+	"field": "velocity_magnitude",
+	"axis": "Y",
+	"height": 3,
+	"heightVec": {
+		"x": 0.0,
+		"y": 0.0,
+		"z": 1.0
+	},
+	"width": 12,
+	"widthVec": {
+		"x": 1.0,
+		"y": 0.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	},
+	{
+	"field": "velocity_magnitude",
+	"axis": "Z",
+	"height": 4,
+	"heightVec": {
+		"x": 0.0,
+		"y": 1.0,
+		"z": 0.0
+	},
+	"width": 12,
+	"widthVec": {
+		"x": 1,
+		"y": 0.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	}
+		
+			
+	],
+"alias": {
+	"tolerance":  0.02,
+	"method": "default",
+	"debug": false
+}
+
+}

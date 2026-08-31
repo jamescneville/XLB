@@ -8,6 +8,8 @@ from tabulate import tabulate
 import neon
 import warp as wp
 
+from xlb.utils.interior_detect import build_level_clips, compute_interior_mask
+
 DEVICE = "cuda"
 
 def generate_mesh(
@@ -20,6 +22,8 @@ def generate_mesh(
     ground_refinement_level=-1,
     ground_voxel_height=4,
     downsample=-1,
+    padding_interior_table=None,
+    interior_detect=None,
 ):
     """
     Generate a multi-resolution voxel grid based on an STL file.
@@ -51,6 +55,19 @@ def generate_mesh(
     downsample : int, optional
         The highest level (inclusive) to downsample when saving data, doubling voxel sizes for levels
         0 to `downsample`. If -1, no downsampling is applied. Default is -1.
+    padding_interior_table : list of lists, optional
+        Same layout as `padding_table`, giving the reduced padding to use inside enclosed cavities
+        of the vehicle (cabin, engine bay, trunk). Typically isotropic, e.g. [8, 8, 8, 8, 8, 8],
+        so the long wake padding is not extended through dead air inside the body. Requires
+        `interior_detect`. If None, `padding_table` is used everywhere as before.
+    interior_detect : dict, optional
+        Options for cavity detection, passed to `interior_detect.compute_interior_mask`:
+        `enabled`, `resolution_level` (refinement level whose cell size detection runs at,
+        which also sets the step size of the transitions inside the body), `seal_voxels`
+        (widest gap treated as closed, in cells of that level), `smooth_voxels`, `cache`,
+        `export_vti`, `force_exterior` and `force_interior`. The last two are lists of
+        world-space AABBs [xmin, ymin, zmin, xmax, ymax, zmax] in metres that override the
+        automatic result.
 
     Returns
     -------
@@ -89,6 +106,27 @@ def generate_mesh(
             "-z": 0,
         }
     kernel = calculate_kernel(padding_table)
+
+    kernel_iso, interior_clips = None, None
+    if padding_interior_table and (interior_detect or {}).get("enabled", True):
+        opts = dict(interior_detect or {})
+        opts.pop("enabled", None)
+        print("/// Interior cavity detection...")
+        interior_mask = compute_interior_mask(stl_name, voxSize, **opts)
+
+        # Only clip the fine levels whose padding is actually reduced inside. Once
+        # the two tables agree there is nothing to save, and stopping there keeps
+        # the retraction schedule short. Clipping must not resume at a coarser
+        # level, so stop at the first level where the tables match.
+        n_rows = min(len(padding_table), len(padding_interior_table))
+        n_clipped = 0
+        while n_clipped < n_rows and padding_table[n_clipped] != padding_interior_table[n_clipped]:
+            n_clipped += 1
+        print(f"    Interior padding applied to levels 0-{n_clipped - 1}" if n_clipped else "    Padding tables identical; no clipping")
+
+        kernel_iso = calculate_kernel(padding_interior_table)
+        interior_clips = build_level_clips(interior_mask, len(kernel), voxSize, n_clipped)
+
     return makeMesh(
         levels,
         stl_name,
@@ -99,6 +137,8 @@ def generate_mesh(
         ground_refinement_level=ground_refinement_level,
         ground_voxel_height=ground_voxel_height,
         downsample=downsample,
+        kernel_iso=kernel_iso,
+        interior_clips=interior_clips,
     )
 
 
@@ -113,15 +153,31 @@ def copy_to_padded_kernel(input: wp.array3d(dtype=wp.uint8), padded: wp.array3d(
         padded[i + pad_x, j + pad_y, k + pad_z] = input[i, j, k]
 
 
-# Apply convolution to a padded matrix on GPU
+# Dilate seeds into an existing output mask on GPU.
+#
+# Cells already set are skipped and the kernel loop exits on the first hit, so
+# running a cheap isotropic pass before an expensive anisotropic one is much
+# faster than the equivalent full convolution. Cells inside `clip` are left for
+# other passes to fill; pass use_clip=0 to disable.
 @wp.kernel
-def convolution_kernel(
-    padded: wp.array3d(dtype=wp.uint8), kernel: wp.array3d(dtype=wp.uint8), output: wp.array3d(dtype=wp.uint8), kx: int, ky: int, kz: int
+def dilate_or_kernel(
+    seed: wp.array3d(dtype=wp.uint8),
+    kernel: wp.array3d(dtype=wp.uint8),
+    output: wp.array3d(dtype=wp.uint8),
+    clip: wp.array3d(dtype=wp.uint8),
+    use_clip: int,
+    kx: int,
+    ky: int,
+    kz: int,
 ):
     i, j, k = wp.tid()
-    if i >= padded.shape[0] or j >= padded.shape[1] or k >= padded.shape[2]:
+    if i >= output.shape[0] or j >= output.shape[1] or k >= output.shape[2]:
         return
-    sum_val = wp.uint8(0)
+    if output[i, j, k] != wp.uint8(0):
+        return
+    if use_clip != 0:
+        if clip[i, j, k] != wp.uint8(0):
+            return
     for di in range(kx):
         for dj in range(ky):
             for dk in range(kz):
@@ -129,33 +185,84 @@ def convolution_kernel(
                     ii = i + di - kx // 2
                     jj = j + dj - ky // 2
                     kk = k + dk - kz // 2
-                    if 0 <= ii < padded.shape[0] and 0 <= jj < padded.shape[1] and 0 <= kk < padded.shape[2]:
-                        sum_val += padded[ii, jj, kk]
-    if sum_val > 0:
-        output[i, j, k] = wp.uint8(1)
-    else:
-        output[i, j, k] = wp.uint8(0)
+                    if 0 <= ii < seed.shape[0] and 0 <= jj < seed.shape[1] and 0 <= kk < seed.shape[2]:
+                        if seed[ii, jj, kk] != 0:
+                            output[i, j, k] = wp.uint8(1)
+                            return
 
 
-# Expand a voxel matrix using convolution-based growth on GPU
-def grow_gpu(matrix, voxSize, origin, kernel):
-    pad = (np.array(kernel.shape) * 0.5).astype(int)
-    print("    Grow padding: ", pad)
-    wp_matrix = wp.array(matrix.astype(np.uint8), dtype=wp.uint8, device=DEVICE)
-    wp_kernel = wp.array(kernel.astype(np.uint8), dtype=wp.uint8, device=DEVICE)
-    padded_shape = tuple(np.array(matrix.shape) + 2 * pad)
+def _upload_padded(matrix, padded_shape, pad):
+    """Copy a host mask into a zero-padded device buffer."""
+    wp_matrix = wp.array(np.ascontiguousarray(matrix, dtype=np.uint8), dtype=wp.uint8, device=DEVICE)
     padded = wp.zeros(padded_shape, dtype=wp.uint8, device=DEVICE)
     nx, ny, nz = matrix.shape
     wp.launch(kernel=copy_to_padded_kernel, dim=(nx, ny, nz), inputs=[wp_matrix, padded, pad[0], pad[1], pad[2]], device=DEVICE)
+    return padded
+
+
+# Expand a voxel matrix using dilation on GPU
+def grow_gpu(matrix, voxSize, origin, kernel, kernel_iso=None, interior=None):
+    """
+    Dilate `matrix` by a box kernel.
+
+    With `kernel_iso` and `interior` supplied the growth is split in two, which
+    is exact because dilation is a union over seeds:
+
+      - `kernel_iso` is applied to every seed voxel and is never clipped, so
+        every surface keeps its minimum isotropic refinement band regardless of
+        how the interior was classified.
+      - the anisotropic `kernel` is seeded only outside the interior cavity and
+        is forbidden from growing into it. Clipping the wake is what actually
+        saves voxels: the long +x kernel seeded at the front bumper otherwise
+        punches straight through the cabin no matter how its seeds are tagged.
+
+    `interior` is an `interior_detect.InteriorClip` for this level.
+    """
+    kernels = [kernel] if kernel_iso is None else [kernel_iso, kernel]
+    pad = np.max([(np.array(k.shape) * 0.5).astype(int) for k in kernels], axis=0)
+    print("    Grow padding: ", pad)
+
+    padded_shape = tuple(int(s) for s in np.array(matrix.shape) + 2 * pad)
     output = wp.zeros(padded_shape, dtype=wp.uint8, device=DEVICE)
-    nx, ny, nz = padded_shape
+    no_clip = wp.zeros((1, 1, 1), dtype=wp.uint8, device=DEVICE)
+
+    seed_all = _upload_padded(matrix, padded_shape, pad)
+    originPad = origin - pad * voxSize
+
+    if kernel_iso is not None:
+        # Isotropic band from every seed, unclipped.
+        wp_iso = wp.array(kernel_iso.astype(np.uint8), dtype=wp.uint8, device=DEVICE)
+        kx, ky, kz = kernel_iso.shape
+        wp.launch(
+            kernel=dilate_or_kernel,
+            dim=padded_shape,
+            inputs=[seed_all, wp_iso, output, no_clip, 0, kx, ky, kz],
+            device=DEVICE,
+        )
+
+        exterior_seed = matrix & ~interior.seed.resample(matrix.shape, origin, voxSize)
+        seed_wake = _upload_padded(exterior_seed, padded_shape, pad)
+        clip = wp.array(
+            np.ascontiguousarray(interior.clip.resample(padded_shape, originPad, voxSize), dtype=np.uint8),
+            dtype=wp.uint8,
+            device=DEVICE,
+        )
+        use_clip = 1
+    else:
+        seed_wake = seed_all
+        clip = no_clip
+        use_clip = 0
+
+    wp_kernel = wp.array(kernel.astype(np.uint8), dtype=wp.uint8, device=DEVICE)
     kx, ky, kz = kernel.shape
-    wp.launch(kernel=convolution_kernel, dim=(nx, ny, nz), inputs=[padded, wp_kernel, output, kx, ky, kz], device=DEVICE)
+    wp.launch(
+        kernel=dilate_or_kernel,
+        dim=padded_shape,
+        inputs=[seed_wake, wp_kernel, output, clip, use_clip, kx, ky, kz],
+        device=DEVICE,
+    )
     wp.synchronize()
-    r = output.numpy().astype(bool)
-    kernel_shape = np.array(kernel.shape)
-    originPad = origin - (kernel_shape - 1) * voxSize * 0.5
-    return r, originPad
+    return output.numpy().astype(bool), originPad
 
 
 # Compute OR of 2x2x2 blocks in a padded matrix on GPU
@@ -435,7 +542,25 @@ def print_padding_table(padding_values):
 
 
 # Generate a multi-level voxel mesh from an STL file
-def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, ground_refinement_level=-1, ground_voxel_height=4, downsample=-1):
+def makeMesh(
+    levels,
+    filename,
+    voxSize,
+    kernel,
+    domainMultiplier,
+    close=True,
+    ground_refinement_level=-1,
+    ground_voxel_height=4,
+    downsample=-1,
+    kernel_iso=None,
+    interior_clips=None,
+):
+    def grow_args(level):
+        """Split-dilation arguments for a level, or plain dilation where not clipped."""
+        if kernel_iso is None or interior_clips is None or interior_clips[level] is None:
+            return {}
+        return {"kernel_iso": kernel_iso[level], "interior": interior_clips[level]}
+
     stem = Path(filename).stem
     tic = time.perf_counter()
 
@@ -508,7 +633,7 @@ def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, gr
         dOrigin = domainMin
         level_data.append((dr, v, dOrigin, 0))
     else:
-        g, origin = grow_gpu(matrix, voxSize, origin, kernel[0])
+        g, origin = grow_gpu(matrix, voxSize, origin, kernel[0], **grow_args(0))
         f, origin = fill_gpu(g, voxSize, origin, close)
         df, origin = crop_gpu(f, origin, domainMin, domainMax, v)
         df = pad_to_even(df)
@@ -529,7 +654,7 @@ def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, gr
             full_shape = np.round(domainSize / v).astype(int)
 
             if l < levels - 1:
-                dg, dOrigin = grow_gpu(d, v, dOrigin, kernel[l])
+                dg, dOrigin = grow_gpu(d, v, dOrigin, kernel[l], **grow_args(l))
                 df_natural, dOrigin = fill_gpu(dg, v, dOrigin, close)
                 df_natural, dOrigin = crop_gpu(df_natural, dOrigin, domainMin, domainMax, v)
                 df_natural = pad_to_even(df_natural)

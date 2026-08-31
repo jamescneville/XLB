@@ -910,6 +910,8 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
             jsonfile['mesher']['mres']['domain'],
             ground_refinement_level=jsonfile['mesher']['mres']['ground_refinement_level'],
             ground_voxel_height=jsonfile['mesher']['mres']['ground_voxel_height'],
+            padding_interior_table=jsonfile['mesher']['mres'].get('padding_interior'),
+            interior_detect=jsonfile['mesher']['mres'].get('interior_detect'),
         )
     elif mesher_type == "cuboid":  
         # Compute translation to put mesh into first octant of the domain
