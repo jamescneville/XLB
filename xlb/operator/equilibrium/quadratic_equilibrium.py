@@ -65,6 +65,55 @@ class QuadraticEquilibrium(Equilibrium):
 
             return feq
         
+        # q = 27 exceeds Warp's default max_unroll (16), so a single loop over
+        # the velocity set stays rolled.  That makes _w[l] and _c[d, l] runtime
+        # reads of a wp.constant matrix and turns the six sign tests below into
+        # real branches -- 162 of them per voxel for D3Q27 -- as well as forcing
+        # feq into local memory via the dynamic write.
+        #
+        # Splitting the sweep into groups of four puts every loop under the
+        # unroll limit, so l becomes a compile-time constant: the coefficient
+        # reads fold, all six branches resolve at compile time, and each
+        # direction collapses to between one and four multiplies.
+        _n_groups = self.velocity_set.q // 4
+        _tail_start = 4 * _n_groups
+
+        @wp.func
+        def product_equilibrium_entry(
+            l: int,
+            base: Any,
+            Bx: Any,
+            inv_Bx: Any,
+            By: Any,
+            inv_By: Any,
+            Bz: Any,
+            inv_Bz: Any,
+        ):
+            # One lattice direction of the product-form equilibrium.  Called
+            # with a literal l so _c/_w fold and the sign tests disappear.
+            val = base * self.compute_dtype(_w[l])
+
+            cx = _c[0, l]
+            if cx == 1:
+                val *= Bx
+            elif cx == -1:
+                val *= inv_Bx
+
+            cy = _c[1, l]
+            if cy == 1:
+                val *= By
+            elif cy == -1:
+                val *= inv_By
+
+            if wp.static(self.velocity_set.d == 3):
+                cz = _c[2, l]
+                if cz == 1:
+                    val *= Bz
+                elif cz == -1:
+                    val *= inv_Bz
+
+            return val
+
         # Construct the full product equilibrium functional
         @wp.func
         def functional(
@@ -117,29 +166,17 @@ class QuadraticEquilibrium(Equilibrium):
                 Psi = Psi * Az
 
             base = rho * Psi
-            for l in range(self.velocity_set.q):
-                val = base * self.compute_dtype(_w[l]) 
 
-                cx = _c[0, l]
-                if cx == 1:
-                    val *= Bx
-                elif cx == -1:
-                    val *= inv_Bx
+            # Grouped by four so each loop stays under Warp's unroll limit; see
+            # the note on product_equilibrium_entry above.
+            for g in range(_n_groups):
+                feq[4 * g + 0] = product_equilibrium_entry(4 * g + 0, base, Bx, inv_Bx, By, inv_By, Bz, inv_Bz)
+                feq[4 * g + 1] = product_equilibrium_entry(4 * g + 1, base, Bx, inv_Bx, By, inv_By, Bz, inv_Bz)
+                feq[4 * g + 2] = product_equilibrium_entry(4 * g + 2, base, Bx, inv_Bx, By, inv_By, Bz, inv_Bz)
+                feq[4 * g + 3] = product_equilibrium_entry(4 * g + 3, base, Bx, inv_Bx, By, inv_By, Bz, inv_Bz)
 
-                cy = _c[1, l]
-                if cy == 1:
-                    val *= By
-                elif cy == -1:
-                    val *= inv_By
-
-                if wp.static(self.velocity_set.d == 3):
-                    cz = _c[2, l]
-                    if cz == 1:
-                        val *= Bz
-                    elif cz == -1:
-                        val *= inv_Bz
-
-                feq[l] = val
+            for l in range(_tail_start, self.velocity_set.q):
+                feq[l] = product_equilibrium_entry(l, base, Bx, inv_Bx, By, inv_By, Bz, inv_Bz)
 
             return feq
 
