@@ -353,11 +353,16 @@ class MeshBoundaryMasker(Operator):
         bc.__dict__.pop("mesh_vertices", None)
 
         mesh_indices = np.arange(mesh_vertices.shape[0])
-        mesh = wp.Mesh(
-            points=wp.array(mesh_vertices, dtype=wp.vec3),
-            indices=wp.array(mesh_indices, dtype=wp.int32),
-        )
-        mesh_id = wp.uint64(mesh.id)
+
+        # Only mesh.id is handed to the kernels, so the wp.Mesh and the arrays it points
+        # at have to outlive this call. Letting them go out of scope leaves mesh_id
+        # dangling: it keeps working only because warp defers its frees until the next
+        # context synchronize, so anything that synchronizes before the mesh queries run
+        # (a timing probe, a counter read-back, an exporter) frees the BVH underneath it.
+        self._mesh_points = wp.array(mesh_vertices, dtype=wp.vec3)
+        self._mesh_indices = wp.array(mesh_indices, dtype=wp.int32)
+        self._mesh = wp.Mesh(points=self._mesh_points, indices=self._mesh_indices)
+        mesh_id = wp.uint64(self._mesh.id)
         bc_id = bc.id
         return mesh_id, bc_id
 
