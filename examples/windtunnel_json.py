@@ -28,6 +28,7 @@ from xlb.operator.boundary_condition import (
 )
 from xlb.operator.boundary_masker import MeshVoxelizationMethod
 from xlb.utils.mesher import prepare_sparsity_pattern, make_cuboid_mesh, MultiresIO
+from xlb.utils.live_view import LiveView
 from xlb.utils import UnitConvertor
 from xlb.utils.makemesh import generate_mesh
 from xlb.operator.force import MultiresMomentumTransfer
@@ -868,7 +869,10 @@ def prep_inputs(input_file):
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        body_vertices,
+        wheel_vertices,
+        actual_num_levels
         )
 
 
@@ -2272,11 +2276,16 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
         )
 
     if not render_fields:
-        raise ValueError(
-            "No slice fields are enabled. "
-            "Set at least one of velocity, pressure, cp, cptotal, or cptotalloss "
-            "to true in jsonfile['slices']."
+        # Not an error: disabling every slice field is a valid way to turn slice
+        # output off. Skip rendering and let the caller carry on with the rest of
+        # the post-processing (average HDF5, surface VTK, isosurfaces).
+        print(
+            "\nNo slice fields are enabled; skipping slice output. "
+            "Set velocity, pressure, cp, cptotal, or cptotalloss to true in "
+            "jsonfile['slices'] to generate slices."
         )
+        jsonfile["outputSlices"] = []
+        return
 
     print("\nEnabled slice fields:")
     for field_spec in render_fields:
@@ -2570,8 +2579,50 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
 
     print(f"\nTime to save all images {time.time() - tic} seconds.")
 
+def make_live_view(jsonfile, grid_shape_zip, actual_num_levels, body_vertices, wheel_vertices, ulb, output_dir):
+    """Build the realtime viewer, or return None if it is not enabled.
+
+    Enabled by ``XLB_LIVE_VIEW=1`` in the environment or by a ``liveView`` block
+    under ``settings`` in the job JSON. Every LiveView keyword is passed through,
+    so resolution / fps / iso level can be tuned per job without code changes:
+
+        "settings": {
+            "liveView": {"enabled": true, "width": 1600, "height": 900, "fps": 20}
+        }
+
+    A failure here is never allowed to take down a solve -- visualization is
+    strictly a monitor.
+    """
+    cfg = dict(jsonfile.get('settings', {}).get('liveView', {}) or {})
+    enabled = cfg.pop('enabled', None)
+    if enabled is None:
+        enabled = os.environ.get('XLB_LIVE_VIEW', '').lower() in ('1', 'true', 'yes')
+    if not enabled:
+        return None
+
+    bodies = []
+    if body_vertices is not None:
+        bodies.append(body_vertices)
+    if wheel_vertices is not None:
+        bodies.extend(wheel_vertices)
+
+    cfg.setdefault('output_dir', os.path.join(output_dir, 'live_view'))
+
+    try:
+        return LiveView(
+            grid_shape_finest=grid_shape_zip,
+            num_levels=actual_num_levels,
+            body_vertices=bodies,
+            u_ref=ulb,
+            **cfg,
+        )
+    except Exception as exc:
+        print(f"[live_view] disabled: {exc}")
+        return None
+
+
 def solve(
-        sim, 
+        sim,
         ulb,
         num_steps, 
         h5exporter, 
@@ -2589,9 +2640,12 @@ def solve(
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        body_vertices=None,
+        wheel_vertices=None,
+        actual_num_levels=1
         ):
-    
+
     # -------------------------- Simulation Loop --------------------------
     wp.synchronize()
     print(f"\n*******\nSolver Started\n*******\n")
@@ -2619,6 +2673,11 @@ def solve(
     final_print_interval = max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq']  / 100.0)))
     h5exporter.start_time_average()
 
+    # Realtime Q-criterion viewer. Off unless asked for, so existing runs and the
+    # SCM worker are unaffected; enable with XLB_LIVE_VIEW=1 or a "liveView"
+    # block under settings.
+    live_view = make_live_view(jsonfile, grid_shape_zip, actual_num_levels, body_vertices, wheel_vertices, ulb, output_dir)
+
     if jsonfile['settings']['debug']:
         for step in range(num_steps):
             solution_time =(time.time()-solve_start)/60
@@ -2627,6 +2686,10 @@ def solve(
             # whole interval at each MLUPS print instead.
             sim.step()
             steps_since_last_print += 1
+            if live_view is not None and live_view.maybe_render(sim, step=step, mlups=MLUPS):
+                # Rendering syncs and takes GPU time, so discount it from the
+                # throughput interval -- MLUPS should report the solver, not the viewer.
+                interval_start += live_view.last_render_seconds
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
             #scm_progress(np.floor(percent_complete))
             if step % int(num_steps / 100) == 0:
@@ -2833,6 +2896,10 @@ def solve(
             # whole interval at each MLUPS print instead.
             sim.step()
             steps_since_last_print += 1
+            if live_view is not None and live_view.maybe_render(sim, step=step, mlups=MLUPS):
+                # Rendering syncs and takes GPU time, so discount it from the
+                # throughput interval -- MLUPS should report the solver, not the viewer.
+                interval_start += live_view.last_render_seconds
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
 
             end_time = time.time()
@@ -2987,9 +3054,12 @@ def solve(
                 "outputName": jsonfile['outputName'],
                 "outputSlices": jsonfile['outputSlices']
                 }, file, indent=4) # indent for pretty-printing
-            print(f"Results Json written to {os.path.join(output_dir, 'Results.json')} successfully.")        
-            
+            print(f"Results Json written to {os.path.join(output_dir, 'Results.json')} successfully.")
+
         scm_results_available(True)
+
+    if live_view is not None:
+        live_view.close()
 
 
 def main(argv):
