@@ -12,6 +12,7 @@ the test does not drag in jax/neon.
 import importlib.util
 import math
 import pathlib
+import queue
 import sys
 
 import numpy as np
@@ -63,16 +64,21 @@ def _solid_body_rotation(shape, omega):
     return vel
 
 
+def _fluid_flags(shape, level=0, device=None):
+    """flags byte for uniform fluid sourced from a single Neon level."""
+    return wp.full(shape, wp.uint8(level + 1), dtype=wp.uint8, device=device)
+
+
 def test_q_kernel_matches_solid_body_rotation(lv, device):
     shape = (24, 24, 12)
     omega = 0.01
     u_ref = 1.0  # so the normalisation is a no-op and we can compare directly
 
     vel = wp.array(_solid_body_rotation(shape, omega), dtype=wp.float32, device=device)
-    flags = wp.full(shape, wp.uint8(1), dtype=wp.uint8, device=device)
+    flags = _fluid_flags(shape, level=0, device=device)
     qv = wp.zeros((2, *shape), dtype=wp.float32, device=device)
 
-    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0 / u_ref], device=device)
+    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0 / u_ref, 0], device=device)
 
     out = qv.numpy()
     interior = (slice(1, -1),) * 3
@@ -81,19 +87,65 @@ def test_q_kernel_matches_solid_body_rotation(lv, device):
     np.testing.assert_allclose(out[1][interior], 2.0 * omega, rtol=1e-4)
 
 
+def test_q_kernel_strided_stencil_recovers_the_coarse_gradient(lv, device):
+    """A coarse level replicated over blocks must still give the right gradient.
+
+    This is the grid-aligned-slab bug. With a stride-1 stencil, a block-constant
+    field differences to zero inside each block and dumps the whole jump onto
+    block faces, amplified by the block size. Striding by the source cell size
+    must instead reproduce the same Q as the unreplicated field.
+    """
+    omega = 0.01
+    render_exp = 0
+    source_level = 2
+    d = 1 << (source_level - render_exp)  # 4 render cells per source cell
+
+    fine_shape = (24, 24, 24)
+    fine = _solid_body_rotation(fine_shape, omega)
+
+    # Replicate each source cell across a d^3 block, exactly as the staging
+    # container does for a level coarser than the render grid.
+    coarse = np.repeat(np.repeat(np.repeat(fine, d, axis=1), d, axis=2), d, axis=3)
+    shape = coarse.shape[1:]
+
+    vel = wp.array(np.ascontiguousarray(coarse), dtype=wp.float32, device=device)
+    flags = _fluid_flags(shape, level=source_level, device=device)
+    qv = wp.zeros((2, *shape), dtype=wp.float32, device=device)
+
+    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0, render_exp], device=device)
+
+    out = qv.numpy()
+    guard = lv._Q_INVALID * 0.5
+    interior = (slice(2 * d, -2 * d),) * 3
+
+    q_in = out[0][interior]
+    w_in = out[1][interior]
+    assert np.all(q_in > guard), "strided stencil should leave the block interiors valid"
+
+    # Solid-body rotation differenced at the source spacing, expressed per
+    # render-cell length: omega is per source cell, so per render cell it is
+    # omega/d, giving Q = (omega/d)^2 and |w| = 2*omega/d.
+    np.testing.assert_allclose(q_in, (omega / d) ** 2, rtol=2e-3)
+    np.testing.assert_allclose(w_in, 2.0 * omega / d, rtol=2e-3)
+
+    # The decisive part: no grid-aligned structure. A stride-1 stencil would make
+    # Q vary hugely between block interiors and block faces.
+    assert q_in.std() / q_in.mean() < 1e-2, "Q should be smooth across blocks, not concentrated at faces"
+
+
 def test_q_kernel_invalidates_boundary_neighbourhoods(lv, device):
     """A single non-fluid cell must invalidate its whole 6-neighbourhood."""
     shape = (12, 12, 12)
 
     vel = wp.array(_solid_body_rotation(shape, 0.01), dtype=wp.float32, device=device)
 
-    flags_np = np.ones(shape, dtype=np.uint8)
-    flags_np[6, 6, 6] = 2  # boundary cell
+    flags_np = np.ones(shape, dtype=np.uint8)  # level 0 fluid everywhere
+    flags_np[6, 6, 6] = 1 | lv._BOUNDARY_BIT  # boundary cell, still level 0
     flags_np[3, 3, 3] = 0  # never written
     flags = wp.array(flags_np, dtype=wp.uint8, device=device)
 
     qv = wp.zeros((2, *shape), dtype=wp.float32, device=device)
-    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0], device=device)
+    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0, 0], device=device)
 
     q = qv.numpy()[0]
     guard = lv._Q_INVALID * 0.5
@@ -109,6 +161,113 @@ def test_q_kernel_invalidates_boundary_neighbourhoods(lv, device):
     # The grid rim is invalid too, since central differences need a border.
     assert q[0, 5, 5] < guard
     assert q[-1, 5, 5] < guard
+
+
+def test_q_kernel_refuses_to_difference_across_a_level_interface(lv, device):
+    """The refinement-interface artifact: a seam between two levels renders as a
+    perfect plane unless Q is masked where the stencil spans levels.
+
+    Velocity here is a single smooth field, so any Q the kernel reports at the
+    seam would be real. The point is that the *source data* is discontinuous
+    across a real interface, so the kernel must refuse to difference there at
+    all -- which is a property of the flags, not of the velocity.
+    """
+    shape = (16, 16, 16)
+    vel = wp.array(_solid_body_rotation(shape, 0.01), dtype=wp.float32, device=device)
+
+    # Half the grid comes from level 0 (stride 1 at render_exp=0), half from
+    # level 1 (stride 2), so the masked shell is thicker on the coarser side.
+    flags_np = np.ones(shape, dtype=np.uint8)
+    flags_np[8:, :, :] = 2  # level 1
+    flags = wp.array(flags_np, dtype=wp.uint8, device=device)
+
+    qv = wp.zeros((2, *shape), dtype=wp.float32, device=device)
+    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0, 0], device=device)
+
+    q = qv.numpy()[0]
+    guard = lv._Q_INVALID * 0.5
+
+    # i=7 reaches i+1=8 (level 1); i=8 and i=9 reach i-2=6,7 (level 0).
+    assert np.all(q[7, 1:-1, 1:-1] < guard), "level-0 side of the seam must be masked"
+    assert np.all(q[8, 2:-2, 2:-2] < guard), "level-1 side of the seam must be masked"
+    assert np.all(q[9, 2:-2, 2:-2] < guard), "stride-2 reaches two cells across the seam"
+
+    # Well away from the seam, both levels still produce valid Q. The level-1
+    # slice starts two cells in because its stencil strides by two.
+    assert np.all(q[3, 1:-1, 1:-1] > guard), "level-0 interior should be unaffected"
+    assert np.all(q[6, 1:-1, 1:-1] > guard), "level-0 cells not reaching the seam stay valid"
+    assert np.all(q[12, 2:-2, 2:-2] > guard), "level-1 interior should be unaffected"
+    assert np.all(q[10, 2:-2, 2:-2] > guard), "first level-1 cell whose stencil clears the seam"
+
+
+def test_q_is_valid_across_a_full_nested_hierarchy(lv, device):
+    """Regression for the empty-picture bug: 4 valid bricks out of 50,337.
+
+    A 6-level car case has *small* boxes at the fine levels and the wake out in
+    the coarse ones. Excluding levels coarser than the render grid therefore left
+    almost nothing valid, and the isosurface was blank while every other number
+    in the log looked plausible. With all levels staged and the stencil strided
+    per level, most of the grid must carry usable Q.
+    """
+    n = 128
+    shape = (n, n, n)
+    render_exp = 2
+    num_levels = 6
+
+    # Nested boxes, coarsest covering everything, each finer one half the width
+    # -- the same shape as a windtunnel refinement stack.
+    flags_np = np.full(shape, num_levels, dtype=np.uint8)  # level 5 everywhere
+    for level in range(num_levels - 2, -1, -1):
+        half = n // (2 ** (num_levels - 1 - level) * 2)
+        lo = [n // 2 - half] * 3
+        hi = [n // 2 + half] * 3
+        flags_np[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]] = level + 1
+
+    present = {int(v) - 1 for v in np.unique(flags_np)}
+    assert present == set(range(num_levels)), f"test setup should exercise every level, got {sorted(present)}"
+
+    # Velocity replicated at each level's own block granularity, as staging does.
+    base = _solid_body_rotation(shape, 0.01)
+    vel_np = np.empty_like(base)
+    for level in range(num_levels):
+        d = 1 << max(level - render_exp, 0)
+        mask = flags_np == (level + 1)
+        if d == 1:
+            blocky = base
+        else:
+            # Snap each component to its block origin value.
+            idx = (np.arange(n) // d) * d
+            blocky = base[:, idx][:, :, idx][:, :, :, idx]
+        vel_np[:, mask] = blocky[:, mask]
+
+    vel = wp.array(np.ascontiguousarray(vel_np), dtype=wp.float32, device=device)
+    flags = wp.array(flags_np, dtype=wp.uint8, device=device)
+    qv = wp.zeros((2, *shape), dtype=wp.float32, device=device)
+
+    wp.launch(lv._q_kernel, dim=shape, inputs=[vel, flags, qv, 1.0, render_exp], device=device)
+
+    q = qv.numpy()[0]
+    valid_frac = float(np.count_nonzero(q > lv._Q_INVALID * 0.5)) / q.size
+
+    assert valid_frac > 0.5, f"only {valid_frac * 100:.1f}% of cells carry valid Q; the picture would be near-empty"
+
+    # Every level must contribute some valid cells, not just the 1:1 one.
+    for level in sorted(present):
+        sel = (flags_np == (level + 1)) & (q > lv._Q_INVALID * 0.5)
+        assert sel.any(), f"level {level} contributed no valid Q at all"
+
+
+def test_flags_encoding_round_trips_all_levels(lv):
+    """level+1 must fit the nibble without colliding with the boundary bit."""
+    for level in range(lv._MAX_ENCODABLE_LEVELS):
+        code = level + 1
+        assert code & lv._LEVEL_MASK == code, f"level {level} overflows the nibble"
+        assert code & lv._BOUNDARY_BIT == 0, f"level {level} collides with the boundary bit"
+        assert code != 0, "no level may encode as unwritten"
+
+        marked = code | lv._BOUNDARY_BIT
+        assert marked & lv._LEVEL_MASK == code, "boundary bit must not corrupt the level"
+        assert marked != code, "a boundary cell must be distinguishable from fluid"
 
 
 def test_brick_kernel_is_overlapping_max(lv, device):
@@ -290,6 +449,71 @@ def test_turbo_endpoints_and_clamping(lv, device):
     assert c[4][0] > c[4][2], "red should dominate high values"
 
 
+def test_scatter_loop_bound_from_array_is_not_unrolled(device):
+    """Mirror of the Neon staging kernel's scatter loop.
+
+    The staging container cannot capture its loop bound as a python int: warp
+    fully unrolls range() over a compile-time constant, and a coarse level in a
+    6-level case covers 32 render cells per axis -- a 32768-body unrolled triple
+    loop. Reading the bound back from a device array forces a dynamic loop.
+
+    The bound is varied at *launch* time here, over a single compiled kernel,
+    which is only possible if the loop really is dynamic.
+    """
+
+    @wp.kernel
+    def scatter(
+        n_arr: wp.array(dtype=wp.int32),
+        origin: wp.array2d(dtype=wp.int32),
+        dst: wp.array3d(dtype=wp.uint8),
+    ):
+        c = wp.tid()
+        n = n_arr[0]
+
+        rx = origin[c, 0]
+        ry = origin[c, 1]
+        rz = origin[c, 2]
+
+        nx = dst.shape[0]
+        ny = dst.shape[1]
+        nz = dst.shape[2]
+
+        for a in range(n):
+            x = rx + a
+            if x < nx:
+                for b in range(n):
+                    y = ry + b
+                    if y < ny:
+                        for d in range(n):
+                            z = rz + d
+                            if z < nz:
+                                dst[x, y, z] = wp.uint8(1)
+
+    shape = (64, 64, 64)
+
+    for n in (1, 4, 32):
+        n_arr = wp.array([n], dtype=wp.int32, device=device)
+        # One coarse cell at the origin, one deliberately overhanging the far
+        # corner so the bounds guards are exercised.
+        origins = np.array([[0, 0, 0], [shape[0] - 2, shape[1] - 2, shape[2] - 2]], dtype=np.int32)
+        origin = wp.array(origins, dtype=wp.int32, device=device)
+        dst = wp.zeros(shape, dtype=wp.uint8, device=device)
+
+        wp.launch(scatter, dim=origins.shape[0], inputs=[n_arr, origin, dst], device=device)
+
+        out = dst.numpy()
+        assert out[:n, :n, :n].all(), f"n={n}: scatter block not filled"
+
+        # The overhanging cell must clip to the grid rather than wrap or corrupt,
+        # and nothing outside the two blocks may be touched. The blocks are
+        # disjoint for every n tested here (n <= 32 < 62). Note the second block
+        # is anchored at 62 and extends forward, so it is clipped to min(n, 2).
+        o = shape[0] - 2
+        clipped = min(n, 2)
+        assert out[o : o + clipped, o : o + clipped, o : o + clipped].all(), f"n={n}: clipped scatter lost its in-bounds part"
+        assert out.sum() == n**3 + clipped**3, f"n={n}: wrote outside the scatter blocks"
+
+
 def test_pick_render_level_respects_budget(lv):
     shape = (2000, 800, 600)
     budget = 512 * 1024 * 1024
@@ -336,3 +560,226 @@ def test_camera_elevation_is_clamped(lv):
     for v in (fwd, right, up):
         assert np.all(np.isfinite([v[0], v[1], v[2]]))
     np.testing.assert_allclose(np.linalg.norm([right[0], right[1], right[2]]), 1.0, atol=1e-5)
+
+
+class _FakeBrick:
+    """Stands in for the device brick array; only ``numpy()`` is used."""
+
+    def __init__(self, values):
+        self._values = np.asarray(values, dtype=np.float32)
+
+    def numpy(self):
+        return self._values
+
+    def set(self, values):
+        self._values = np.asarray(values, dtype=np.float32)
+
+
+def _calib_stub(lv, **overrides):
+    """Minimal duck-typed object for exercising LiveView._calibrate in isolation."""
+
+    class Stub:
+        pass
+
+    s = Stub()
+    s._brick = _FakeBrick(np.full(64, 1.0))
+    s.iso_brick_fraction = 0.05
+    s.iso_smoothing = 0.2
+    s.q_iso = 0.0
+    s.w_max = 1.0
+    s._needs_calibration = True
+    s.verbose = False
+    for k, v in overrides.items():
+        setattr(s, k, v)
+    return s
+
+
+def test_calibrate_leaves_the_target_brick_fraction_above_the_iso_level(lv):
+    """The level must be a percentile of the field, not a fraction of its peak.
+
+    This is the bug that produced a blank screen at 2.4 s/frame: scaling the
+    peak put the level *below* the field floor, so no sample could bracket a
+    crossing and every ray traversed the whole volume. Occupancy is the quantity
+    that has to be controlled, because it bounds both cost and visibility.
+    """
+    s = _calib_stub(lv, iso_brick_fraction=0.05)
+
+    # A field whose peak is orders of magnitude above its bulk -- exactly the
+    # shape that breaks a peak-scaled threshold. Log-spread so there are no
+    # exact ties, as in a real field.
+    rng = np.random.default_rng(0)
+    values = np.concatenate([
+        10.0 ** rng.uniform(-10.0, -8.0, 1000),  # quiet freestream
+        10.0 ** rng.uniform(-6.0, -3.0, 200),  # wake structure
+    ])
+    s._brick.set(values)
+
+    lv.LiveView._calibrate(s, force=True)
+
+    positive = values[values > 0.0]
+    occupied = np.count_nonzero(positive >= s.q_iso) / positive.size
+    assert occupied == pytest.approx(0.05, abs=0.01), f"occupancy {occupied:.3f} should track iso_brick_fraction"
+
+    # And crucially the level sits inside the field, so a crossing can bracket.
+    # A peak-scaled level (0.02 * max) would fall far below the field floor here,
+    # which is precisely the blank-and-slow failure.
+    assert values.min() < s.q_iso < values.max()
+    assert s.q_iso > 0.02 * values.max() * 1.0e-3, "sanity: level is nowhere near a peak-scaled one"
+
+
+def test_calibrate_ignores_strain_dominated_bricks(lv):
+    """Q <= 0 bricks hold no vortex and must not drag the percentile down.
+
+    Most of a windtunnel domain is quiet freestream, so if non-positive bricks
+    counted they would dominate the distribution and pull the level below
+    anything the isosurface could occupy.
+    """
+    s = _calib_stub(lv, iso_brick_fraction=0.1)
+
+    hot = np.linspace(1.0, 2.0, 100)
+    values = np.concatenate([np.full(5000, -3.0), np.zeros(2000), hot])
+    s._brick.set(values)
+
+    lv.LiveView._calibrate(s, force=True)
+
+    # The level must be set from the 100 positive bricks alone.
+    assert s.q_iso == pytest.approx(np.percentile(hot, 90.0), rel=1e-6)
+    assert s.q_iso > 1.0
+
+
+def test_calibrate_holds_level_when_no_rotation_exists_yet(lv):
+    """All-negative field: hold the previous level rather than set an unusable one."""
+    s = _calib_stub(lv, q_iso=0.25, _needs_calibration=False)
+    s._brick.set(np.full(64, -1.0))
+
+    lv.LiveView._calibrate(s)
+    assert s.q_iso == pytest.approx(0.25)
+    # Still uncalibrated in the sense that it never locked on to a real field.
+    assert s._needs_calibration is False
+
+
+def test_calibrate_occupancy_follows_the_requested_fraction(lv):
+    """Lower fraction -> higher level -> less surface drawn and cheaper march."""
+    values = np.linspace(1.0e-6, 1.0, 2000)
+
+    levels = {}
+    for frac in (0.01, 0.1, 0.4):
+        s = _calib_stub(lv, iso_brick_fraction=frac)
+        s._brick.set(values)
+        lv.LiveView._calibrate(s, force=True)
+        levels[frac] = s.q_iso
+
+        occupied = np.count_nonzero(values >= s.q_iso) / values.size
+        assert occupied == pytest.approx(frac, abs=0.01)
+
+    assert levels[0.01] > levels[0.1] > levels[0.4], "a smaller fraction must give a higher iso level"
+
+
+def test_calibrate_first_call_snaps_and_later_calls_smooth(lv):
+    """The startup transient bug: a threshold frozen at step 0 is wrong later.
+
+    Q at step 0 is orders of magnitude below a developed wake, so calibration
+    has to keep tracking. The first call must snap (nothing to smooth against),
+    subsequent calls must move toward the new target without jumping to it.
+    """
+    s = _calib_stub(lv, iso_brick_fraction=0.05)
+
+    # Frame 1: undeveloped flow, tiny Q -- roughly what the R2 run reported.
+    early = np.full(64, 6.131e-05)
+    s._brick.set(early)
+    lv.LiveView._calibrate(s)
+    first = s.q_iso
+    assert first == pytest.approx(6.131e-05)
+    assert not s._needs_calibration
+
+    # Flow develops: the distribution climbs four orders of magnitude.
+    late = np.full(64, 0.5)
+    s._brick.set(late)
+    target = 0.5
+
+    lv.LiveView._calibrate(s)
+    assert first < s.q_iso < target, "second call should move toward the target, not snap to it"
+    np.testing.assert_allclose(s.q_iso, 0.8 * first + 0.2 * target, rtol=1e-6)
+
+    # Repeated tracking must converge rather than stall or overshoot.
+    for _ in range(200):
+        lv.LiveView._calibrate(s)
+    np.testing.assert_allclose(s.q_iso, target, rtol=1e-3)
+
+
+def test_calibrate_force_snaps_immediately(lv):
+    """The R key must bypass smoothing rather than crawl to the new level."""
+    s = _calib_stub(lv)
+    s._brick.set(np.full(64, 1.0e-6))
+    lv.LiveView._calibrate(s)
+
+    s._brick.set(np.full(64, 1.0))
+    lv.LiveView._calibrate(s, force=True)
+    assert s.q_iso == pytest.approx(1.0)
+
+
+def test_calibrate_ignores_invalid_bricks_and_degenerate_peaks(lv):
+    """All-invalid or non-positive fields must leave the previous level intact."""
+    s = _calib_stub(lv, q_iso=0.25, _needs_calibration=False)
+
+    s._brick.set(np.full(64, lv._Q_INVALID))
+    lv.LiveView._calibrate(s)
+    assert s.q_iso == pytest.approx(0.25), "all-invalid brick grid should not move the iso level"
+
+    # A field that is valid but everywhere <= 0 has no isosurface to find.
+    s._brick.set(np.full(64, -3.0))
+    lv.LiveView._calibrate(s)
+    assert s.q_iso == pytest.approx(0.25)
+
+    # w_max must stay consistent with q_iso once a real peak arrives.
+    s._brick.set(np.full(64, 1.0))
+    lv.LiveView._calibrate(s, force=True)
+    np.testing.assert_allclose(s.w_max, 4.0 * math.sqrt(2.0 * s.q_iso), rtol=1e-6)
+
+
+def test_png_display_writes_off_the_calling_thread(lv, tmp_path):
+    """PNG encode must not run inline: it costs several times the GPU render."""
+    width, height = 64, 32
+    state = lv._ViewerState(lv.Camera(target=np.zeros(3), distance=1.0))
+    display = lv._PngDisplay(width, height, str(tmp_path), state)
+
+    frame = (np.random.default_rng(0).integers(0, 256, (height, width, 3), dtype=np.uint8)).tobytes()
+    for _ in range(3):
+        display.show(frame)
+
+    # close() drains the queue and joins the worker.
+    display.close()
+
+    written = sorted(tmp_path.glob("live_*.png"))
+    assert len(written) + display.dropped == 3, "every frame must be written or explicitly counted as dropped"
+    assert written, "no frames survived the queue"
+
+    from PIL import Image
+
+    img = np.asarray(Image.open(written[0]))
+    assert img.shape == (height, width, 3)
+    np.testing.assert_array_equal(img, np.frombuffer(frame, dtype=np.uint8).reshape(height, width, 3))
+
+
+def test_png_display_drops_rather_than_blocks_when_saturated(lv, tmp_path):
+    """A slow disk must throttle the movie, never the solver."""
+    width, height = 32, 16
+    state = lv._ViewerState(lv.Camera(target=np.zeros(3), distance=1.0))
+    display = lv._PngDisplay(width, height, str(tmp_path), state, queue_depth=1)
+
+    # Swap in a queue with no consumer, so saturation is deterministic rather
+    # than a race against however fast the worker happens to encode. The worker
+    # keeps its reference to the original queue and stays parked on it.
+    original = display._queue
+    display._queue = queue.Queue(maxsize=1)
+
+    frame = b"\x01" * (width * height * 3)
+    for _ in range(50):
+        display.show(frame)  # must return immediately, never block
+
+    assert display.index == 1, "exactly one frame should have fit in the queue"
+    assert display.dropped == 49, "every other frame should have been dropped, not blocked"
+
+    # Restore the real queue so close() can drain it and join the worker.
+    display._queue = original
+    display.close()

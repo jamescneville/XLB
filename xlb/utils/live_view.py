@@ -19,13 +19,28 @@ Per frame the pipeline is:
                                         composited against the body triangle mesh
   6. ``wp.copy`` to a pinned host image, handed to the display thread
 
-Step 2 flattens *every* Neon level into a single uniform grid rather than one
-dense box per level. Warp kernels cannot take a ragged list of arrays, and the
-scatter direction makes the level merge trivial: a cell at level ``l`` covers
-``2**l`` finest-grid units, so it writes the block of render cells it overlaps,
-and running the levels coarsest-first lets finer data overwrite coarser data.
-The cost is that Q is evaluated at render resolution, so vortices thinner than a
-render cell are decimated away -- this is a live monitor, not an analysis tool.
+Step 2 flattens the Neon levels into a single uniform grid rather than one dense
+box per level. Warp kernels cannot take a ragged list of arrays, and the scatter
+direction makes the level merge trivial: a cell at level ``l`` covers ``2**l``
+finest-grid units, so it writes the render cells it overlaps, and running the
+levels coarsest-first lets finer data overwrite coarser data.
+
+Two consequences shape what you see:
+
+* Q is evaluated at render resolution, so vortices thinner than a render cell
+  are decimated away. This is a live monitor, not an analysis tool.
+* Velocity is discontinuous across a refinement interface, and a central
+  difference taken across that seam manufactures enormous artificial Q -- it
+  renders as a clean plane at every refinement box boundary. So each render cell
+  records which level supplied it (see the ``flags`` layout below) and Q is only
+  evaluated where the whole stencil came from one level.
+* A level coarser than the render grid is replicated across a block of render
+  cells, so an adjacent-cell difference would be zero inside a block and the
+  whole jump concentrated (and amplified) at block faces -- grid-aligned slabs.
+  ``_q_kernel`` therefore strides its stencil by the source cell size, landing
+  on genuinely adjacent source cells. Every level is rendered; the coarse ones
+  simply resolve less. Note the fine levels are the *small* boxes at the body,
+  so excluding coarse levels would leave almost nothing to look at.
 
 Render grid resolution is chosen from a memory budget; see ``_pick_render_level``.
 
@@ -64,8 +79,10 @@ smoother picture, lower it when you care about wall clock.
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import os
+import queue
 import threading
 import time
 from typing import Any, Optional, Sequence
@@ -80,6 +97,23 @@ _Q_INVALID = -1.0e30
 
 # Render cells per brick, per axis, for the empty-space-skipping grid.
 _BRICK = 8
+
+# Layout of the per-render-cell ``flags`` byte.
+#
+# 0 means the cell was never written this frame. Otherwise the low nibble holds
+# (source Neon level + 1) and bit 7 marks a boundary cell. Recording *which*
+# level supplied each cell is what lets the Q kernel refuse to difference across
+# a refinement interface: the velocity is discontinuous there, and differencing
+# across the seam manufactures enormous artificial Q that renders as a perfect
+# plane at every level boundary.
+_LEVEL_MASK = 0x0F
+_BOUNDARY_BIT = 0x80
+_MAX_ENCODABLE_LEVELS = _LEVEL_MASK - 1  # level+1 must fit the nibble
+
+# The only bc_mask value that means "not fluid". Mirrored from xlb.cell_type so
+# this module stays importable without pulling in the package (the tests load it
+# by path); asserted against the real one in LiveView.__init__.
+_BC_SOLID = 255
 
 
 # ---------------------------------------------------------------------------
@@ -120,12 +154,23 @@ def _q_kernel(
     flags: wp.array3d(dtype=wp.uint8),
     qv: wp.array4d(dtype=wp.float32),
     inv_u_ref: float,
+    render_exp: int,
 ):
     """Q-criterion and vorticity magnitude from the staged velocity grid.
 
     Both are computed from velocity normalised by the reference (inlet) speed and
     differenced per render cell, so they are dimensionless and the iso level is
-    comparable across grid resolutions and unit systems.
+    comparable across levels, grid resolutions and unit systems.
+
+    The stencil is **strided by the source cell size**. A cell from a level
+    coarser than the render grid was replicated across a block of ``d`` render
+    cells per axis, so an adjacent-cell difference reads two copies of the same
+    value: zero everywhere inside a block, and the entire jump concentrated at
+    block faces, amplified by ``d``. That is what renders as grid-aligned slabs.
+    Stepping ``d`` cells instead lands on genuinely adjacent source cells, giving
+    the correct coarse gradient smoothly across the whole block. Dividing by
+    ``2*d`` keeps the result per render-cell-length, so one iso level stays
+    meaningful across every level at once.
     """
     i, j, k = wp.tid()
 
@@ -133,39 +178,56 @@ def _q_kernel(
     ny = flags.shape[1]
     nz = flags.shape[2]
 
-    # One-cell border is needed for the central differences below.
-    if i == 0 or j == 0 or k == 0 or i >= nx - 1 or j >= ny - 1 or k >= nz - 1:
+    # Q is only meaningful in fluid whose whole stencil is also fluid and came
+    # from the same refinement level.
+    #
+    # Differencing across a wall or into an unwritten cell manufactures huge
+    # spurious vorticity that would shroud the body in noise. Differencing across
+    # a *level interface* is just as bad and less obvious: velocity is
+    # discontinuous between levels, so the seam renders as a clean plane at every
+    # refinement box boundary.
+    c = flags[i, j, k]
+    if c == wp.uint8(0) or (c & wp.uint8(_BOUNDARY_BIT)) != wp.uint8(0):
         qv[0, i, j, k] = float(_Q_INVALID)
         qv[1, i, j, k] = 0.0
         return
 
-    # Q is only meaningful in fluid whose whole 6-neighbourhood is also fluid:
-    # differencing across a wall or into an unwritten cell manufactures huge
-    # spurious vorticity that would otherwise shroud the body in noise.
-    if (
-        flags[i, j, k] != wp.uint8(1)
-        or flags[i + 1, j, k] != wp.uint8(1)
-        or flags[i - 1, j, k] != wp.uint8(1)
-        or flags[i, j + 1, k] != wp.uint8(1)
-        or flags[i, j - 1, k] != wp.uint8(1)
-        or flags[i, j, k + 1] != wp.uint8(1)
-        or flags[i, j, k - 1] != wp.uint8(1)
-    ):
+    lvl = c & wp.uint8(_LEVEL_MASK)
+
+    # Nibble holds level+1, so the source level is lvl-1. Levels at or finer than
+    # the render grid were decimated onto single cells and stride 1.
+    d = 1 << wp.max(int(lvl) - 1 - render_exp, 0)
+
+    if i - d < 0 or j - d < 0 or k - d < 0 or i + d >= nx or j + d >= ny or k + d >= nz:
         qv[0, i, j, k] = float(_Q_INVALID)
         qv[1, i, j, k] = 0.0
         return
 
-    s = 0.5 * inv_u_ref
+    n_xp = flags[i + d, j, k]
+    n_xm = flags[i - d, j, k]
+    n_yp = flags[i, j + d, k]
+    n_ym = flags[i, j - d, k]
+    n_zp = flags[i, j, k + d]
+    n_zm = flags[i, j, k - d]
 
-    dudx = (vel[0, i + 1, j, k] - vel[0, i - 1, j, k]) * s
-    dudy = (vel[0, i, j + 1, k] - vel[0, i, j - 1, k]) * s
-    dudz = (vel[0, i, j, k + 1] - vel[0, i, j, k - 1]) * s
-    dvdx = (vel[1, i + 1, j, k] - vel[1, i - 1, j, k]) * s
-    dvdy = (vel[1, i, j + 1, k] - vel[1, i, j - 1, k]) * s
-    dvdz = (vel[1, i, j, k + 1] - vel[1, i, j, k - 1]) * s
-    dwdx = (vel[2, i + 1, j, k] - vel[2, i - 1, j, k]) * s
-    dwdy = (vel[2, i, j + 1, k] - vel[2, i, j - 1, k]) * s
-    dwdz = (vel[2, i, j, k + 1] - vel[2, i, j, k - 1]) * s
+    if n_xp != lvl or n_xm != lvl or n_yp != lvl or n_ym != lvl or n_zp != lvl or n_zm != lvl:
+        # An exact match also rules out unwritten (0) and boundary (bit 7 set)
+        # neighbours, since neither can equal a bare level nibble.
+        qv[0, i, j, k] = float(_Q_INVALID)
+        qv[1, i, j, k] = 0.0
+        return
+
+    s = 0.5 * inv_u_ref / float(d)
+
+    dudx = (vel[0, i + d, j, k] - vel[0, i - d, j, k]) * s
+    dudy = (vel[0, i, j + d, k] - vel[0, i, j - d, k]) * s
+    dudz = (vel[0, i, j, k + d] - vel[0, i, j, k - d]) * s
+    dvdx = (vel[1, i + d, j, k] - vel[1, i - d, j, k]) * s
+    dvdy = (vel[1, i, j + d, k] - vel[1, i, j - d, k]) * s
+    dvdz = (vel[1, i, j, k + d] - vel[1, i, j, k - d]) * s
+    dwdx = (vel[2, i + d, j, k] - vel[2, i - d, j, k]) * s
+    dwdy = (vel[2, i, j + d, k] - vel[2, i, j - d, k]) * s
+    dwdz = (vel[2, i, j, k + d] - vel[2, i, j, k - d]) * s
 
     # Vorticity magnitude, used for colouring the isosurface.
     wx = dwdy - dvdz
@@ -779,11 +841,24 @@ class _PygletDisplay:
 class _PngDisplay:
     """Fallback that writes a numbered PNG per frame.
 
-    Used when no window can be opened (headless node, no WSLg, no pyglet). The
-    GPU pipeline is identical; only the transport differs.
+    Used when no window can be opened (headless node, container without a
+    display, no pyglet). The GPU pipeline is identical; only the transport
+    differs.
+
+    Compression runs on worker threads. PNG-encoding a 720p frame costs tens of
+    milliseconds, which is several times the whole GPU render -- doing it inline
+    would make the *viewer* the dominant cost of the run. The queue is short and
+    drops frames rather than growing, so a slow disk throttles the movie instead
+    of the solve.
+
+    Several workers because an interactive draw rate outruns a single encoder.
+    They finish out of order, so ``completed`` tracks the newest index that is
+    actually on disk -- a viewer told to load a frame still being written would
+    just flicker. ``keep_frames`` prunes behind them: at 30 fps a numbered
+    sequence reaches gigabytes within minutes.
     """
 
-    def __init__(self, width, height, output_dir, state):
+    def __init__(self, width, height, output_dir, state, queue_depth=4, workers=3, keep_frames=900):
         from PIL import Image
 
         self._Image = Image
@@ -792,17 +867,65 @@ class _PngDisplay:
         self.output_dir = output_dir
         self.state = state
         self.index = 0
+        self.dropped = 0
+        self.completed = -1
+        self.keep_frames = int(keep_frames)
 
         os.makedirs(output_dir, exist_ok=True)
 
+        self._done_lock = threading.Lock()
+        self._queue = queue.Queue(maxsize=queue_depth)
+        self._threads = [threading.Thread(target=self._worker, name=f"xlb-live-view-png-{i}", daemon=True) for i in range(max(1, workers))]
+        for t in self._threads:
+            t.start()
+
+    def _path(self, index):
+        return os.path.join(self.output_dir, f"live_{index:06d}.png")
+
+    def _worker(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+
+            index, buf = item
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3)
+            path = self._path(index)
+            try:
+                # compress_level=1 rather than the default 6: at 720p that is
+                # roughly a 4x faster encode for ~20% larger files, which is the
+                # right trade for a frame sequence nobody archives.
+                self._Image.fromarray(arr).save(path, compress_level=1)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[live_view] failed to write {path}: {exc}")
+                continue
+
+            with self._done_lock:
+                # Workers finish out of order; only ever advance.
+                if index > self.completed:
+                    self.completed = index
+                stale = index - self.keep_frames
+
+            if self.keep_frames > 0 and stale >= 0:
+                with contextlib.suppress(OSError):
+                    os.remove(self._path(stale))
+
     def show(self, frame_bytes):
-        arr = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(self.height, self.width, 3)
-        path = os.path.join(self.output_dir, f"live_{self.index:06d}.png")
-        self._Image.fromarray(arr).save(path)
-        self.index += 1
+        try:
+            self._queue.put_nowait((self.index, frame_bytes))
+            self.index += 1
+        except queue.Full:
+            self.dropped += 1
 
     def close(self):
-        pass
+        for _ in self._threads:
+            self._queue.put(None)
+        for t in self._threads:
+            t.join(timeout=30.0)
+        if self.dropped:
+            print(f"[live_view] wrote {self.index} PNG frames, dropped {self.dropped} (disk could not keep up)")
+        else:
+            print(f"[live_view] wrote {self.index} PNG frames to {self.output_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -853,13 +976,49 @@ class LiveView:
         ``_pick_render_level``; the default keeps a car-scale domain at roughly
         the coarsest level.
     fps
-        Wall-clock cap on render rate. This, not the step count, is what bounds
-        the solver overhead -- see the per-frame costs in the module docstring.
+        Wall-clock cap on the *data* refresh rate: macro + staging + Q, which
+        needs the solver's current state and so drains its dispatch queue. This
+        is what bounds the viewer's cost to the solve.
+    view_fps
+        Wall-clock cap on camera-only redraws, which reuse the resident Q field
+        and run on a private stream. These cost a couple of milliseconds and do
+        not interact with the solver, so this can be high. 0 means unthrottled.
+    heartbeat
+        Redraw at least this often (seconds) even with no camera movement, so the
+        published frame and its reported age stay current. Cheap: one draw.
+    max_lag_steps
+        Cap on how many solver steps the host may run ahead of the device, by
+        syncing every N steps. This is the main lever on how quickly the
+        isosurface can update: without it the host fills CUDA's launch queue and
+        a data refresh has to wait out seconds of queued work. Lower is more
+        responsive and slightly slower in MLUPS; 0 disables the sync entirely and
+        leaves the solver's dispatch exactly as it was.
     min_step_interval
         Never render more often than this many solver steps, whatever fps says.
-    auto_iso_frac
-        Iso level as a fraction of the 99.9th percentile of per-brick max Q.
-        Calibrated on the first frame and on demand (press R in the viewer).
+    max_level
+        Coarsest Neon level to stage; default is all of them. Lower it only to
+        deliberately crop to the finer levels near the body -- excluded levels
+        render as empty space.
+    mask_solid
+        Read ``bc_mask`` and refuse to evaluate Q on solid cells. Set False to
+        skip the field entirely: Q is then evaluated everywhere data exists,
+        which is a useful escape hatch if the coverage line reports an
+        implausible solid percentage. The body mesh occludes its own interior
+        anyway, so the main loss is some noise at walls.
+    iso_brick_fraction
+        Target fraction of occupied bricks left above the iso level, in
+        (0, 0.5]. The level is set to the matching percentile of the per-brick
+        max-Q distribution, so this directly controls how much surface is drawn
+        -- and therefore how fast the raymarch is. Lower shows only the
+        strongest cores; higher shows more structure and costs more.
+    recalibrate_every
+        Re-derive the iso level every N frames. Must be >0 for a startup
+        transient: Q at step 0 is orders of magnitude below a developed wake, so
+        a threshold frozen there saturates as the flow spins up. Set to 0 to
+        calibrate once and hold (then press R in the viewer to redo it).
+    iso_smoothing
+        Exponential smoothing on tracked iso updates, in [0,1]. Low values
+        follow the flow slowly and steadily; 1.0 snaps to each new estimate.
     output_dir
         Where the PNG fallback and manual snapshots are written.
     """
@@ -873,9 +1032,16 @@ class LiveView:
         width: int = 1280,
         height: int = 720,
         fps: float = 10.0,
+        view_fps: float = 30.0,
+        heartbeat: float = 0.5,
+        max_lag_steps: int = 8,
         min_step_interval: int = 1,
         memory_budget_mb: float = 512.0,
-        auto_iso_frac: float = 0.02,
+        max_level: Optional[int] = None,
+        mask_solid: bool = True,
+        iso_brick_fraction: float = 0.05,
+        recalibrate_every: int = 1,
+        iso_smoothing: float = 0.2,
         step_cells: float = 0.75,
         fov: float = 45.0,
         backend: str = "auto",
@@ -895,8 +1061,13 @@ class LiveView:
         self.width = int(width)
         self.height = int(height)
         self.min_interval = 1.0 / float(fps) if fps > 0 else 0.0
+        self.min_view_interval = 1.0 / float(view_fps) if view_fps > 0 else 0.0
+        self.heartbeat = float(heartbeat)
+        self.max_lag_steps = int(max_lag_steps)
         self.min_step_interval = max(1, int(min_step_interval))
-        self.auto_iso_frac = float(auto_iso_frac)
+        self.iso_brick_fraction = float(np.clip(iso_brick_fraction, 1.0e-4, 0.5))
+        self.recalibrate_every = int(recalibrate_every)
+        self.iso_smoothing = float(np.clip(iso_smoothing, 0.0, 1.0))
         self.step_cells = float(step_cells)
         self.output_dir = output_dir
         self.title = title
@@ -917,6 +1088,19 @@ class LiveView:
         self._vel = wp.zeros((3, nx, ny, nz), dtype=wp.float32)
         self._qv = wp.zeros((2, nx, ny, nz), dtype=wp.float32)
         self._flags = wp.zeros((nx, ny, nz), dtype=wp.uint8)
+
+        # Stage every level by default. Coarse levels carry the wake and far
+        # field -- in a 6-level car case the *finest* levels are tiny boxes right
+        # at the body, so excluding coarse ones leaves almost nothing to render.
+        # Their blockiness is handled in _q_kernel by striding the stencil to the
+        # source cell size rather than by dropping them.
+        self.mask_solid = bool(mask_solid)
+        self.max_level = (self.num_levels - 1) if max_level is None else int(max_level)
+        if self.num_levels > _MAX_ENCODABLE_LEVELS:
+            # The flags nibble holds level+1, so very deep hierarchies would
+            # alias distinct levels onto the same code and defeat the interface
+            # masking. Clamp rather than silently mis-mask.
+            self.max_level = min(self.max_level, _MAX_ENCODABLE_LEVELS - 1)
 
         self.bshape = tuple((v + _BRICK - 1) // _BRICK for v in self.rshape)
         self._brick = wp.zeros(self.bshape, dtype=wp.float32)
@@ -950,32 +1134,83 @@ class LiveView:
         # hands us rather than ones guessed at construction time.
         self._containers = None
         self._neon = None
+        self._scatter_n = None
 
         # --- display ---------------------------------------------------------
         self.display = self._make_display(backend)
 
+        # --- filesystem control bridge ---------------------------------------
+        # When frames go to disk rather than a window, the same directory doubles
+        # as a two-way channel: we publish status.json and read camera.json back.
+        # A viewer running outside this process -- crucially, outside this
+        # *container* -- can then drive the camera with no network, no X11 and no
+        # OpenGL, as long as it can see the directory. See tools/live_view_viewer.py.
+        if isinstance(self.display, _PngDisplay):
+            self._camera_path = os.path.join(output_dir, "camera.json")
+            self._status_path = os.path.join(output_dir, "status.json")
+            if self.verbose:
+                print(f"[live_view] control bridge: {self._status_path} / {self._camera_path}")
+        else:
+            self._camera_path = None
+            self._status_path = None
+
+        self._camera_mtime = None
+        self._recalibrate_seq = 0
+
+        # Cheap guard against _BC_SOLID drifting from the real definition. Import
+        # here rather than at module scope so this file stays loadable by path.
+        from xlb.cell_type import BC_SOLID
+
+        assert int(BC_SOLID) == _BC_SOLID, f"_BC_SOLID ({_BC_SOLID}) no longer matches xlb.cell_type.BC_SOLID ({BC_SOLID})"
+
         self._last_render = 0.0
+        self._last_data = 0.0
         self._last_step = -(10**9)
+        self._last_sync = -(10**9)
         self._frames = 0
+        self._refreshes = 0
         self._render_ms = 0.0
+        self._draw_ms = 0.0
+        self._data_ms = 0.0
+        self._drain_ms = 0.0
+        self._macro_ms = 0.0
+        self._stage_ms = 0.0
+        self._q_ms = 0.0
         self.enabled = True
+
+        # Private stream for camera-only redraws. It reads only arrays this class
+        # owns, so it can overlap solver work instead of queueing behind it --
+        # that independence is what makes dragging feel immediate. CPU-only warp
+        # builds have no streams, hence the guard.
+        try:
+            self._stream = wp.Stream() if wp.get_device().is_cuda else None
+        except Exception as exc:  # noqa: BLE001
+            self._stream = None
+            if self.verbose:
+                print(f"[live_view] no private stream ({exc}); draws will share the default stream")
 
         if self.verbose:
             cells = nx * ny * nz
             mb = cells * _BYTES_PER_RENDER_CELL / (1024.0 * 1024.0)
+            staged = min(self.max_level, self.num_levels - 1)
             print(
                 f"[live_view] render grid {nx}x{ny}x{nz} "
                 f"(decimation 2^{self.r} of {self.grid_shape_finest}), "
                 f"{cells / 1e6:.1f}M cells, {mb:.0f} MB, "
+                f"levels 0-{staged} of 0-{self.num_levels - 1} staged, "
                 f"display={type(self.display).__name__}"
             )
+            if staged < self.num_levels - 1:
+                print(f"[live_view] levels {staged + 1}-{self.num_levels - 1} excluded by max_level; those regions will be blank")
 
     @property
     def last_render_seconds(self):
-        """Wall-clock cost of the most recent frame.
+        """Wall-clock cost of the most recent frame, excluding solver backlog.
 
         Callers that measure solver throughput can add this to the start of
-        their timing interval so viewer overhead is not charged to MLUPS.
+        their timing interval so viewer overhead is not charged to MLUPS. It is
+        safe to do so precisely because render() drains the async solver queue
+        before it starts timing -- see the comment there.
         """
         return self._render_ms / 1000.0
 
@@ -1054,17 +1289,22 @@ class LiveView:
         mask_flag = 1 if use_mask else 0
 
         @neon.Container.factory(name="LiveViewStage")
-        def factory(u_neon: Any, m_neon: Any, dst_vel: Any, dst_flags: Any, level: Any, cells_per_axis: Any):
+        def factory(u_neon: Any, m_neon: Any, dst_vel: Any, dst_flags: Any, level: Any, cells_per_axis: Any, level_code: Any):
             def launcher(loader: neon.Loader):
                 loader.set_mres_grid(u_neon.get_grid(), level)
                 u_hdl = loader.get_mres_read_handle(u_neon)
                 m_hdl = loader.get_mres_read_handle(m_neon)
 
-                # A python int at build time, so the triple loop below unrolls.
-                n = cells_per_axis
+                # The scatter bound must be read from a device array, not captured
+                # as a python int: warp fully unrolls range() over a compile-time
+                # constant, and a coarse level can cover 16 or 32 render cells per
+                # axis -- a 4096- or 32768-body unrolled triple loop. Reading it
+                # back forces a real dynamic loop instead.
+                n_arr = cells_per_axis
 
                 @wp.func
                 def kernel(index: Any):
+                    n = n_arr[0]
                     cIdx = wp.neon_global_idx(u_hdl, index)
 
                     # Global indices are in finest-level units; a cell at level l
@@ -1077,11 +1317,20 @@ class LiveView:
                     uy = wp.float32(wp.neon_read(u_hdl, index, 1))
                     uz = wp.float32(wp.neon_read(u_hdl, index, 2))
 
-                    # 1 = fluid, 2 = boundary, 0 = never written this frame.
-                    fl = wp.uint8(1)
+                    # Low nibble = source level + 1, bit 7 = solid cell.
+                    #
+                    # Only BC_SOLID counts. Every other nonzero bc_mask value is a
+                    # boundary-condition *id* sitting on a perfectly good fluid
+                    # cell -- inlet, outlet, moving walls, ground, body surface --
+                    # and the solver itself only ever tests against BC_SOLID
+                    # (see nse_multires_stepper.prepare_coalescence_count, and
+                    # MultiresIO._solid_mask_from_fields_data). Treating nonzero
+                    # as "boundary" rejected 86% of the domain and left Q valid
+                    # nowhere at all.
+                    fl = level_code
                     if mask_flag == 1:
-                        if wp.neon_read(m_hdl, index, 0) != wp.uint8(0):
-                            fl = wp.uint8(2)
+                        if wp.neon_read(m_hdl, index, 0) == wp.uint8(_BC_SOLID):
+                            fl = level_code | wp.uint8(_BOUNDARY_BIT)
 
                     for a in range(n):
                         x = rx + a
@@ -1102,10 +1351,24 @@ class LiveView:
             return launcher
 
         containers = []
-        for level in range(self.num_levels - 1, -1, -1):
-            # Levels finer than the render grid collapse onto one render cell
-            # (decimation); coarser levels scatter over a 2^(l-r) block.
+        # Kept alive on self: these back the dynamic loop bounds above, so they
+        # must outlive this function for as long as the containers are launched.
+        self._scatter_n = []
+
+        # Coarsest first, so finer levels overwrite where boxes overlap.
+        #
+        # Levels coarser than the render grid are skipped entirely: scattering a
+        # coarse cell over a block of render cells gives a piecewise-constant
+        # field whose gradient is meaningless, and it renders as grid-aligned
+        # blocks and stair-steps rather than flow structure. Rendering Q only
+        # where the simulation actually resolves the render grid also means the
+        # picture covers the refined region -- body and wake -- and leaves the
+        # under-resolved far field empty, which is what you want to look at.
+        for level in range(min(self.max_level, self.num_levels - 1), -1, -1):
             n = 1 << max(0, level - self.r)
+            n_arr = wp.array([n], dtype=wp.int32)
+            self._scatter_n.append(n_arr)
+
             containers.append(
                 factory(
                     u_field,
@@ -1113,48 +1376,233 @@ class LiveView:
                     self._vel,
                     self._flags,
                     level,
-                    n,
+                    n_arr,
+                    wp.uint8(level + 1),
                 )
             )
 
         return containers
 
+    # -- filesystem control bridge -------------------------------------------
+
+    def _poll_camera(self):
+        """Apply camera state written by an external viewer, if it changed.
+
+        Gated on mtime so the common case is a single stat() per frame. A partial
+        read is expected rather than exceptional -- the viewer replaces the file
+        atomically, but a bind mount to another OS does not always make that
+        visible atomically -- so a parse failure just resets the mtime and waits
+        for the next frame instead of propagating.
+        """
+        if self._camera_path is None:
+            return False
+
+        try:
+            mtime = os.path.getmtime(self._camera_path)
+        except OSError:
+            return False
+
+        if mtime == self._camera_mtime:
+            return False
+
+        try:
+            with open(self._camera_path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            self._camera_mtime = None
+            return False
+
+        self._camera_mtime = mtime
+
+        with self.state.lock:
+            camera = self.state.camera
+            for key in ("azimuth", "elevation", "distance", "fov"):
+                if key in data:
+                    setattr(camera, key, float(data[key]))
+
+            if "iso_scale" in data:
+                self.state.iso_scale = float(data["iso_scale"])
+
+            # A sequence number rather than a boolean: the viewer has no way to
+            # observe when a flag was consumed, so it counts up instead.
+            seq = int(data.get("recalibrate_seq", 0))
+            if seq != self._recalibrate_seq:
+                self._recalibrate_seq = seq
+                self.state.recalibrate = True
+
+            if data.get("closed"):
+                self.state.closed = True
+
+        return True
+
+    def _write_status(self, step, mlups, iso_scale):
+        """Publish what the viewer needs: newest frame, HUD numbers, camera echo.
+
+        Written via a temp file plus replace so a viewer never reads a half-file.
+        """
+        if self._status_path is None:
+            return
+
+        camera = self.state.camera
+        payload = {
+            "frame": self.display.completed,
+            "frame_file": f"live_{self.display.completed:06d}.png",
+            "dropped": self.display.dropped,
+            "step": int(step),
+            "mlups": float(mlups),
+            "render_ms": round(self._render_ms, 2),
+            "draw_ms": round(self._draw_ms, 2),
+            "data_ms": round(self._data_ms, 2),
+            "drain_ms": round(self._drain_ms, 2),
+            "q_iso": self.q_iso * iso_scale,
+            "iso_scale": iso_scale,
+            "width": self.width,
+            "height": self.height,
+            "render_shape": list(self.rshape),
+            "azimuth": camera.azimuth,
+            "elevation": camera.elevation,
+            "distance": camera.distance,
+            "fov": camera.fov,
+            "time": time.time(),
+        }
+
+        tmp = self._status_path + ".tmp"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, self._status_path)
+        except OSError as exc:
+            # Losing a status update is cosmetic; never let it break the solve.
+            if self.verbose:
+                print(f"[live_view] could not write status: {exc}")
+
     # -- iso calibration -----------------------------------------------------
 
-    def _calibrate(self):
-        """Pick an iso level from the brick-max grid.
+    def _calibrate(self, force=False):
+        """Track the iso level from the brick-max grid.
 
         The brick grid is a 512x reduction of the render grid, so this host copy
-        is tiny -- tens of thousands of floats -- and gives a robust picture of
-        the Q distribution without needing a device-side reduction. The 99.9th
-        percentile rather than the max keeps one hot cell from setting the scale.
+        is tiny -- a few thousand floats -- and gives a robust picture of the Q
+        distribution without needing a device-side reduction (Neon exposes none).
+
+        The level is a **percentile** of that distribution, chosen so only
+        ``iso_brick_fraction`` of occupied bricks sit above it. Scaling some
+        fraction of the *peak* instead does not work: nothing ties the peak to
+        where the field's mass lies, so the level can land below the field floor
+        entirely. That is the pathological case -- the crossing test in the
+        raymarcher needs a sample *below* the level to bracket against, so a
+        too-low level draws nothing at all while making every ray traverse the
+        whole volume. Blank screen, worst-case cost. Anchoring to a percentile
+        makes occupancy the controlled quantity, which bounds both.
+
+        This has to keep tracking rather than calibrate once. Q at step 0 is the
+        initial transient, orders of magnitude below a developed wake, so a
+        one-shot threshold taken there is wrong within a few hundred steps.
+        Updates are smoothed so the surface breathes instead of flickering;
+        ``force`` (the R key, or the first frame) snaps straight to the target.
         """
         b = self._brick.numpy().ravel()
-        valid = b[b > _Q_INVALID * 0.5]
+
+        # Only rotation-dominated bricks are candidates. Q <= 0 means strain
+        # dominates, so those bricks hold no vortex and including them just drags
+        # the percentile down into a region the isosurface can never occupy --
+        # in a windtunnel most of the domain is quiet freestream, so they would
+        # otherwise dominate the distribution completely.
+        valid = b[(b > _Q_INVALID * 0.5) & (b > 0.0)]
         if valid.size == 0:
+            # No rotation anywhere yet (very early in a startup). Hold the
+            # previous level rather than set one that cannot bracket a crossing.
             return
 
-        peak = float(np.percentile(valid, 99.9))
-        if not np.isfinite(peak) or peak <= 0.0:
+        pct = 100.0 * (1.0 - self.iso_brick_fraction)
+        target = float(np.percentile(valid, pct))
+
+        if not np.isfinite(target) or target <= 0.0:
             return
 
-        self.q_iso = self.auto_iso_frac * peak
+        if force or self._needs_calibration:
+            self.q_iso = target
+        else:
+            a = self.iso_smoothing
+            self.q_iso = (1.0 - a) * self.q_iso + a * target
+
         # In a coherent vortex Q ~ 0.5|omega|^2, so sqrt(2*Q_iso) is the vorticity
         # at the isosurface itself; a few times that spans the visible range.
-        self.w_max = 4.0 * math.sqrt(2.0 * self.q_iso)
+        self.w_max = 4.0 * math.sqrt(2.0 * max(self.q_iso, 0.0))
+
+        first = self._needs_calibration
         self._needs_calibration = False
 
-        if self.verbose:
-            print(f"[live_view] calibrated q_iso={self.q_iso:.4g} (peak {peak:.4g}), w_max={self.w_max:.4g}")
+        # Only announce the initial lock-on and explicit recalibrations; the
+        # per-frame tracking updates would otherwise flood the solver log.
+        if self.verbose and (first or force):
+            occupied = float(np.count_nonzero(valid >= self.q_iso)) / float(valid.size)
+            print(
+                f"[live_view] calibrated q_iso={self.q_iso:.4g} "
+                f"(P{pct:.1f} of {valid.size} valid bricks, peak {valid.max():.4g}), "
+                f"{occupied * 100.0:.1f}% of bricks occupied, w_max={self.w_max:.4g}"
+            )
+
+    def _report_coverage(self):
+        """One-shot breakdown of which levels actually reached the render grid.
+
+        Worth the single 25 MB readback: if a level contributes nothing, or Q
+        ends up valid almost nowhere, the picture is empty and every other
+        number in the log still looks reasonable. That failure is otherwise
+        invisible -- it cost a couple of runs to spot.
+        """
+        flags = self._flags.numpy().ravel()
+        total = flags.size
+
+        written = np.count_nonzero(flags)
+        solid = np.count_nonzero(flags & _BOUNDARY_BIT)
+        levels = (flags & _LEVEL_MASK).astype(np.int32) - 1
+
+        parts = []
+        for level in range(self.num_levels):
+            n = int(np.count_nonzero((levels == level) & (flags != 0)))
+            if n:
+                parts.append(f"L{level}:{n / 1e3:.0f}k")
+
+        q = self._qv.numpy()[0].ravel()
+        valid_q = int(np.count_nonzero(q > _Q_INVALID * 0.5))
+
+        print(
+            f"[live_view] coverage: {written / total * 100.0:.1f}% of render cells written "
+            f"({', '.join(parts) if parts else 'none'}), {solid / max(written, 1) * 100.0:.1f}% solid, "
+            f"Q valid in {valid_q / total * 100.0:.1f}% of cells"
+        )
+        if valid_q * 200 < total:
+            print(
+                "[live_view] WARNING: Q is valid in under 0.5% of the grid, so the isosurface will be "
+                "nearly empty. A high solid percentage above means bc_mask is rejecting the domain; "
+                "otherwise check max_level and memory_budget_mb."
+            )
 
     # -- rendering -----------------------------------------------------------
 
     def maybe_render(self, sim, step: int, mlups: float = 0.0, force: bool = False, **hud):
-        """Render if enough wall-clock time and enough solver steps have passed.
+        """Advance the viewer, doing as little as the situation needs.
 
-        Gating on wall clock rather than step count is what keeps the overhead a
-        fixed fraction of runtime: a coarse case that steps quickly renders every
-        few hundred steps, a fine case renders every few.
+        Two rates, because the two halves of a frame cost wildly different
+        amounts:
+
+        * **Data refresh** (``fps``) runs ``sim.macro`` plus the Neon staging
+          containers and recomputes Q. It needs the solver's current state, so it
+          must drain the async dispatch queue -- typically the dominant cost, and
+          the reason a naive design updates roughly once a second.
+        * **Draw** (``view_fps``) only re-runs the raymarch over the Q field that
+          is already resident, on a private CUDA stream. It touches nothing the
+          solver owns, so it neither waits for the queue nor blocks it.
+
+        Dragging the camera therefore costs a couple of milliseconds and shows up
+        immediately, instead of waiting out a queue drain. Called every step, so
+        the effective draw rate is bounded by how often the host loops.
+
+        The draw is checked **first**, and deliberately so. A refresh can easily
+        cost more than its own requested period, which makes it perpetually
+        "due"; testing the refresh first then starves the cheap path entirely and
+        the camera goes back to feeling like it updates once a second.
         """
         if not self.enabled:
             return False
@@ -1164,25 +1612,74 @@ class LiveView:
                 self._shutdown()
                 return False
 
-        if not force:
-            now = time.perf_counter()
-            if now - self._last_render < self.min_interval:
-                return False
-            if step - self._last_step < self.min_step_interval:
-                return False
+        # Cheap: one stat() unless the file actually changed.
+        camera_moved = self._poll_camera()
 
-        self.render(sim, step=step, mlups=mlups, **hud)
-        return True
+        now = time.perf_counter()
+        acted = False
+
+        # 1) Camera-only redraw, before anything that can block. A heartbeat
+        #    keeps the published frame (and its age) current even when nobody is
+        #    dragging, for a couple of milliseconds a second.
+        since_draw = now - self._last_render
+        if since_draw >= self.min_view_interval and (camera_moved or since_draw >= self.heartbeat):
+            self._draw(step, mlups, hud)
+            acted = True
+
+        # 2) Bound how far the host runs ahead of the device.
+        #
+        #    sim.step() never syncs, so the host enqueues until CUDA's launch
+        #    queue is full -- hundreds of steps, seconds of work. A data refresh
+        #    needs current state and so must wait that out, which is what sets
+        #    the floor on how often the isosurface can update. Syncing every few
+        #    steps keeps the queue shallow, trading a little pipelining for a
+        #    much shorter drain. Set max_lag_steps=0 to leave dispatch untouched.
+        if self.max_lag_steps > 0 and (step - self._last_sync) >= self.max_lag_steps:
+            wp.synchronize()
+            self._last_sync = step
+
+        # 3) Data refresh: new physics, and the expensive half.
+        if force or ((now - self._last_data) >= self.min_interval and (step - self._last_step) >= self.min_step_interval):
+            self._refresh_data(sim)
+            self._last_data = time.perf_counter()
+            self._last_step = step
+            self._draw(step, mlups, hud)
+            acted = True
+
+        return acted
 
     def render(self, sim, step: int = 0, mlups: float = 0.0, **hud):
-        """Run the full pipeline once and publish the frame."""
+        """Force a full data refresh and draw. Kept for explicit one-shot use."""
+        self._refresh_data(sim)
+        self._last_data = time.perf_counter()
+        self._last_step = step
+        self._draw(step, mlups, hud)
+        return True
+
+    def _refresh_data(self, sim):
+        """Pull current state from the solver into the Q field. Expensive half."""
+        if self._containers is None:
+            bc_mask = getattr(sim, "bc_mask", None) if self.mask_solid else None
+            self._containers = self._build_containers(sim.u, bc_mask)
+
+        # Drain the solver backlog *before* starting the clock.
+        #
+        # sim.step() dispatches asynchronously and deliberately does not sync, so
+        # the host runs far ahead of the device -- by seconds on a large case.
+        # Everything below queues behind that backlog. Timing from here would
+        # report mostly solver time as "render time", which is not just a
+        # cosmetic lie: callers subtract last_render_seconds from their
+        # throughput interval, so it would inflate their reported MLUPS.
+        #
+        # The drain itself is unavoidable -- rendering the current state means
+        # waiting for the current state -- but it belongs to the solver, not here.
+        t_pre = time.perf_counter()
+        wp.synchronize()
         t0 = time.perf_counter()
 
-        if self._containers is None:
-            self._containers = self._build_containers(sim.u, getattr(sim, "bc_mask", None))
-
-        # Refresh rho/u from the current distributions.
         sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
+        wp.synchronize()
+        t_macro = time.perf_counter()
 
         # Cells not written this frame must read as invalid, otherwise the
         # isosurface would be built partly from stale data.
@@ -1190,59 +1687,109 @@ class LiveView:
 
         for container in self._containers:
             container.run(0, container_runtime=self._neon.Container.ContainerRuntime.neon)
+        wp.synchronize()
+        t_stage = time.perf_counter()
 
-        wp.launch(_q_kernel, dim=self.rshape, inputs=[self._vel, self._flags, self._qv, 1.0 / self.u_ref])
+        wp.launch(_q_kernel, dim=self.rshape, inputs=[self._vel, self._flags, self._qv, 1.0 / self.u_ref, self.r])
         wp.launch(_brick_kernel, dim=self.bshape, inputs=[self._qv, self._brick])
+        wp.synchronize()
+        t_q = time.perf_counter()
+
+        self._drain_ms = (t0 - t_pre) * 1000.0
+        self._macro_ms = (t_macro - t0) * 1000.0
+        self._stage_ms = (t_stage - t_macro) * 1000.0
+        self._q_ms = (t_q - t_stage) * 1000.0
+        # Includes the drain: that wait is what sets the refresh period, even
+        # though the work itself belongs to the solver.
+        self._data_ms = (t_q - t_pre) * 1000.0
+
+        with self.state.lock:
+            recalibrate = self.state.recalibrate
+            self.state.recalibrate = False
+
+        first = self._needs_calibration
+        due = self.recalibrate_every > 0 and self._refreshes % self.recalibrate_every == 0
+        if first or recalibrate or due:
+            self._calibrate(force=recalibrate)
+
+        self._refreshes += 1
+
+        if first and self.verbose:
+            self._report_coverage()
+
+        # Report the breakdown on the first refresh *and* a few later ones. The
+        # first is dominated by warp/Neon JIT compilation -- it read 13 s once,
+        # almost all of it compiling, which says nothing about where the
+        # steady-state cost is and sent an optimisation effort the wrong way.
+        if self.verbose and self._refreshes in (1, 5, 25):
+            label = "first, includes JIT compile" if self._refreshes == 1 else "steady state"
+            print(
+                f"[live_view] data refresh {self._data_ms:.0f} ms "
+                f"(queue drain {self._drain_ms:.0f}, macro {self._macro_ms:.0f}, "
+                f"stage {self._stage_ms:.0f}, Q {self._q_ms:.0f}) [{label}]"
+            )
+
+    def _draw(self, step, mlups, hud):
+        """Raymarch the resident Q field and publish. Cheap half.
+
+        Runs on a private stream so it is independent of the solver's queue in
+        both directions: it does not wait behind pending solver work, and
+        synchronising it does not force that work to complete early.
+        """
+        t0 = time.perf_counter()
 
         with self.state.lock:
             camera = self.state.camera
             iso_scale = self.state.iso_scale
-            recalibrate = self.state.recalibrate
             save_png = self.state.save_png
-            self.state.recalibrate = False
             self.state.save_png = False
-
-        if self._needs_calibration or recalibrate:
-            self._calibrate()
 
         eye, fwd, right, up = camera.basis()
 
-        wp.launch(
-            _render_kernel,
-            dim=(self.height, self.width),
-            inputs=[
-                self._qv,
-                self._brick,
-                self._fb,
-                self._mesh_id,
-                self._has_mesh,
-                eye,
-                fwd,
-                right,
-                up,
-                math.tan(math.radians(camera.fov) * 0.5),
-                self.q_iso * iso_scale,
-                self.w_max,
-                self.step_cells,
-                self.body_color,
-                self.bg_top,
-                self.bg_bottom,
-                self.ambient,
-                self.specular,
-                self.gamma,
-            ],
-        )
+        inputs = [
+            self._qv,
+            self._brick,
+            self._fb,
+            self._mesh_id,
+            self._has_mesh,
+            eye,
+            fwd,
+            right,
+            up,
+            math.tan(math.radians(camera.fov) * 0.5),
+            self.q_iso * iso_scale,
+            self.w_max,
+            self.step_cells,
+            self.body_color,
+            self.bg_top,
+            self.bg_bottom,
+            self.ambient,
+            self.specular,
+            self.gamma,
+        ]
 
-        # The only per-frame device->host traffic: one RGB image.
-        wp.copy(self._host, self._fb)
-        wp.synchronize()
+        if self._stream is not None:
+            # Note: pass stream= explicitly rather than using wp.ScopedStream.
+            # ScopedStream synchronizes on *entry* by default, which makes the
+            # new stream wait for everything already queued on the default one --
+            # exactly the solver backlog we are trying to step around. Measured:
+            # 293 ms via ScopedStream vs 3.6 ms with an explicit stream, behind
+            # an identical 400-launch backlog.
+            wp.launch(_render_kernel, dim=(self.height, self.width), inputs=inputs, stream=self._stream)
+            # The only per-frame device->host traffic: one RGB image.
+            wp.copy(self._host, self._fb, stream=self._stream)
+            wp.synchronize_stream(self._stream)
+        else:
+            wp.launch(_render_kernel, dim=(self.height, self.width), inputs=inputs)
+            wp.copy(self._host, self._fb)
+            wp.synchronize()
 
         frame = self._host.numpy().tobytes()
 
         self._frames += 1
-        self._render_ms = (time.perf_counter() - t0) * 1000.0
+        self._draw_ms = (time.perf_counter() - t0) * 1000.0
+        self._render_ms = self._draw_ms
         self._last_render = time.perf_counter()
-        self._last_step = step
 
         with self.state.lock:
             self.state.hud = self._hud_text(step, mlups, iso_scale, hud)
@@ -1252,11 +1799,12 @@ class LiveView:
         if save_png and not isinstance(self.display, _PngDisplay):
             self._snapshot(frame, step)
 
-        return True
+        # After show(), so frame_file names a frame that has at least been queued.
+        self._write_status(step, mlups, iso_scale)
 
     def _hud_text(self, step, mlups, iso_scale, extra):
         lines = [
-            f"step {step}   MLUPS {mlups:.1f}   render {self._render_ms:.0f} ms",
+            f"step {step}   MLUPS {mlups:.1f}   draw {self._draw_ms:.0f} ms   data {self._data_ms:.0f} ms",
             f"q_iso {self.q_iso * iso_scale:.4g}   grid {self.rshape[0]}x{self.rshape[1]}x{self.rshape[2]}",
         ]
         if extra:
@@ -1291,9 +1839,11 @@ class LiveView:
         self._fb = None
         self._host = None
         self._containers = None
+        self._scatter_n = None
+        self._stream = None
 
         if self.verbose:
-            print(f"[live_view] closed after {self._frames} frames")
+            print(f"[live_view] closed after {self._frames} frames, {self._refreshes} data refreshes")
 
     def close(self):
         with self.state.lock:
