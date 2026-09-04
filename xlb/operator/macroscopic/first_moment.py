@@ -78,7 +78,21 @@ class FirstMoment(Operator):
             # Split-accumulator summation for each spatial component
             for d in range(self.velocity_set.d):
                 u[d] = split_sum_component(d, f)
-            u /= rho
+            # `u /= rho` emits one fp32 division per component.  Without
+            # --use_fast_math each is ~20 SASS instructions (FCHK + MUFU.RCP +
+            # Newton refinement), so forming the reciprocal once and scaling by
+            # it trades d divisions for 1 division and d multiplies.  Measured
+            # on the D3Q27 KBC+Smagorinsky collision path (sm_86, ptxas -O3):
+            # div.rn.f32 34 -> 31 and 117 -> 113 registers.
+            #
+            # Accuracy note: reciprocal-then-multiply carries one rounding more
+            # than a direct divide.  Over realistic densities (rho = 1 +/- 2%)
+            # the max relative error grows from 6.0e-8 (0.5 ulp) to 1.2e-7
+            # (1 ulp), mean 2.2e-8 -> 3.0e-8, against an fp32 epsilon of
+            # 1.19e-7 -- the same order of trade already taken by the
+            # split-accumulator sums above.
+            inv_rho = self.compute_dtype(1.0) / rho
+            u *= inv_rho
             return u
 
         @wp.kernel
