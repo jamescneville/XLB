@@ -66,6 +66,8 @@ Cell types are defined in `xlb.cell_type`:
 - BC_NONE (0): Regular fluid voxel with potential BCs or multi-res interactions
 """
 
+import os
+
 import nvtx
 import warp as wp
 from typing import Any
@@ -92,7 +94,7 @@ from xlb.operator.boundary_masker import (
     MultiresMeshMaskerTrapped,
 )
 from xlb.operator.boundary_condition.helper_functions_bc import MultiresEncodeAuxiliaryData
-from xlb.cell_type import BC_SFV, BC_SOLID
+from xlb.cell_type import BC_NONE, BC_SFV, BC_SOLID
 
 """
 SFV = Simple Fluid Voxel: a fluid voxel that is not a BC nor is involved in explosion or coalescence
@@ -409,6 +411,34 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         # Warp rejects `self` as an "Invalid external reference type" when it appears
         # in a plain assignment (e.g. `_c = self.velocity_set.c`).  Capturing here
         # makes these values available as simple closure variables.
+        # ---------------------------------------------------------------
+        # Diagnostic ablations for CFV_finest_fused_pull, the container that
+        # dominates the profile.  Each token removes one stage so its cost
+        # share can be measured directly.  Every ablation makes the physics
+        # WRONG -- this exists only to attribute time.
+        #   XLB_ABLATE=accum       skip the 27 neon_mres_lbm_store_op coalescence writes
+        #   XLB_ABLATE=explosion   plain streaming instead of stream-with-explosion
+        #   XLB_ABLATE=bc          skip BC application and aux recovery
+        #   XLB_ABLATE=thread_data skip the local f_0 / missing_mask reads
+        # Comma-separate to combine, e.g. XLB_ABLATE=accum,explosion
+        # ---------------------------------------------------------------
+        _ablate = {t.strip() for t in os.environ.get("XLB_ABLATE", "").split(",") if t.strip()}
+        _unknown = _ablate - {"accum", "explosion", "bc", "thread_data"}
+        if _unknown:
+            raise ValueError(f"XLB_ABLATE: unknown token(s) {sorted(_unknown)}")
+        if _ablate:
+            print(f"*** XLB_ABLATE={sorted(_ablate)} -- CFV finest kernel ABLATED, physics INVALID ***")
+        _abl_accum = "accum" in _ablate
+        _abl_explosion = "explosion" in _ablate
+        _abl_bc = "bc" in _ablate
+        _abl_thread_data = "thread_data" in _ablate
+
+        # Per-voxel gating of the multiresolution stages (explosion reads and
+        # coalescence accumulation) on a precomputed `needs_mres` flag.  Set
+        # XLB_NO_MRES_GATE=1 to fall back to the unconditional behaviour for A/B.
+        _mres_gate_disabled = os.environ.get("XLB_NO_MRES_GATE", "0").strip().lower() in ("1", "true", "yes", "on")
+        self._mres_gate_enabled = not _mres_gate_disabled
+
         lattice_central_index = self.velocity_set.center_index
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _missing_mask_vec = wp.vec(self.velocity_set.q, dtype=wp.uint8)
@@ -496,6 +526,20 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 _missing_mask[l] = wp.neon_read(missing_mask_pn, index, l)
 
             return _f0_thread, _missing_mask
+
+        @wp.func
+        def neon_get_f0(
+            f0_pn: Any,
+            index: Any,
+        ):
+            # Populations-only variant of neon_get_thread_data, for the SFV fast
+            # paths that never consult the missing mask.  Reading missing_mask
+            # there costs q bytes of traffic per voxel plus q registers for a
+            # vector that is immediately discarded.
+            _f0_thread = _f_vec()
+            for l in range(self.velocity_set.q):
+                _f0_thread[l] = self.compute_dtype(wp.neon_read(f0_pn, index, l))
+            return _f0_thread
 
         @wp.func
         def neon_apply_aux_recovery_bc(
@@ -591,6 +635,10 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         collide_bc_accum = make_collide_pipeline(do_bc=True, do_accumulation=True)
         collide_bc_only = make_collide_pipeline(do_bc=True, do_accumulation=False)
         collide_simple = make_collide_pipeline(do_bc=False, do_accumulation=False)
+        collide_accum_only = make_collide_pipeline(do_bc=False, do_accumulation=True)
+        # Used by CFV_finest_fused_pull; identical to collide_bc_accum unless an
+        # XLB_ABLATE token disables a stage.
+        collide_cfv_finest = make_collide_pipeline(do_bc=not _abl_bc, do_accumulation=not _abl_accum)
 
         @wp.func
         def neon_stream_explode_coalesce(
@@ -718,12 +766,16 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
                     if _boundary_id != wp.uint8(BC_SFV):
                         return
-                    _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
+                    # Collide-only kernel: the local populations are the collision
+                    # input.  collide_simple is do_bc=False, so the missing mask is
+                    # never consulted -- do not pay to read it.
+                    _f0_thread = neon_get_f0(f_0_pn, index)
+                    _no_missing_mask = _missing_mask_vec()
                     collide_simple(
                         index,
                         0,
                         _boundary_id,
-                        _missing_mask,
+                        _no_missing_mask,
                         f_0_pn,
                         f_1_pn,
                         _f0_thread,
@@ -1053,9 +1105,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     #   - They are not on a resolution jump -> they do not do coalescence or explosion
                     #   - They are not mr halo cells
 
-                    _missing_mask = _missing_mask_vec()
-                    _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
-                    _f_post_collision = _f0_thread
+                    # Stream-only kernel: nothing downstream reads the local
+                    # pre-streaming populations or the missing mask.
                     _f_post_stream = self.stream.neon_functional(f_0_pn, index)
 
                     for l in range(self.velocity_set.q):
@@ -1189,6 +1240,90 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
             return ll
 
+        @neon.Container.factory(name="mark_needs_mres")
+        def mark_needs_mres(level: int, f_0_fd: Any, bc_mask_fd: Any, needs_mres_fd: Any):
+            """Precompute, once, which voxels can participate in a level jump.
+
+            Both multiresolution stages in the finest fused kernel only fire
+            where the voxel actually borders a coarser region:
+
+            * explosion -- ``neon_stream_finest_with_explosion`` reads the
+              coarser level only where there is no same-level neighbour *and*
+              ``neon_lbm_read_coarser_ngh`` finds a coarser one;
+            * coalescence -- ``neon_mres_lbm_store_op`` reaches its ``atomicAdd``
+              only inside ``if (!pout.isActive(cn))`` with an active uncle.
+
+            This reuses the exact predicate ``SFV_reset_bc_mask`` applies to
+            plain fluid voxels, extended to BC-carrying voxels -- that routine
+            returns early on ``_boundary_id != 0``, so wall voxels are never
+            evaluated and end up in the expensive class by default.
+
+            A missing same-level neighbour alone is NOT a valid test: it is also
+            true all over the body surface, where the interior is not meshed.
+            Using it flags nearly every wall voxel and gains nothing (measured).
+
+            D3Q27's direction set is {-1,0,1}^3, so one sweep covers every
+            offset, and push directions are the negation of pull directions so
+            the union covers both.  Topology is static, so this is computed once
+            at setup rather than rediscovered 27 times per voxel per timestep.
+            """
+            def ll(loader: neon.Loader):
+                loader.set_mres_grid(bc_mask_fd.get_grid(), level)
+                f_0_pn = loader.get_mres_read_handle(f_0_fd)
+                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+                needs_pn = loader.get_mres_write_handle(needs_mres_fd)
+
+                @wp.func
+                def cl(index: Any):
+                    _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
+                    if _boundary_id == wp.uint8(BC_SOLID):
+                        wp.neon_write(needs_pn, index, 0, wp.uint8(0))
+                        return
+
+                    # Same test SFV_reset_bc_mask uses to classify a voxel as
+                    # SFV, but applied to BC-carrying voxels too -- that routine
+                    # returns early on `_boundary_id != 0`, so wall voxels are
+                    # never evaluated for whether they touch a level jump.
+                    #
+                    # A missing same-level neighbour is NOT sufficient: it also
+                    # happens at the body surface, where the interior is not
+                    # meshed.  The coarser cell must actually exist, which is
+                    # what neon_lbm_read_coarser_ngh reports.
+                    _flag = wp.uint8(0)
+                    for l in range(self.velocity_set.q):
+                        if l == lattice_central_index:
+                            continue
+
+                        pull_direction = wp.neon_ngh_idx(wp.int8(-_c[0, l]), wp.int8(-_c[1, l]), wp.int8(-_c[2, l]))
+
+                        has_ngh_at_same_level = wp.bool(False)
+                        wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level)
+
+                        if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
+                            if not has_ngh_at_same_level:
+                                if wp.neon_has_parent(f_0_pn, index):
+                                    has_a_coarser_ngh = wp.bool(False)
+                                    wp.neon_lbm_read_coarser_ngh(
+                                        f_0_pn, index, pull_direction, l, self.store_dtype(0), has_a_coarser_ngh
+                                    )
+                                    if has_a_coarser_ngh:
+                                        _flag = wp.uint8(1)  # explosion
+                        else:
+                            if has_ngh_at_same_level:
+                                _flag = wp.uint8(1)  # coalescence
+
+                    # A voxel with children is a halo cell of a finer level and
+                    # is skipped by the fused kernel anyway, but flag it so the
+                    # predicate stays conservative if that ever changes.
+                    if wp.neon_has_child(f_0_pn, index):
+                        _flag = wp.uint8(1)
+
+                    wp.neon_write(needs_pn, index, 0, _flag)
+
+                loader.declare_kernel(cl)
+
+            return ll
+
         @neon.Container.factory(name="CFV_finest_fused_pull")
         def CFV_finest_fused_pull(
             level: int,
@@ -1232,6 +1367,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
                 accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
 
+
                 @wp.func
                 def device(index: Any):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
@@ -1242,16 +1378,25 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     if wp.neon_has_child(f_0_pn, index):
                         return
 
-                    _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
+                    if wp.static(_abl_thread_data):
+                        _f0_thread = _f_vec()
+                        _missing_mask = _missing_mask_vec()
+                    else:
+                        _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
                     _f_post_collision = _f0_thread
-                    _f_post_stream = neon_stream_finest_with_explosion(index, f_0_pn, explosion_src_pn)
 
-                    _f_post_stream = apply_bc_post_streaming(
-                        index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
-                        _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
-                    )
+                    if wp.static(_abl_explosion):
+                        _f_post_stream = self.stream.neon_functional(f_0_pn, index)
+                    else:
+                        _f_post_stream = neon_stream_finest_with_explosion(index, f_0_pn, explosion_src_pn)
 
-                    collide_bc_accum(
+                    if wp.static(not _abl_bc):
+                        _f_post_stream = apply_bc_post_streaming(
+                            index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                            _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
+                        )
+
+                    collide_cfv_finest(
                         index,
                         timestep,
                         _boundary_id,
@@ -1275,6 +1420,160 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 loader.declare_kernel(device)
 
             return ll
+
+        def make_cfv_finest_split(does_mres: bool, does_bc: bool, name: str):
+            """Build one of the three specialised finest-level CFV containers.
+
+            Splitting into separate containers rather than branching inside one
+            kernel is deliberate, and measured: a runtime branch inlines every
+            variant into a single kernel, so all CFV voxels pay the register and
+            occupancy cost while only fully-uniform warps see the saving.  At
+            ~8% CFV scattered over 64-thread blocks that is a net loss
+            (CFV/SFV 2.035 branched vs 1.853 unbranched vs 1.548 split).
+
+            The three classes partition CFV exactly:
+
+            ==========================  ==============================  ====  ====
+            container                   selector                        BC    mres
+            ==========================  ==============================  ====  ====
+            CFV_BC_finest_fused_pull    needs_mres == 0                 yes   no
+            CFV_MRES_NOBC_...           needs_mres != 0, bc_mask == 0    no   yes
+            CFV_MRES_BC_...             needs_mres != 0, bc_mask != 0   yes   yes
+            ==========================  ==============================  ====  ====
+
+            The middle class is ~99.8% of the multiresolution voxels and carries
+            no boundary condition, so it is compiled with ``do_bc=False``: none
+            of the registered BC functionals are inlined into it at all.  The
+            handful of voxels that are both a wall and a level jump (~2,300 at
+            the finest level) fall into the third container and keep the full
+            path -- the split is on measured state, never on an assumption that
+            those two populations are disjoint.
+
+            With ``do_bc=False`` the local pre-streaming populations and the
+            missing mask are dead (they exist only as ``f_pre`` for the BC
+            chain), so that kernel skips ``neon_get_thread_data`` entirely.
+            """
+
+            @neon.Container.factory(name=name)
+            def cfv_finest_split(
+                level: int,
+                f_0_fd: Any,
+                f_1_fd: Any,
+                bc_mask_fd: Any,
+                missing_mask_fd: Any,
+                omega: Any,
+                timestep: Any,
+                is_f1_the_explosion_src_field: bool,
+                _rho0: Any,
+                _u0: Any,
+                _rho1: Any,
+                _u1: Any,
+                _relax: Any,
+                normal_vector: Any,
+                normal_distance: Any,
+            ):
+                if level != 0:
+                    raise Exception("Only the finest level is supported for now")
+                num_levels = f_0_fd.get_grid().num_levels
+
+                def ll(loader: neon.Loader):
+                    loader.set_mres_grid(bc_mask_fd.get_grid(), level)
+                    if level + 1 < f_0_fd.get_grid().num_levels:
+                        f_0_pn = loader.get_mres_write_handle(f_0_fd, neon.Loader.Operation.stencil_up)
+                        f_1_pn = loader.get_mres_write_handle(f_1_fd, neon.Loader.Operation.stencil_up)
+                    else:
+                        f_0_pn = loader.get_mres_read_handle(f_0_fd)
+                        f_1_pn = loader.get_mres_write_handle(f_1_fd)
+                    bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+                    missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
+                    needs_mres_pn = loader.get_mres_read_handle(self.needs_mres)
+                    _rho0_pn = loader.get_mres_read_handle(_rho0)
+                    _u0_pn = loader.get_mres_read_handle(_u0)
+                    _rho1_pn = loader.get_mres_write_handle(_rho1)
+                    _u1_pn = loader.get_mres_write_handle(_u1)
+                    _relax_pn = loader.get_mres_write_handle(_relax)
+                    _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
+                    _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
+                    explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
+                    accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
+
+                    @wp.func
+                    def device(index: Any):
+                        _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
+                        if _boundary_id == wp.uint8(BC_SOLID):
+                            return
+                        if _boundary_id == wp.uint8(BC_SFV):
+                            return
+                        if wp.neon_has_child(f_0_pn, index):
+                            return
+
+                        _needs_mres = wp.neon_read(needs_mres_pn, index, 0)
+                        if wp.static(does_mres):
+                            if _needs_mres == wp.uint8(0):
+                                return
+                            if wp.static(does_bc):
+                                if _boundary_id == wp.uint8(BC_NONE):
+                                    return
+                            else:
+                                if _boundary_id != wp.uint8(BC_NONE):
+                                    return
+                        else:
+                            if _needs_mres != wp.uint8(0):
+                                return
+
+                        if wp.static(does_bc):
+                            _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
+                        else:
+                            # Dead without the BC chain: they exist only as f_pre.
+                            _f0_thread = _f_vec()
+                            _missing_mask = _missing_mask_vec()
+                        _f_post_collision = _f0_thread
+
+                        if wp.static(does_mres):
+                            _f_post_stream = neon_stream_finest_with_explosion(index, f_0_pn, explosion_src_pn)
+                        else:
+                            _f_post_stream = self.stream.neon_functional(f_0_pn, index)
+
+                        if wp.static(does_bc):
+                            _f_post_stream = apply_bc_post_streaming(
+                                index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_collision, _f_post_stream,
+                                _rho0_pn, _u0_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn,
+                            )
+
+                        if wp.static(does_mres and does_bc):
+                            collide_bc_accum(
+                                index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream,
+                                omega, num_levels, level, accumulation_pn,
+                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn,
+                            )
+                        if wp.static(does_mres and not does_bc):
+                            collide_accum_only(
+                                index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream,
+                                omega, num_levels, level, accumulation_pn,
+                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn,
+                            )
+                        if wp.static(not does_mres):
+                            collide_bc_only(
+                                index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream,
+                                omega, num_levels, level, accumulation_pn,
+                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn,
+                            )
+
+                    loader.declare_kernel(device)
+
+                return ll
+
+            return cfv_finest_split
+
+        CFV_BC_finest_fused_pull = make_cfv_finest_split(
+            does_mres=False, does_bc=True, name="CFV_BC_finest_fused_pull"
+        )
+        CFV_MRES_NOBC_finest_fused_pull = make_cfv_finest_split(
+            does_mres=True, does_bc=False, name="CFV_MRES_NOBC_finest_fused_pull"
+        )
+        CFV_MRES_BC_finest_fused_pull = make_cfv_finest_split(
+            does_mres=True, does_bc=True, name="CFV_MRES_BC_finest_fused_pull"
+        )
 
         @neon.Container.factory(name="SFV_finest_fused_pull")
         def SFV_finest_fused_pull(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, omega: Any, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
@@ -1301,13 +1600,16 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
                     if _boundary_id != wp.uint8(BC_SFV):
                         return
-                    _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
+                    # SFV voxels carry no BC and no explosion, so the streamed
+                    # populations are the only collision input: neither the local
+                    # pre-streaming populations nor the missing mask are read.
                     _f_post_stream = self.stream.neon_functional(f_0_pn, index)
+                    _no_missing_mask = _missing_mask_vec()
                     collide_simple(
                         index,
                         0,
                         _boundary_id,
-                        _missing_mask,
+                        _no_missing_mask,
                         f_0_pn,
                         f_1_pn,
                         _f_post_stream,
@@ -1335,6 +1637,10 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             "CFV_finest_fused_pull": CFV_finest_fused_pull,
             "SFV_finest_fused_pull": SFV_finest_fused_pull,
             "SFV_reset_bc_mask": SFV_reset_bc_mask,
+            "mark_needs_mres": mark_needs_mres,
+            "CFV_BC_finest_fused_pull": CFV_BC_finest_fused_pull,
+            "CFV_MRES_NOBC_finest_fused_pull": CFV_MRES_NOBC_finest_fused_pull,
+            "CFV_MRES_BC_finest_fused_pull": CFV_MRES_BC_finest_fused_pull,
             "CFV_collide_coarse": CFV_collide_coarse,
             "SFV_collide_coarse": SFV_collide_coarse,
             "SFV_stream_coarse_step_ABC": SFV_stream_coarse_step_ABC,

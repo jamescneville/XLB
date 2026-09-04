@@ -2619,6 +2619,14 @@ def solve(
     final_print_interval = max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq']  / 100.0)))
     h5exporter.start_time_average()
 
+    # Opt-in per-container timing breakdown (XLB_PROFILE_CONTAINERS=1).
+    # Leaves the fields in a meaningless state, so it exits rather than solving.
+    from xlb.utils.container_profile import enabled as _profile_enabled, profile_containers
+    if _profile_enabled():
+        profile_containers(sim, h5exporter=h5exporter)
+        print("Container profile complete; exiting without solving.")
+        return
+
     if jsonfile['settings']['debug']:
         for step in range(num_steps):
             solution_time =(time.time()-solve_start)/60

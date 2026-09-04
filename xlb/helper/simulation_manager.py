@@ -9,6 +9,7 @@ interleaves coarse and fine grid updates.
 
 import warp as wp
 from xlb.operator.stepper import MultiresIncompressibleNavierStokesStepper
+from xlb.precision_policy import Precision
 from xlb.operator.macroscopic import MultiresMacroscopic
 from xlb.mres_perf_optimization_type import MresPerfOptimizationType
 
@@ -84,6 +85,15 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         self.f_0, self.f_1, self.bc_mask, self.missing_mask, self.normal_vector, self.normal_distance = self.prepare_fields(self.rho, self.u, self.initializer)
         self.prepare_coalescence_count(coalescence_factor=self.coalescence_factor, bc_mask=self.bc_mask)
 
+        # Per-voxel flag: can this voxel reach a coarser level at all?  Both
+        # multiresolution stages in the fused kernels are guarded by a missing
+        # same-level neighbour, so voxels fully surrounded at their own level
+        # can skip them.  Topology is static, so this is computed once here.
+        # Must precede _construct_stepper_skeleton, which reads the field when
+        # it builds the containers.
+        self.needs_mres = grid.create_field(cardinality=1, dtype=Precision.UINT8)
+        self.prepare_needs_mres()
+
         self.iteration_idx = -1
         self.macro = MultiresMacroscopic(
             compute_backend=self.compute_backend,
@@ -93,6 +103,16 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
 
         # Construct the stepper skeleton
         self._construct_stepper_skeleton()
+
+    def prepare_needs_mres(self):
+        """Populate ``needs_mres`` for every level and report the split.
+
+        The printed counts are the payoff estimate: voxels flagged 0 skip both
+        the explosion read path and the 27 coalescence uncle walks.
+        """
+        for level in range(self.count_levels):
+            self.neon_container["mark_needs_mres"](level, self.f_0, self.bc_mask, self.needs_mres).run(0)
+        wp.synchronize()
 
     def compute_omega(self, omega_finest, level):
         """
@@ -199,12 +219,27 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             ("finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
             ("finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
         ]
-        sfv_fused_pull_finest = [
-            ("CFV_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
-            ("SFV_finest_fused_pull", False, {}),
-            ("CFV_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
-            ("SFV_finest_fused_pull", True, {}),
-        ]
+        if getattr(self, "_mres_gate_enabled", False):
+            # CFV split by needs_mres into two single-path containers.  See
+            # make_cfv_finest_split for why this is two containers rather than a
+            # branch inside one kernel.
+            sfv_fused_pull_finest = [
+                ("CFV_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
+                ("CFV_MRES_NOBC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
+                ("CFV_MRES_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
+                ("SFV_finest_fused_pull", False, {}),
+                ("CFV_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+                ("CFV_MRES_NOBC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+                ("CFV_MRES_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+                ("SFV_finest_fused_pull", True, {}),
+            ]
+        else:
+            sfv_fused_pull_finest = [
+                ("CFV_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
+                ("SFV_finest_fused_pull", False, {}),
+                ("CFV_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+                ("SFV_finest_fused_pull", True, {}),
+            ]
 
         configs = {
             MresPerfOptimizationType.NAIVE_COLLIDE_STREAM: {
