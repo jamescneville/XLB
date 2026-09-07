@@ -64,35 +64,58 @@ class SecondMoment(Operator):
             dtype=self.compute_dtype,
         )
 
+        # Number of whole 4-element groups, and where the leftover tail starts.
+        _n_groups = self.velocity_set.q // 4
+        _tail_start = 4 * _n_groups
+
+        @wp.func
+        def split_sum_component(d: int, fneq: _f_vec):
+            # Four interleaved accumulators, one branch per term on the
+            # compile-time constant _cc[q, d]. Because _cc is a wp.constant and
+            # the loops unroll, zero coefficients are eliminated at compile time.
+            a0 = self.compute_dtype(0.0)
+            a1 = self.compute_dtype(0.0)
+            a2 = self.compute_dtype(0.0)
+            a3 = self.compute_dtype(0.0)
+
+            for g in range(_n_groups):
+                if _cc[4 * g + 0, d] == 1:
+                    a0 += fneq[4 * g + 0]
+                elif _cc[4 * g + 0, d] == -1:
+                    a0 -= fneq[4 * g + 0]
+
+                if _cc[4 * g + 1, d] == 1:
+                    a1 += fneq[4 * g + 1]
+                elif _cc[4 * g + 1, d] == -1:
+                    a1 -= fneq[4 * g + 1]
+
+                if _cc[4 * g + 2, d] == 1:
+                    a2 += fneq[4 * g + 2]
+                elif _cc[4 * g + 2, d] == -1:
+                    a2 -= fneq[4 * g + 2]
+
+                if _cc[4 * g + 3, d] == 1:
+                    a3 += fneq[4 * g + 3]
+                elif _cc[4 * g + 3, d] == -1:
+                    a3 -= fneq[4 * g + 3]
+
+            for q in range(_tail_start, self.velocity_set.q):
+                if _cc[q, d] == 1:
+                    a0 += fneq[q]
+                elif _cc[q, d] == -1:
+                    a0 -= fneq[q]
+
+            return (a0 + a1) + (a2 + a3)
+
         # Construct functional for computing second moment
         @wp.func
         def functional(
-            fneq: Any,
+            fneq: _f_vec,
         ):
-            # Get second order moment (a symmetric tensor shaped into a vector)
-            pi = _pi_vec()     # pi[d] will hold the final sums
-            corr = _pi_vec()   # correction term for each component
-
-            # initialise
+            # Get second order moment (a symmetric tensor shaped into a vector).
+            pi = _pi_vec()
             for d in range(_pi_dim):
-                pi[d]   = self.compute_dtype(0.0)
-                corr[d] = self.compute_dtype(0.0)
-
-            # ---- Neumaier summation over all lattice velocities ----
-            for q in range(self.velocity_set.q):
-                for d in range(_pi_dim):
-                    t = _cc[q, d] * fneq[q] - corr[d]   # (input – correction)
-                    # provisional sum
-                    y = pi[d] + t
-                    # update correction:  (pi[d] – y) + t
-                    #   – the part of pi[d] that was lost when adding t
-                    corr[d] = (pi[d] - y) + t
-                    pi[d] = y
-
-            # final correction (add the accumulated low-order bits once)
-            for d in range(_pi_dim):
-                pi[d] = pi[d] + corr[d]
-
+                pi[d] = split_sum_component(d, fneq)
             return pi
 
         # Construct the kernel
