@@ -57,6 +57,54 @@ def _warp_init_and_select_cuda_device():
             pass
 
 
+def _maybe_enable_fast_math():
+    """Force ``fast_math`` on for every Warp module when ``XLB_FAST_MATH`` is set.
+
+    Warp offers no global switch for this.  ``warp.config`` has no ``fast_math``
+    field at all, and :class:`warp.context.Module` hardcodes
+    ``options["fast_math"] = False`` when it builds its option dict, so setting
+    ``wp.config.fast_math = True`` silently does nothing.  The documented
+    alternative, :func:`warp.set_module_options`, targets a *Python* module --
+    but Neon compiles every container kernel into its own anonymous Warp module
+    via ``@wp.kernel(module="unique")`` (see ``neon/container.py``), so there is
+    no importable module to point it at.
+
+    Patching ``Module.__init__`` is therefore the only hook that reaches both
+    XLB's own operator modules and Neon's per-container ones.
+
+    Enabling this maps fp32 division and square root onto the fast hardware
+    intrinsics and flushes denormals to zero.  On the D3Q27 KBC+Smagorinsky
+    collision path this measured 2488 -> 1824 SASS instructions (-27%) and
+    removed all 34 division range checks, at a cost of ~11 registers
+    (117 -> 128, i.e. 17 -> 16 warps/SM on sm_86).
+
+    It is a real numerical change, so it is opt-in and off by default.  Validate
+    against a reference case, not just MLUPS.
+
+    Returns
+    -------
+    bool
+        ``True`` if fast math was enabled.
+    """
+    if os.environ.get("XLB_FAST_MATH", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+
+    from warp.context import Module
+
+    if not getattr(Module, "_xlb_fast_math_patched", False):
+        _original_init = Module.__init__
+
+        def _init_with_fast_math(self, *args, **kwargs):
+            _original_init(self, *args, **kwargs)
+            self.options["fast_math"] = True
+
+        Module.__init__ = _init_with_fast_math
+        Module._xlb_fast_math_patched = True
+
+    print("XLB: fast_math ENABLED for all Warp modules (XLB_FAST_MATH is set)")
+    return True
+
+
 def init(velocity_set, default_backend, default_precision_policy):
     """Initialize the global XLB configuration.
 
@@ -77,6 +125,7 @@ def init(velocity_set, default_backend, default_precision_policy):
 
     if default_backend == ComputeBackend.WARP:
         _warp_init_and_select_cuda_device()
+        _maybe_enable_fast_math()
     elif default_backend == ComputeBackend.NEON:
         import warp as wp
         import neon
@@ -87,6 +136,10 @@ def init(velocity_set, default_backend, default_precision_policy):
         # wp.verbose_warnings = True
 
         _warp_init_and_select_cuda_device()
+
+        # Must precede any kernel definition: it changes the codegen options that
+        # every Warp module is constructed with.
+        _maybe_enable_fast_math()
 
         # It's a good idea to always clear the kernel cache when developing new native or codegen features
         wp.build.clear_kernel_cache()
