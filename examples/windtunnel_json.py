@@ -1755,6 +1755,13 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     
     sliceSettings = jsonfile.get("slices", {})
 
+    if not any(
+        bool(sliceSettings.get(key, False))
+        for key in ("velocity", "pressure", "cp", "cptotal", "cptotalloss")
+    ):
+        print("No slice fields enabled; skipping slice generation.")
+        return
+
     # Universal controls for all fields and axes.
     default_num_slices = int(sliceSettings.get("numSlices", 51))
     default_num_slices = max(1, default_num_slices)
