@@ -273,8 +273,9 @@ class MomentumTransfer(Operator):
                                 m[d] += phi
                             elif _c[d, _opp_indices[l]] == -1:
                                 m[d] -= phi
-            # Atomic sum to get the total force vector
-            wp.atomic_add(force, 0, m)
+
+                # Atomic sum to get the total force vector
+                wp.atomic_add(force, 0, m)
 
         # Construct the warp kernel
         @wp.kernel
