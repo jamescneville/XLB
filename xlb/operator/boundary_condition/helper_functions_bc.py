@@ -183,7 +183,7 @@ class HelperFunctionsBC(object):
             three = compute_dtype(3.0)
             trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
 
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)            
+            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             for l in range(_q):
                 QiPi = compute_dtype(0.0)
                 for t in range(_nt):
@@ -195,7 +195,7 @@ class HelperFunctionsBC(object):
                 # assign all populations based on eq 45 of Latt et al (2008)
                 # fneq ~ f^1
                 fpop1 = compute_dtype(4.5) * _w[l] * QiPi
-                fpop[l] = feq[l] + fpop1                
+                fpop[l] = feq[l] + fpop1
                 fpop[l] = wp.max(fpop[l], _epsilon)
 
             return fpop
@@ -468,13 +468,10 @@ class HelperFunctionsBC(object):
                 u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
 
             # Newton iteration: solve g(u+) = u+ - profile(K/u+) = 0
-            for _ in range(15):
+            for _ in range(4):
                 y_plus = K / wp.max(u_plus, _epsilon)
                 u_profile = reichardt_profile(y_plus)
                 residual = u_plus - u_profile
-
-                if wp.abs(residual) < compute_dtype(1e-6) * wp.max(u_plus, compute_dtype(1.0)):
-                    break
 
                 du_dy = reichardt_derivative(y_plus)
                 g_prime = compute_dtype(1.0) + du_dy * K / (u_plus * u_plus + _epsilon)
@@ -489,9 +486,8 @@ class HelperFunctionsBC(object):
         def sample_neighbor(
             index: Any,
             normal: Any,
-            _rho: Any, 
+            _rho: Any,
             _u: Any,
-            f_1: Any,
             streamwise: Any,
         ):
             """
@@ -499,11 +495,15 @@ class HelperFunctionsBC(object):
             2. Snap to the lattice link best aligned with `streamwise` → from the neighbor,
             step 1 voxel in downdstream and upstream to get data.
 
-            
+            Downstream sampling is skipped entirely when the upstream coherence
+            check already fails, since `coherent` requires both to pass. This
+            avoids the second neighbor read/vector-construction pass (and the
+            two dead `u_up`/`u_down` locals from the original version) in the
+            common incoherent case.
             """
-            
+
             # ============================================================
-            # Find best lattice link aligned with the NORMAL 
+            # Find best lattice link aligned with the NORMAL
             # ============================================================
             best_n_l   = wp.int32(0)
             best_n_dot = compute_dtype(-1.0e9)
@@ -528,7 +528,7 @@ class HelperFunctionsBC(object):
             step_dir = wp.vec3i(_c[0, best_n_l], _c[1, best_n_l], _c[2, best_n_l])
             if best_n_dot < compute_dtype(0.0):
                 step_dir = -step_dir
-            
+
             # ============================================================
             # Find neighbor properties and streamwise vector
             # ============================================================
@@ -540,11 +540,11 @@ class HelperFunctionsBC(object):
             for d in range(_d):
                 has_neihbor = wp.bool(False)
                 f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, compute_dtype(0.0), has_neihbor))
-                if has_neihbor:                    
+                if has_neihbor:
                     u_neighbor[d] = f_aux
 
             neighbor_dist = wp.length(wp.vec3(compute_dtype(step_dir[0]), compute_dtype(step_dir[1]), compute_dtype(step_dir[2]), ))
-    
+
             # ============================================================
             # Find best lattice link aligned with the STREAMWISE
             # ============================================================
@@ -562,12 +562,12 @@ class HelperFunctionsBC(object):
                 if cmag <= _epsilon:
                     continue
                 c_unit = c / cmag
-                a = wp.dot(c_unit, streamwise)                
+                a = wp.dot(c_unit, streamwise)
                 if a > best_s_dot:
                     best_s_dot = a
                     best_s_l   = wp.int32(l)
 
-            # Flip if best dot was negative.            
+            # Flip if best dot was negative.
             stream_step = wp.vec3i(_c[0, best_s_l], _c[1, best_s_l], _c[2, best_s_l])
             if best_s_dot < compute_dtype(0.0):
                 stream_step = -stream_step
@@ -577,116 +577,81 @@ class HelperFunctionsBC(object):
                 compute_dtype(stream_step[0]),
                 compute_dtype(stream_step[1]),
                 compute_dtype(stream_step[2]),
-            )) 
-            # Upstream dist is for neighbor to upstream 
+            ))
+            # Upstream dist is for neighbor to upstream
             # To include Downstream we x2 the length
             streamwise_dist = wp.max(compute_dtype(2.0) * upstream_dist, _epsilon)
+            dot_tol = compute_dtype(0.25) #~80deg    0.5 ~60deg higher = tighter 0.45was working well
 
             # ============================================================
-            # Sample UPSTREAM and DOWNSTREAM
+            # Sample UPSTREAM and check coherence first
             # ============================================================
-                
-            # Upstream Reads
             f_upstream_off = wp.vec3i( step_dir[0] - stream_step[0], step_dir[1] - stream_step[1], step_dir[2] - stream_step[2], )
             ngh_uf = wp.neon_ngh_idx(wp.int8(f_upstream_off[0]), wp.int8(f_upstream_off[1]), wp.int8(f_upstream_off[2]))
-            
-            f_rho_upstream = rho_center
-            has_upstrem = wp.bool(False)
-            f_aux = compute_dtype(
-            wp.neon_read_ngh(_rho, index, ngh_uf, 0, compute_dtype(0.0), has_upstrem))
-            if has_upstrem:                    
-                f_rho_upstream = f_aux
 
             f_u_upstream = u_neighbor
             for d in range(_d):
                 has_neihbor = wp.bool(False)
                 f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, compute_dtype(0.0), has_neihbor))
-                if has_neihbor:                    
+                if has_neihbor:
                     f_u_upstream[d] = f_aux
 
-            # Downstream Reads    
-            f_downstream_off = wp.vec3i( step_dir[0] + stream_step[0], step_dir[1] + stream_step[1], step_dir[2] + stream_step[2], )
-            ngh_df = wp.neon_ngh_idx(wp.int8(f_downstream_off[0]), wp.int8(f_downstream_off[1]), wp.int8(f_downstream_off[2]))        
-            
-            f_rho_downstream = rho_center
-            has_downstream = wp.bool(False)
-            f_aux = compute_dtype(
-                wp.neon_read_ngh(_rho, index, ngh_df, 0, compute_dtype(0.0), has_downstream))
-            if has_downstream:                    
-                f_rho_downstream = f_aux  
-                
-            f_u_downstream = u_neighbor
-            for d in range(_d):
-                has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, compute_dtype(0.0), has_neihbor))
-                if has_neihbor:                    
-                    f_u_downstream[d] = f_aux    
-
-            # Coherence check
             f_u_upstream_normal = normal * wp.dot(f_u_upstream, normal)
             f_u_upstream_streamwise = f_u_upstream - f_u_upstream_normal
-            f_u_upstream_mag = wp.length(f_u_upstream_streamwise)    
-            f_u_upstream_streamwise = f_u_upstream_streamwise / f_u_upstream_mag
-
-            f_u_downstream_normal = normal * wp.dot(f_u_downstream, normal)
-            f_u_downstream_streamwise = f_u_downstream - f_u_downstream_normal
-            f_u_downstream_mag = wp.length(f_u_downstream_streamwise)    
-            f_u_downstream_streamwise = f_u_downstream_streamwise / f_u_downstream_mag
+            f_u_upstream_mag = wp.length(f_u_upstream_streamwise)
 
             dot_up = compute_dtype(0.0)
-            dot_dn = compute_dtype(0.0)
-
             if f_u_upstream_mag > _epsilon:
-                dot_up = wp.dot(streamwise, f_u_upstream_streamwise)
+                dot_up = wp.dot(streamwise, f_u_upstream_streamwise / f_u_upstream_mag)
 
-            if f_u_downstream_mag > _epsilon:
-                dot_dn = wp.dot(streamwise,f_u_downstream_streamwise)
+            coherent = compute_dtype(0.0)
+            drho_ds = compute_dtype(0.0)
 
-            dot_tol = compute_dtype(0.25) #~80deg    0.5 ~60deg higher = tighter 0.45was working well
-            
-            if (dot_up > dot_tol) and (dot_dn > dot_tol):
-                u_up = f_u_upstream
-                rho_up = f_rho_upstream
-                u_down = f_u_downstream
-                rho_down = f_rho_downstream
-                coherent = compute_dtype(1.0)
-            else:
-                u_up = u_neighbor
-                rho_up = rho_center
-                u_down = u_neighbor
-                rho_down = rho_center
-                coherent = compute_dtype(0.0)
+            # Only sample downstream (and pay for the extra neighbor reads) if
+            # upstream already passed -- `coherent` needs both to hold.
+            if dot_up > dot_tol:
+                f_rho_upstream = rho_center
+                has_upstrem = wp.bool(False)
+                f_aux = compute_dtype(
+                wp.neon_read_ngh(_rho, index, ngh_uf, 0, compute_dtype(0.0), has_upstrem))
+                if has_upstrem:
+                    f_rho_upstream = f_aux
 
-            # --- Debug print (unchanged) ---
-            # idx_wp = neon_index_to_warp(f_1, index)
-            # nx = normal[0]
-            # ny = normal[1]
-            # nz = normal[2]
-            # theta = wp.atan2(nz, -nx) * compute_dtype(57.29577951308232)
-            # if theta < compute_dtype(0.0):
-            #     theta += compute_dtype(360.0)
+                f_downstream_off = wp.vec3i( step_dir[0] + stream_step[0], step_dir[1] + stream_step[1], step_dir[2] + stream_step[2], )
+                ngh_df = wp.neon_ngh_idx(wp.int8(f_downstream_off[0]), wp.int8(f_downstream_off[1]), wp.int8(f_downstream_off[2]))
 
-            # #12mm
-            # if (idx_wp[1] > 429) and (idx_wp[1] < 431) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            # #10mm
-            # #if (idx_wp[1] > 515) and (idx_wp[1] < 517) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            # #8mm
-            # #if (idx_wp[1] > 644) and (idx_wp[1] < 646) and (idx_wp[2] > 50) and (nz > compute_dtype(0.15)) and (wp.abs(ny) < compute_dtype(0.25)) and (theta > compute_dtype(20.0)) and (theta < compute_dtype(145.0)):
-            #     wp.printf(
-            #         "WM idx,%4d,%4d,%4d, theta, %1.1f, normal,%1.2f,%1.2f,%1.2f, streamwise,%1.2f,%1.2f,%1.2f, streamstep,%1d,%1d,%1d, f_rho_up, %1.6e f_rho_dn, %1.6e, rho_n, %1.6e, dot_up, %1.1e, dot_dn, %1.1e \n",
-            #         idx_wp[0], idx_wp[1], idx_wp[2], theta, 
-            #         normal[0], normal[1], normal[2],streamwise[0], streamwise[1], streamwise[2],stream_step[0], stream_step[1], stream_step[2], f_rho_upstream, f_rho_downstream, rho_center, dot_up, dot_dn
-            #     )
-         
-                                     
-            return u_neighbor, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent
+                f_rho_downstream = rho_center
+                has_downstream = wp.bool(False)
+                f_aux = compute_dtype(
+                    wp.neon_read_ngh(_rho, index, ngh_df, 0, compute_dtype(0.0), has_downstream))
+                if has_downstream:
+                    f_rho_downstream = f_aux
+
+                f_u_downstream = u_neighbor
+                for d in range(_d):
+                    has_neihbor = wp.bool(False)
+                    f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, compute_dtype(0.0), has_neihbor))
+                    if has_neihbor:
+                        f_u_downstream[d] = f_aux
+
+                f_u_downstream_normal = normal * wp.dot(f_u_downstream, normal)
+                f_u_downstream_streamwise = f_u_downstream - f_u_downstream_normal
+                f_u_downstream_mag = wp.length(f_u_downstream_streamwise)
+
+                dot_dn = compute_dtype(0.0)
+                if f_u_downstream_mag > _epsilon:
+                    dot_dn = wp.dot(streamwise, f_u_downstream_streamwise / f_u_downstream_mag)
+
+                if dot_dn > dot_tol:
+                    drho_ds = _cs2 * (f_rho_downstream - f_rho_upstream) / streamwise_dist
+                    coherent = compute_dtype(1.0)
+
+            return u_neighbor, neighbor_dist, streamwise, drho_ds, coherent
             
         @wp.func
         def compute_wall_modeled_velocity(
             index: Any,
             _missing_mask: Any,
-            f_1: Any,
-            f_pre: Any,
             u_wall: Any,
             nu: Any,
             _rho: Any,
@@ -740,8 +705,8 @@ class HelperFunctionsBC(object):
             # -----------------------------------------------------------------
             # NEIGHBOR SAMPLING
             # -----------------------------------------------------------------
-            u_f, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent = sample_neighbor(
-                index, normal, _rho, _u, f_1, streamwiseb
+            u_f, neighbor_dist, streamwise, drho_ds, coherent = sample_neighbor(
+                index, normal, _rho, _u, streamwiseb
             )
 
             # =================================================================
@@ -752,20 +717,9 @@ class HelperFunctionsBC(object):
             u_f_rel = u_f - u_wall
             u_f_mag = wp.length(u_f_rel)
 
-            # Tangential direction at F (safe fallback)
-            u_f_norm = wp.dot(u_f_rel, normal)
-            u_f_tangent = u_f_rel - normal * u_f_norm
-            u_f_tangent_len = wp.length(u_f_tangent)
-            if u_f_tangent_len > _epsilon:
-                streamwisef = u_f_tangent / u_f_tangent_len
-            else:
-                streamwisef = streamwise          
-
             # Use B-streamwise for signed streamwise speed
             u_f_signed = wp.dot(u_f_rel, streamwise)
             u_f_par_mag = wp.abs(u_f_signed)
-
-            u_f_fwd = wp.dot(u_f_rel, streamwiseb)
 
             if u_f_par_mag < _epsilon:
                 return u_wall, _relax
@@ -784,7 +738,7 @@ class HelperFunctionsBC(object):
             # =================================================================
             # SECTION 2: STREAMWISE PRESSURE GRADIENT
             # =================================================================
-            dp_ds = _cs2 * (rho_down - rho_up) / wp.max(streamwise_dist, _epsilon)
+            dp_ds = drho_ds
             rho_b = wp.max(compute_dtype(wp.neon_read(_rho, index, 0)), compute_dtype(1.0e-6))
 
             a_pg = dp_ds / rho_b
