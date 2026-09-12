@@ -1,0 +1,562 @@
+"""
+Single-resolution AABB-Close boundary masker with wall-model normal/distance output.
+
+Ports the normal-vector/wall-distance computation from
+:class:`MultiresMeshMaskerAABBClose` (Neon multires backend) to a plain,
+single-resolution ``neon.dense.dGrid``. The per-voxel geometry (mesh
+ray-casting, normal clustering, wall-distance derivation) is identical --
+only the grid/loader calls differ (no ``set_mres_grid``/``get_mres_*_handle``,
+no per-level loop, since a single-resolution grid has exactly one level).
+
+This exists so :class:`WallModelNavierStokesStepper` can support the
+``HybridBC`` wall-model variants (``use_wall_model=True``) without the Neon
+multires (mGrid) machinery.
+"""
+
+import warp as wp
+from typing import Any
+from xlb.velocity_set.velocity_set import VelocitySet
+from xlb.precision_policy import PrecisionPolicy
+from xlb.compute_backend import ComputeBackend
+from xlb.operator.boundary_masker import MeshMaskerAABBClose
+from xlb.operator.operator import Operator
+from xlb.cell_type import BC_SOLID
+
+
+class WallModelMeshMaskerAABBClose(MeshMaskerAABBClose):
+    """AABB-Close mesh masker for single-resolution Neon grids that also
+    computes per-voxel wall normal/distance for the ``HybridBC`` wall model.
+
+    Same morphological dilate/erode closing as the base masker, plus a NEON
+    container that ray-casts against the mesh to accumulate a clustered
+    surface normal and wall distance per boundary voxel (see
+    :class:`MultiresMeshMaskerAABBClose` for the multires original this is
+    ported from).
+    """
+
+    def __init__(
+        self,
+        velocity_set: VelocitySet = None,
+        precision_policy: PrecisionPolicy = None,
+        compute_backend: ComputeBackend = None,
+        close_voxels: int = None,
+    ):
+        super().__init__(velocity_set, precision_policy, compute_backend, close_voxels)
+        if self.compute_backend in [ComputeBackend.JAX, ComputeBackend.WARP]:
+            raise NotImplementedError(f"Operator {self.__class__.__name__} not supported in {self.compute_backend} backend.")
+
+        # Build and store NEON dicts
+        self.neon_functional_dict, self.neon_container_dict = self._construct_neon()
+
+    def _construct_neon(self):
+        import neon
+
+        # Use the warp functionals from the base (for reference), but implement NEON variants here
+        functional_dict_warp, _ = self._construct_warp()
+        functional_erode_warp = functional_dict_warp.get("functional_erode")
+        functional_dilate_warp = functional_dict_warp.get("functional_dilate")
+        functional_solid = functional_dict_warp.get("functional_solid")
+
+        # We also need lattice info for neighbor iteration
+        _c = self.velocity_set.c
+        _q = self.velocity_set.q
+        _opp_indices = self.velocity_set.opp_indices
+
+        # Set local constants
+        lattice_central_index = self.velocity_set.center_index
+
+        @wp.func
+        def hit_normal_weight(
+            norm_dir: wp.vec3f,
+            normal: wp.vec3f,
+            ray_dist: wp.float32,
+            max_length: wp.float32,
+        ):
+            # normal is oriented against the ray direction before this is called.
+            # alignment = 1.0 for face-on hits, 0.0 for grazing hits.
+            alignment = -wp.dot(norm_dir, normal)
+            alignment = wp.clamp(alignment, wp.float32(0.0), wp.float32(1.0))
+
+            # Prefer closer hits, but prevent tiny distances from dominating.
+            rel_dist = ray_dist / (max_length if max_length > 0.0 else wp.float32(1.0))
+            distance_weight = wp.float32(1.0) / wp.max(rel_dist, wp.float32(0.25))
+
+            # D3Q27 has more diagonal links than axis links.
+            # This reduces over-weighting of edge/corner directions.
+            link_weight = wp.float32(1.0) / wp.max(max_length * max_length, wp.float32(1.0))
+
+            return alignment * alignment * distance_weight * link_weight
+
+        # Main AABB close: sets bc_mask, missing_mask, distances based on solid_mask
+        # bc_mask: wp.uint8, missing_mask: wp.uint8, distances: dtype from precision policy (float)
+        @wp.func
+        def functional_aabb_wall_model(
+            index: Any,
+            mesh_id: wp.uint64,
+            id_number: wp.int32,
+            distances_pn: Any,
+            bc_mask_pn: Any,
+            missing_mask_pn: Any,
+            solid_mask_pn: Any,
+            needs_mesh_distance: bool,
+            normal_vector: Any,
+            normal_distance: Any,
+        ):
+            reset_done = wp.bool(False)
+
+            cell_center = self.helper_masker.index_to_position(bc_mask_pn, index)
+
+            solid_val = wp.neon_read(solid_mask_pn, index, 0)
+            bc_val = wp.neon_read(bc_mask_pn, index, 0)
+
+            # Keep existing solid or already-owned boundary cells untouched.
+            if solid_val == wp.uint8(BC_SOLID) or bc_val == wp.uint8(BC_SOLID):
+                wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SOLID))
+                return
+
+            # Four clusters allow one dominant wall plus a few local feature normals.
+            cluster_n0 = wp.vec3f(0.0, 0.0, 0.0)
+            cluster_n1 = wp.vec3f(0.0, 0.0, 0.0)
+            cluster_n2 = wp.vec3f(0.0, 0.0, 0.0)
+            cluster_n3 = wp.vec3f(0.0, 0.0, 0.0)
+
+            cluster_w0 = wp.float32(0.0)
+            cluster_w1 = wp.float32(0.0)
+            cluster_w2 = wp.float32(0.0)
+            cluster_w3 = wp.float32(0.0)
+
+            # These store weighted projected centroid-to-wall distance, not ray length.
+            cluster_d0 = wp.float32(0.0)
+            cluster_d1 = wp.float32(0.0)
+            cluster_d2 = wp.float32(0.0)
+            cluster_d3 = wp.float32(0.0)
+
+            total_normal = wp.vec3f(0.0, 0.0, 0.0)
+            total_wall_dist = wp.float32(0.0)
+            total_weight = wp.float32(0.0)
+
+            # Normals within about 35 degrees are treated as the same surface cluster.
+            cluster_cos = wp.float32(0.819152044)
+
+            for direction_idx in range(_q):
+                if direction_idx == lattice_central_index:
+                    continue
+
+                ngh = wp.neon_ngh_idx(wp.int8(_c[0, direction_idx]), wp.int8(_c[1, direction_idx]), wp.int8(_c[2, direction_idx]))
+
+                is_valid = wp.bool(False)
+                nval = wp.neon_read_ngh(solid_mask_pn, index, ngh, 0, wp.uint8(0), is_valid)
+
+                if not is_valid:
+                    continue
+
+                if nval != wp.uint8(BC_SOLID):
+                    continue
+
+                # If no mesh distance is requested, keep the base ownership behavior:
+                # mark the cell as boundary and flag the missing opposite link.
+                if not needs_mesh_distance:
+                    if not reset_done:
+                        for l in range(_q):
+                            self.write_field(missing_mask_pn, index, _opp_indices[l], wp.uint8(False))
+                        reset_done = wp.bool(True)
+
+                    self.write_field(bc_mask_pn, index, 0, wp.uint8(id_number))
+                    self.write_field(missing_mask_pn, index, _opp_indices[direction_idx], wp.uint8(True))
+                    continue
+
+                dir_vec = wp.vec3f(wp.float32(_c[0, direction_idx]), wp.float32(_c[1, direction_idx]), wp.float32(_c[2, direction_idx]))
+
+                max_length = wp.length(dir_vec)
+                safe_length = max_length if max_length > 0.0 else wp.float32(1.0)
+                norm_dir = dir_vec / safe_length
+
+                # 2.5-link search distance so the second-layer case can still hit.
+                query = wp.mesh_query_ray(mesh_id, cell_center, norm_dir, wp.float32(2.5) * safe_length)
+
+                # Ownership, missing-mask reset, distances, and normal accumulation only
+                # happen after a valid mesh hit. This avoids claiming ownership from
+                # solid-mask adjacency when the mesh ray did not actually resolve.
+
+                if not reset_done:
+                    for l in range(_q):
+                        self.write_field(missing_mask_pn, index, _opp_indices[l], wp.uint8(False))
+                    reset_done = wp.bool(True)
+
+                self.write_field(bc_mask_pn, index, 0, wp.uint8(id_number))
+                self.write_field(missing_mask_pn, index, _opp_indices[direction_idx], wp.uint8(True))
+
+                if query.result:
+                    ray_dist = query.t
+                    normal = query.normal
+                else:
+                    ray_dist = wp.float32(1.5)
+                    normal = -norm_dir
+
+                # Orient the triangle normal against the lattice ray.
+                # This makes alignment positive and keeps normal_vector consistently
+                # pointing from the wall back toward the fluid cell.
+                if wp.dot(norm_dir, normal) > 0.0:
+                    normal = -normal
+
+                alignment = -wp.dot(norm_dir, normal)
+                alignment = wp.clamp(alignment, wp.float32(0.0), wp.float32(1.0))
+
+                # Store per-link distance normalized by lattice-link length.
+                # Subtract 0.5 to account for aabb solid.
+                link_distance = ray_dist / safe_length
+                link_distance = wp.clamp(link_distance - 0.5, wp.float32(0.0), wp.float32(1.0))
+
+                if wp.isnan(link_distance) or wp.isinf(link_distance):
+                    link_distance = wp.float32(1.0)
+
+                self.write_field(distances_pn, index, direction_idx, self.store_dtype(link_distance))
+
+                # Convert ray length to true wall-normal distance.
+                #
+                # For a flat plane parallel to voxel faces:
+                #   axis ray:     ray_dist = d,           alignment = 1
+                #   edge ray:     ray_dist = d / cos,     alignment = cos
+                #   corner ray:   ray_dist = d / cos,     alignment = cos
+                #
+                # Therefore: wall_dist = ray_dist * alignment = d
+                wall_dist = ray_dist * alignment
+                wall_dist = wp.max(wall_dist, wp.float32(0.0))
+
+                if wp.isnan(wall_dist) or wp.isinf(wall_dist):
+                    continue
+
+                hit_w = hit_normal_weight(norm_dir, normal, ray_dist, safe_length)
+
+                if hit_w <= 0.0:
+                    continue
+
+                weighted_normal = hit_w * normal
+
+                total_normal += weighted_normal
+                total_wall_dist += hit_w * wall_dist
+                total_weight += hit_w
+
+                added = wp.bool(False)
+
+                # Try to add this hit to an existing normal cluster.
+                if cluster_w0 > 0.0 and not added:
+                    c_len = wp.length(cluster_n0)
+                    c_dir = cluster_n0 / (c_len if c_len > 0.0 else wp.float32(1.0))
+
+                    if wp.dot(normal, c_dir) >= cluster_cos:
+                        cluster_n0 += weighted_normal
+                        cluster_w0 += hit_w
+                        cluster_d0 += hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if cluster_w1 > 0.0 and not added:
+                    c_len = wp.length(cluster_n1)
+                    c_dir = cluster_n1 / (c_len if c_len > 0.0 else wp.float32(1.0))
+
+                    if wp.dot(normal, c_dir) >= cluster_cos:
+                        cluster_n1 += weighted_normal
+                        cluster_w1 += hit_w
+                        cluster_d1 += hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if cluster_w2 > 0.0 and not added:
+                    c_len = wp.length(cluster_n2)
+                    c_dir = cluster_n2 / (c_len if c_len > 0.0 else wp.float32(1.0))
+
+                    if wp.dot(normal, c_dir) >= cluster_cos:
+                        cluster_n2 += weighted_normal
+                        cluster_w2 += hit_w
+                        cluster_d2 += hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if cluster_w3 > 0.0 and not added:
+                    c_len = wp.length(cluster_n3)
+                    c_dir = cluster_n3 / (c_len if c_len > 0.0 else wp.float32(1.0))
+
+                    if wp.dot(normal, c_dir) >= cluster_cos:
+                        cluster_n3 += weighted_normal
+                        cluster_w3 += hit_w
+                        cluster_d3 += hit_w * wall_dist
+                        added = wp.bool(True)
+
+                # If no existing cluster matched, start a new cluster if possible.
+                if not added:
+                    if cluster_w0 <= 0.0:
+                        cluster_n0 = weighted_normal
+                        cluster_w0 = hit_w
+                        cluster_d0 = hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if not added:
+                    if cluster_w1 <= 0.0:
+                        cluster_n1 = weighted_normal
+                        cluster_w1 = hit_w
+                        cluster_d1 = hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if not added:
+                    if cluster_w2 <= 0.0:
+                        cluster_n2 = weighted_normal
+                        cluster_w2 = hit_w
+                        cluster_d2 = hit_w * wall_dist
+                        added = wp.bool(True)
+
+                if not added:
+                    if cluster_w3 <= 0.0:
+                        cluster_n3 = weighted_normal
+                        cluster_w3 = hit_w
+                        cluster_d3 = hit_w * wall_dist
+                        added = wp.bool(True)
+
+                # If all clusters are occupied and this hit matches none, add it to
+                # the closest normal cluster instead of dropping it.
+                if not added:
+                    best_i = wp.int32(0)
+                    best_dot = wp.float32(-2.0)
+
+                    c_len0 = wp.length(cluster_n0)
+                    c_dir0 = cluster_n0 / (c_len0 if c_len0 > 0.0 else wp.float32(1.0))
+                    d0 = wp.dot(normal, c_dir0)
+
+                    if d0 > best_dot:
+                        best_dot = d0
+                        best_i = wp.int32(0)
+
+                    c_len1 = wp.length(cluster_n1)
+                    c_dir1 = cluster_n1 / (c_len1 if c_len1 > 0.0 else wp.float32(1.0))
+                    d1 = wp.dot(normal, c_dir1)
+
+                    if d1 > best_dot:
+                        best_dot = d1
+                        best_i = wp.int32(1)
+
+                    c_len2 = wp.length(cluster_n2)
+                    c_dir2 = cluster_n2 / (c_len2 if c_len2 > 0.0 else wp.float32(1.0))
+                    d2 = wp.dot(normal, c_dir2)
+
+                    if d2 > best_dot:
+                        best_dot = d2
+                        best_i = wp.int32(2)
+
+                    c_len3 = wp.length(cluster_n3)
+                    c_dir3 = cluster_n3 / (c_len3 if c_len3 > 0.0 else wp.float32(1.0))
+                    d3 = wp.dot(normal, c_dir3)
+
+                    if d3 > best_dot:
+                        best_dot = d3
+                        best_i = wp.int32(3)
+
+                    if best_i == wp.int32(0):
+                        cluster_n0 += weighted_normal
+                        cluster_w0 += hit_w
+                        cluster_d0 += hit_w * wall_dist
+                    elif best_i == wp.int32(1):
+                        cluster_n1 += weighted_normal
+                        cluster_w1 += hit_w
+                        cluster_d1 += hit_w * wall_dist
+                    elif best_i == wp.int32(2):
+                        cluster_n2 += weighted_normal
+                        cluster_w2 += hit_w
+                        cluster_d2 += hit_w * wall_dist
+                    else:
+                        cluster_n3 += weighted_normal
+                        cluster_w3 += hit_w
+                        cluster_d3 += hit_w * wall_dist
+
+            if (total_weight <= 0.0) or (not needs_mesh_distance):
+                return
+
+            # Use the dominant cluster, not the global average, so random outlier
+            # triangle hits do not skew the stored normal.
+            best_n = cluster_n0
+            best_w = cluster_w0
+            best_d = cluster_d0
+
+            if cluster_w1 > best_w:
+                best_n = cluster_n1
+                best_w = cluster_w1
+                best_d = cluster_d1
+
+            if cluster_w2 > best_w:
+                best_n = cluster_n2
+                best_w = cluster_w2
+                best_d = cluster_d2
+
+            if cluster_w3 > best_w:
+                best_n = cluster_n3
+                best_w = cluster_w3
+                best_d = cluster_d3
+
+            # Fallback for pathological cases.
+            if best_w <= 0.0:
+                best_n = total_normal
+                best_w = total_weight
+                best_d = total_wall_dist
+
+            avg_wall_dist = best_d / wp.max(best_w, wp.float32(1.0e-8))
+            avg_wall_dist = wp.max(avg_wall_dist, wp.float32(0.0))
+
+            avg_normal_len = wp.length(best_n)
+
+            if avg_normal_len > 1.0e-8:
+                avg_normal = best_n / avg_normal_len
+            else:
+                fallback_len = wp.length(total_normal)
+                if fallback_len > 1.0e-8:
+                    avg_normal = total_normal / fallback_len
+                else:
+                    avg_normal = wp.vec3f(0.0, 0.0, 0.0)
+
+            self.write_field(normal_distance, index, 0, self.store_dtype(avg_wall_dist))
+            self.write_field(normal_vector, index, 0, self.store_dtype(avg_normal[0]))
+            self.write_field(normal_vector, index, 1, self.store_dtype(avg_normal[1]))
+            self.write_field(normal_vector, index, 2, self.store_dtype(avg_normal[2]))
+
+        # Containers (single-resolution: plain get_read_handle/get_write_handle, no level arg)
+
+        @neon.Container.factory(name="Erode")
+        def container_erode(f_field: wp.array3d(dtype=Any), f_field_out: wp.array3d(dtype=Any)):
+            def erode_launcher(loader: neon.Loader):
+                loader.set_grid(f_field.get_grid())
+                f_field_pn = loader.get_read_handle(f_field)
+                f_field_out_pn = loader.get_write_handle(f_field_out)
+
+                @wp.func
+                def erode_kernel(index: Any):
+                    functional_erode_warp(index, f_field_pn, f_field_out_pn)
+
+                loader.declare_kernel(erode_kernel)
+
+            return erode_launcher
+
+        @neon.Container.factory(name="Dilate")
+        def container_dilate(f_field: wp.array3d(dtype=Any), f_field_out: wp.array3d(dtype=Any)):
+            def dilate_launcher(loader: neon.Loader):
+                loader.set_grid(f_field.get_grid())
+                f_field_pn = loader.get_read_handle(f_field)
+                f_field_out_pn = loader.get_write_handle(f_field_out)
+
+                @wp.func
+                def dilate_kernel(index: Any):
+                    functional_dilate_warp(index, f_field_pn, f_field_out_pn)
+
+                loader.declare_kernel(dilate_kernel)
+
+            return dilate_launcher
+
+        @neon.Container.factory(name="Solid")
+        def container_solid(mesh_id: wp.uint64, solid_mask: wp.array3d(dtype=wp.uint8)):
+            def solid_launcher(loader: neon.Loader):
+                loader.set_grid(solid_mask.get_grid())
+                solid_mask_pn = loader.get_write_handle(solid_mask)
+
+                @wp.func
+                def solid_kernel(index: Any):
+                    functional_solid(index, mesh_id, solid_mask_pn, wp.vec3f(0.0, 0.0, 0.0))
+
+                loader.declare_kernel(solid_kernel)
+
+            return solid_launcher
+
+        @neon.Container.factory(name="MeshMaskerAABBCloseWallModel")
+        def container(
+            mesh_id: Any,
+            id_number: Any,
+            distances: Any,
+            bc_mask: Any,
+            missing_mask: Any,
+            solid_mask: Any,
+            needs_mesh_distance: Any,
+            normal_vector: Any,
+            normal_distance: Any,
+        ):
+            def aabb_launcher(loader: neon.Loader):
+                loader.set_grid(bc_mask.get_grid())
+                distances_pn = loader.get_write_handle(distances)
+                bc_mask_pn = loader.get_write_handle(bc_mask)
+                missing_mask_pn = loader.get_write_handle(missing_mask)
+                solid_mask_pn = loader.get_write_handle(solid_mask)
+                norm_vec_pn = loader.get_write_handle(normal_vector)
+                norm_dist_pn = loader.get_write_handle(normal_distance)
+
+                @wp.func
+                def aabb_kernel(index: Any):
+                    functional_aabb_wall_model(
+                        index,
+                        mesh_id,
+                        id_number,
+                        distances_pn,
+                        bc_mask_pn,
+                        missing_mask_pn,
+                        solid_mask_pn,
+                        needs_mesh_distance,
+                        norm_vec_pn,
+                        norm_dist_pn,
+                    )
+
+                loader.declare_kernel(aabb_kernel)
+
+            return aabb_launcher
+
+        container_dict = {
+            "container_erode": container_erode,
+            "container_dilate": container_dilate,
+            "container_solid": container_solid,
+            "container_aabb": container,
+        }
+
+        functional_dict = {
+            "functional_aabb_wall_model": functional_aabb_wall_model,
+        }
+
+        return functional_dict, container_dict
+
+    @Operator.register_backend(ComputeBackend.NEON)
+    def neon_implementation(
+        self,
+        bc,
+        distances,
+        bc_mask,
+        missing_mask,
+        normal_vector,
+        normal_distance,
+        stream=0,
+    ):
+        import neon
+
+        # Prepare inputs
+        mesh_id, bc_id = self._prepare_kernel_inputs(bc, bc_mask)
+
+        grid = bc_mask.get_grid()
+        solid_mask = grid.new_field(cardinality=1, dtype=wp.uint8)
+        solid_mask_out = grid.new_field(cardinality=1, dtype=wp.uint8)
+
+        solid_mask.fill_run(value=wp.uint8(0), stream_idx=stream)
+        solid_mask_out.fill_run(value=wp.uint8(0), stream_idx=stream)
+
+        container_solid = self.neon_container_dict["container_solid"](mesh_id, solid_mask)
+        container_solid.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+
+        for _ in range(self.close_voxels):
+            container_dilate = self.neon_container_dict["container_dilate"](solid_mask, solid_mask_out)
+            container_dilate.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            solid_mask, solid_mask_out = solid_mask_out, solid_mask
+
+        if self.close_voxels % 2 > 0:
+            solid_mask, solid_mask_out = solid_mask_out, solid_mask
+
+        for _ in range(self.close_voxels):
+            container_erode = self.neon_container_dict["container_erode"](solid_mask_out, solid_mask)
+            container_erode.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            solid_mask, solid_mask_out = solid_mask_out, solid_mask
+
+        if self.close_voxels % 2 > 0:
+            solid_mask, solid_mask_out = solid_mask_out, solid_mask
+
+        container_aabb = self.neon_container_dict["container_aabb"](
+            mesh_id, bc_id, distances, bc_mask, missing_mask, solid_mask, wp.static(bc.needs_mesh_distance), normal_vector, normal_distance
+        )
+        container_aabb.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+
+        return distances, bc_mask, missing_mask, normal_vector, normal_distance
