@@ -1172,7 +1172,7 @@ def setup_boundary_conditions(grid, level_data, body_vertices, wheel_vertices, w
         # Define rotating boundary profile
         def wheel_profile(origin_np, rot_rate):
             dtype = precision_policy.compute_precision.wp_dtype
-            _u_vec = wp.vec(3, dtype=dtype)
+            _u_vec = wp.types.vector(3, dtype=dtype)
             angular_velocity = _u_vec(0.0, rot_rate, 0.0)
             origin_wp = _u_vec(origin_np[0], origin_np[1], origin_np[2])
 
