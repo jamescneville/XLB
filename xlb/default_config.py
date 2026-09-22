@@ -86,6 +86,11 @@ def init(velocity_set, default_backend, default_precision_policy):
         # wp.config.verbose = True
         # wp.verbose_warnings = True
 
+        # Neon partition types don't support Warp's adjoint (backward) code
+        # generation (e.g. adj_where fails to compile for NeonMultiresPartition_*).
+        # XLB's Neon backend doesn't need autodiff, so disable it entirely.
+        wp.config.enable_backward = False
+
         _warp_init_and_select_cuda_device()
 
         # It's a good idea to always clear the kernel cache when developing new native or codegen features
