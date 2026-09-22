@@ -793,11 +793,22 @@ def prep_inputs(input_file):
     scm_progress(15)
     print(f"Progress 15%")
 
-    # Setup momentum transfer    
+    # Front/rear wheel-center reference points (used below to compute the
+    # front/rear lift split), derived from the wheel filenames.
+    front_center = rear_center = None
+    if wheel_vertices is not None:
+        front_center, rear_center, _, _ = classify_wheel_axles(wheel_centers, jsonfile['vehicle']['wheels'])
+
+    # Setup momentum transfer.
+    # When wheels are present, body and wheel forces/moments are all taken about
+    # front_center so they can be combined into a single moment for the front/rear
+    # lift decomposition in print_lift_drag; otherwise the reference point is
+    # irrelevant since only the net force is used.
     momentum_transfer = MultiresMomentumTransfer(
         boundary_conditions[0],
         mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
         compute_backend=compute_backend,
+        moment_reference_point=tuple(front_center) if front_center is not None else (0.0, 0.0, 0.0),
     )
     wheel_momentum = None
     if wheel_vertices is not None:
@@ -807,9 +818,10 @@ def prep_inputs(input_file):
                 boundary_conditions[-1-i],
                 mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
                 compute_backend=compute_backend,
+                moment_reference_point=tuple(front_center),
             )
             wheel_momentum.append(mt)
-    
+
     #if settings['debug'] == True: 
         # bcMask = os.path.join(output_dir, f"{jsonfile['outputName']}_initial_bc_mask") 
         # bc_mask_exporter.to_hdf5(bcMask, {"bc_mask": sim.bc_mask}, compression="gzip", compression_opts=0)
@@ -876,14 +888,14 @@ def prep_inputs(input_file):
     
     gc.collect()
     solve(
-        sim, 
+        sim,
         ulb,
-        num_steps, 
-        h5exporter, 
-        output_dir, 
+        num_steps,
+        h5exporter,
+        output_dir,
         grid_shape_zip,
-        grid_shape_x_coarsest, 
-        delta_x_coarse, 
+        grid_shape_x_coarsest,
+        delta_x_coarse,
         shift,
         momentum_transfer,
         wheel_momentum,
@@ -894,7 +906,9 @@ def prep_inputs(input_file):
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        front_center,
+        rear_center,
         )
 
 
@@ -1227,12 +1241,75 @@ def setup_boundary_conditions(grid, level_data, body_vertices, wheel_vertices, w
 
 # Utility Functions
 # =================
-def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values):
+def classify_wheel_axles(wheel_centers, wheel_filenames):
     """
-    Calculate and print lift and drag coefficients.
+    Determine front/rear wheel-center reference points and axle membership from
+    the wheel filenames (production naming convention), not from voxel-index
+    geometry — wheel_centers are in voxel-index units (always >= 0), so a
+    coordinate-sign heuristic (e.g. "left is negative y") cannot work there.
+
+    Keys on the substrings "front_left", "front_right", "rear_left", "rear_right"
+    (case-insensitive) in each filename. wheel_filenames must be in the same
+    order as wheel_centers (both ultimately come from jsonfile['vehicle']['wheels'],
+    preserved in order through mesh_prep).
+
+    Parameters
+    ----------
+    wheel_centers : list of (center_xyz, diameter)
+        As produced by mesh_prep, in lattice-voxel units.
+    wheel_filenames : list of str
+        jsonfile['vehicle']['wheels'], same order as wheel_centers.
+
+    Returns
+    -------
+    front_center, rear_center : np.ndarray of shape (3,)
+        Front/rear axle reference points, on the vehicle centerline (y=0), using
+        the *_left wheel's x and z (per-side simplification).
+    front_indices, rear_indices : list of int
+        Indices into wheel_centers belonging to the front/rear axle.
+    """
+    names = [os.path.basename(str(f)).lower() for f in wheel_filenames]
+
+    def find_unique(tag):
+        matches = [i for i, name in enumerate(names) if tag in name]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one wheel filename containing '{tag}', found {len(matches)} "
+                f"among {wheel_filenames}. Check jsonfile['vehicle']['wheels'] naming."
+            )
+        return matches[0]
+
+    i_front_left = find_unique("front_left")
+    i_rear_left = find_unique("rear_left")
+    front_indices = [i for i, name in enumerate(names) if "front_left" in name or "front_right" in name]
+    rear_indices = [i for i, name in enumerate(names) if "rear_left" in name or "rear_right" in name]
+    if sorted(front_indices + rear_indices) != list(range(len(names))):
+        raise ValueError(
+            f"Every wheel filename must contain one of front_left/front_right/rear_left/rear_right: {wheel_filenames}"
+        )
+
+    front_x = wheel_centers[i_front_left][0][0]
+    rear_x = wheel_centers[i_rear_left][0][0]
+    front_center = np.array([front_x, 0.0, wheel_centers[i_front_left][0][2]])
+    rear_center = np.array([rear_x, 0.0, wheel_centers[i_rear_left][0][2]])
+    return front_center, rear_center, front_indices, rear_indices
+
+
+def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values,
+                     front_center=None, rear_center=None):
+    """
+    Calculate and print lift and drag coefficients, plus (when wheels are present
+    and front_center/rear_center are provided) the front/rear lift split.
+
+    The front/rear split is a static two-point equivalent-load decomposition: it
+    uses the total force and the total moment about front_center (accumulated by
+    momentum_transfer and every wheel_momentum instance, all constructed with
+    moment_reference_point=front_center) to find the vertical loads L_f, L_r at
+    the front/rear wheel-center stations that reproduce both the true net lift
+    and the true pitching moment about the front axle.
     """
     boundary_force = momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
-    wheel_force = [0.0, 0.0, 0.0]
+    wheel_force = np.array([0.0, 0.0, 0.0])
     if wheel_momentum is not None:
         for i in range(len(wheel_momentum)):
             wheel_force += wheel_momentum[i](sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
@@ -1242,8 +1319,55 @@ def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference
     cl = 2.0 * lift / (ulb**2 * reference_area)
     if np.isnan(cd) or np.isnan(cl):
         raise ValueError(f"NaN detected in coefficients at step {step}: Cd={cd}, Cl={cl}")
-    drag_values.append([step, cd, cl])    
-    return cd, cl, drag
+    drag_values.append([step, cd, cl])
+
+    cl_f = cl_r = pct_rear = None
+    if wheel_momentum is not None and front_center is not None and rear_center is not None:
+        # Combined moment about front_center: body + all wheels (linear, so the
+        # per-instance moments accumulated with the same reference point just add).
+        moment_front = momentum_transfer.get_moment()
+        for i in range(len(wheel_momentum)):
+            moment_front = moment_front + wheel_momentum[i].get_moment()
+
+        b = float(rear_center[0] - front_center[0])  # wheelbase (x_rear - x_front), > 0
+        my_front = moment_front[1]
+        # M_y = (z - z_f) * Fx - (x - x_f) * Fz. For a pure rear point-load L_r
+        # acting at arm b along x from front_center: M_y_equiv = -b * L_r.
+        L_r = -my_front / b
+        L_f = lift - L_r
+        cl_f = 2.0 * L_f / (ulb**2 * reference_area)
+        cl_r = 2.0 * L_r / (ulb**2 * reference_area)
+        # "% rear" (aero balance) is only a meaningful single number when front and
+        # rear loads act in the same sense (both lift or both downforce). If they
+        # have opposite signs the total can pass through zero and the percentage
+        # is undefined/misleading, so it's reported as None in that case.
+        pct_rear = 100.0 * L_r / (L_f + L_r) if L_f * L_r > 0.0 else None
+
+    return cd, cl, drag, cl_f, cl_r, pct_rear
+
+
+def compute_axle_averages(axle_values, crossover_step):
+    """
+    Average front/rear lift coefficients over the post-crossover portion of the
+    run (same crossover filtering as the Cd/Cl average), and derive the aero
+    balance from the averaged loads rather than averaging the per-step ratio
+    (avoids a misleading average when the instantaneous split crosses sign).
+
+    Returns (avg_cl_f, avg_cl_r, avg_pct_rear), or (None, None, None) if no
+    front/rear data was collected (e.g. no wheels in this run).
+    """
+    if len(axle_values) == 0:
+        return None, None, None
+    axle_values_array = np.array(axle_values)
+    mask = axle_values_array[:, 0] >= crossover_step
+    post_crossover = axle_values_array[mask, :]
+    if len(post_crossover) <= 1:
+        post_crossover = axle_values_array
+    avg_cl_f = np.mean(post_crossover[:, 1])
+    avg_cl_r = np.mean(post_crossover[:, 2])
+    avg_pct_rear = 100.0 * avg_cl_r / (avg_cl_f + avg_cl_r) if avg_cl_f * avg_cl_r > 0.0 else None
+    return avg_cl_f, avg_cl_r, avg_pct_rear
+
 
 def plot_drag_lift(drag_values, output_dir, script_name, percentile_range=(15, 85), use_log_scale=False):
     """
@@ -2466,7 +2590,9 @@ def solve(
         total_lattice_updates_per_step,
         jsonfile,
         partSize,
-        surface_mesh_for_vtk
+        surface_mesh_for_vtk,
+        front_center=None,
+        rear_center=None,
         ):
     
     # -------------------------- Simulation Loop --------------------------
@@ -2486,6 +2612,7 @@ def solve(
     interval_time = 0.0
     time_out = False
     drag_values = []
+    axle_values = []
     scm_progress(20)
     print(f"Progress 20%")
     # Calculate print and file output intervals
@@ -2540,8 +2667,10 @@ def solve(
                     interval_time = measured
                     MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6
                 sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-                cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
-                filename = os.path.join(output_dir, f"{jsonfile['outputName']}_{step:04d}")                
+                cd, cl, drag, cl_f, cl_r, pct_rear = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values, front_center, rear_center)
+                if cl_f is not None:
+                    axle_values.append([step, cl_f, cl_r])
+                filename = os.path.join(output_dir, f"{jsonfile['outputName']}_{step:04d}")
                 h5exporter.to_slice_image(
                     filename,
                     {"velocity": sim.u},
@@ -2571,6 +2700,9 @@ def solve(
                     # Otherwise the progress block above already printed this same value.
                     print(f"  MLUPS: {MLUPS:.1f}")
                 print(f"  Cd={cd:.3f}, Cl={cl:.3f}, Drag Force (lattice units)={drag:.3f}")
+                if cl_f is not None:
+                    pct_str = f"{pct_rear:.1f}% rear" if pct_rear is not None else "undefined (front/rear opposite sign)"
+                    print(f"  Cl_f={cl_f:.3f}, Cl_r={cl_r:.3f}, Aero Balance={pct_str}")
                 # Reset the interval AFTER I/O so output time is excluded from the next interval.
                 interval_start = time.time()
                 steps_since_last_print = 0
@@ -2607,21 +2739,28 @@ def solve(
                 post_crossover = drag_values_array
             avg_cd = np.mean(post_crossover[:, 1])
             avg_cl = np.mean(post_crossover[:, 2])
+            avg_cl_f, avg_cl_r, avg_pct_rear = compute_axle_averages(axle_values, crossover_step)
             epsilon = 1e-8
             target_cd = jsonfile['vehicle']['targets']['cd'] + epsilon
             target_cl = jsonfile['vehicle']['targets']['cl'] + epsilon
-            print(f"\nExperimental Drag Coefficient (Cd): {target_cd}\n" 
+            print(f"\nExperimental Drag Coefficient (Cd): {target_cd}\n"
                 f"Averages over last {100-jsonfile['settings']['crossover']}% of run:\n"
                 f"Cd: {avg_cd:.4f}\n"
                 f"Cl: {avg_cl:.4f}\n"
                 f"CdA: {avg_cd*reference_area_physical:.4f}\n"
                 f"ClA: {avg_cl*reference_area_physical:.4f}\n"
-                f"Aero Power (kW): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys**3)*avg_cd*reference_area_physical /1000:.4f}\n"                
-                f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys**3)*avg_cd*reference_area_physical /746:.4f}\n"                
-                f"Error Drag Coefficient (Cd): {((avg_cd-target_cd)/target_cd)*100:.2f}%\n" 
+                f"Aero Power (kW): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys**3)*avg_cd*reference_area_physical /1000:.4f}\n"
+                f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys**3)*avg_cd*reference_area_physical /746:.4f}\n"
+                f"Error Drag Coefficient (Cd): {((avg_cd-target_cd)/target_cd)*100:.2f}%\n"
                 f"Error Lift Coefficient (Cl): {((avg_cl-target_cl)/target_cl)*100:.2f}%\n"
                 )
-            
+            if avg_cl_f is not None:
+                pct_str = f"{avg_pct_rear:.1f}% rear" if avg_pct_rear is not None else "undefined (front/rear opposite sign)"
+                print(f"Cl_f: {avg_cl_f:.4f}\n"
+                    f"Cl_r: {avg_cl_r:.4f}\n"
+                    f"Aero Balance: {pct_str}\n"
+                    )
+
             with open(os.path.join(output_dir, "project.log"),'a') as fd:
                 fd.write(f"Averages over last {100-jsonfile['settings']['crossover']}% of run:\n")
                 fd.write(f"Cd: {avg_cd:.4f}\n")
@@ -2632,9 +2771,13 @@ def solve(
                 fd.write(f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys**3)*avg_cd*reference_area_physical / 746:.4f}\n")
                 fd.write(f"Error Drag Coefficient (Cd): {((avg_cd-target_cd)/target_cd)*100:.2f}%\n")
                 fd.write(f"Error Lift Coefficient (Cl): {((avg_cl-target_cl)/target_cl)*100:.2f}%\n")
+                if avg_cl_f is not None:
+                    fd.write(f"Cl_f: {avg_cl_f:.4f}\n")
+                    fd.write(f"Cl_r: {avg_cl_r:.4f}\n")
+                    fd.write(f"Aero Balance: {pct_str}\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
-                
-        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize) 
+
+        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize)
         
             
         filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average")
@@ -2698,6 +2841,10 @@ def solve(
         jsonfile['results']['cla'] = avg_cl * reference_area_physical
         jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
         jsonfile['results']['aero_power_hp'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746
+        if avg_cl_f is not None:
+            jsonfile['results']['cl_f'] = avg_cl_f
+            jsonfile['results']['cl_r'] = avg_cl_r
+            jsonfile['results']['aero_balance_pct_rear'] = avg_pct_rear
         with open(os.path.join(output_dir, "source.json"), 'w') as file:
             json.dump(jsonfile, file, indent=4) # indent for pretty-printing
             print(f"Source Json written to {os.path.join(output_dir, 'source.json')} successfully.")
@@ -2744,7 +2891,11 @@ def solve(
                         MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6
                         print(f"  MLUPS: {MLUPS:.1f}")
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
+                    cd, cl, drag, cl_f, cl_r, pct_rear = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values, front_center, rear_center)
+                    if cl_f is not None:
+                        axle_values.append([step, cl_f, cl_r])
+                        pct_str = f"{pct_rear:.1f}% rear" if pct_rear is not None else "undefined (front/rear opposite sign)"
+                        print(f"  Cl_f={cl_f:.3f}, Cl_r={cl_r:.3f}, Aero Balance={pct_str}")
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
                     wp.synchronize()
                     # Reset the interval AFTER I/O so output time is excluded from the next interval.
@@ -2834,15 +2985,22 @@ def solve(
                 post_crossover = drag_values_array
             avg_cd = np.mean(post_crossover[:, 1])
             avg_cl = np.mean(post_crossover[:, 2])
+            avg_cl_f, avg_cl_r, avg_pct_rear = compute_axle_averages(axle_values, crossover_step)
             print(f"\nAverages over last {100-jsonfile['settings']['crossover']}% of run:\n"
                 f"Cd: {avg_cd:.4f}\n"
                 f"Cl: {avg_cl:.4f}\n"
                 f"CdA: {avg_cd*reference_area_physical:.4f}\n"
                 f"ClA: {avg_cl*reference_area_physical:.4f}\n"
-                f"Aero Power (kW): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical /1000:.4f}\n"                
-                f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical /746:.4f}\n"                
+                f"Aero Power (kW): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical /1000:.4f}\n"
+                f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical /746:.4f}\n"
                 )
-            
+            if avg_cl_f is not None:
+                pct_str = f"{avg_pct_rear:.1f}% rear" if avg_pct_rear is not None else "undefined (front/rear opposite sign)"
+                print(f"Cl_f: {avg_cl_f:.4f}\n"
+                    f"Cl_r: {avg_cl_r:.4f}\n"
+                    f"Aero Balance: {pct_str}\n"
+                    )
+
             with open(os.path.join(output_dir, "project.log"),'a') as fd:
                 fd.write(f"Averages over last {100-jsonfile['settings']['crossover']}% of run:\n")
                 fd.write(f"Cd: {avg_cd:.4f}\n")
@@ -2851,13 +3009,21 @@ def solve(
                 fd.write(f"ClA: {avg_cl*reference_area_physical:.4f}\n")
                 fd.write(f"Aero Power (kW): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical/1000:.4f}\n")
                 fd.write(f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical / 746:.4f}\n")
+                if avg_cl_f is not None:
+                    fd.write(f"Cl_f: {avg_cl_f:.4f}\n")
+                    fd.write(f"Cl_r: {avg_cl_r:.4f}\n")
+                    fd.write(f"Aero Balance: {pct_str}\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
-        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)  
+        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)
         jsonfile['results'] ={}
         jsonfile['results']['cd'] = avg_cd
         jsonfile['results']['avg_cl'] = avg_cl
         jsonfile['results']['cda'] = avg_cd * reference_area_physical
         jsonfile['results']['cla'] = avg_cl * reference_area_physical
+        if avg_cl_f is not None:
+            jsonfile['results']['cl_f'] = avg_cl_f
+            jsonfile['results']['cl_r'] = avg_cl_r
+            jsonfile['results']['aero_balance_pct_rear'] = avg_pct_rear
         jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
         jsonfile['results']['aero_power_hp'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746
         with open(os.path.join(output_dir, "Results.json"), 'w') as file:

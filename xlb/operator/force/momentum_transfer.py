@@ -155,10 +155,12 @@ class MomentumTransfer(Operator):
         velocity_set: VelocitySet = None,
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
+        moment_reference_point=(0.0, 0.0, 0.0),
     ):
         # Assign the no-slip boundary condition instance
         self.no_slip_bc_instance = no_slip_bc_instance
         self.operation_sequence = operation_sequence
+        self.moment_reference_point = moment_reference_point
 
         # Define the needed for the momentum transfer
         self.fetcher = FetchPopulations(
@@ -180,6 +182,18 @@ class MomentumTransfer(Operator):
             # Allocate the force vector (the total integral value will be computed)
             _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
             self.force = wp.zeros((1), dtype=_u_vec)
+            # Allocate the moment (torque) vector, taken about moment_reference_point.
+            # Since the momentum-exchange force at a boundary voxel is treated as acting
+            # at that voxel's own position, moment = cross(position - reference, force) and
+            # can be accumulated with the same atomic reduction used for force.
+            self.moment = wp.zeros((1), dtype=_u_vec)
+
+    def get_moment(self):
+        """Return the accumulated moment (torque) vector about moment_reference_point.
+
+        Only valid after the operator has been called at least once.
+        """
+        return self.moment.numpy()[0]
 
     @Operator.register_backend(ComputeBackend.JAX)
     @partial(jit, static_argnums=(0))
@@ -221,6 +235,11 @@ class MomentumTransfer(Operator):
         return force_net
 
     def _construct_warp(self):
+        # Moment (torque) accumulation relies on wp.cross, which is only defined for
+        # 3-vectors; this is a hard requirement rather than a runtime branch since the
+        # kernel is compiled once for a fixed velocity_set.d.
+        assert self.velocity_set.d == 3, "Moment (torque) accumulation in MomentumTransfer requires a 3D velocity set."
+
         # Set local constants
         _c = self.velocity_set.c
         _opp_indices = self.velocity_set.opp_indices
@@ -231,6 +250,28 @@ class MomentumTransfer(Operator):
         # Find velocity index for (0, 0, 0)
         lattice_central_index = self.velocity_set.center_index
 
+        # Reference point (in the same index units as `index`) about which the
+        # moment (torque) accumulator is computed.
+        _moment_ref = _u_vec(
+            self.compute_dtype(self.moment_reference_point[0]),
+            self.compute_dtype(self.moment_reference_point[1]),
+            self.compute_dtype(self.moment_reference_point[2]),
+        )
+        _is_neon_backend = self.compute_backend == ComputeBackend.NEON
+
+        @wp.func
+        def _boundary_position(bc_mask: Any, index: Any):
+            # On the Neon backend `index` is an opaque bIndex (not a vec3i) and must
+            # be resolved to a global lattice coordinate first, mirroring the
+            # neon_index_to_warp helper used elsewhere for the same purpose
+            # (e.g. xlb/operator/boundary_condition/helper_functions_bc.py). On the
+            # plain Warp backend `index` is already a real vec3i.
+            if _is_neon_backend:
+                c_idx = wp.neon_global_idx(bc_mask, index)
+                return wp.vec3i(wp.neon_get_x(c_idx), wp.neon_get_y(c_idx), wp.neon_get_z(c_idx))
+            else:
+                return index
+
         @wp.func
         def functional(
             index: Any,
@@ -238,7 +279,8 @@ class MomentumTransfer(Operator):
             f_1: Any,
             bc_mask: Any,
             missing_mask: Any,
-            force: Any, 
+            force: Any,
+            moment: Any,
             _rho: Any,
             _u: Any,
             _relax: Any,
@@ -277,6 +319,17 @@ class MomentumTransfer(Operator):
                 # Atomic sum to get the total force vector
                 wp.atomic_add(force, 0, m)
 
+                # The momentum-exchange force is treated as concentrated at this
+                # boundary voxel's own position, so its contribution to the moment
+                # about _moment_ref is simply cross(position - reference, force).
+                pos = _boundary_position(bc_mask, index)
+                r = _u_vec()
+                r[0] = self.compute_dtype(pos[0]) - _moment_ref[0]
+                r[1] = self.compute_dtype(pos[1]) - _moment_ref[1]
+                r[2] = self.compute_dtype(pos[2]) - _moment_ref[2]
+                mom = wp.cross(r, m)
+                wp.atomic_add(moment, 0, mom)
+
         # Construct the warp kernel
         @wp.kernel
         def kernel(
@@ -285,6 +338,7 @@ class MomentumTransfer(Operator):
             bc_mask: wp.array4d(dtype=wp.uint8),
             missing_mask: wp.array4d(dtype=wp.uint8),
             force: wp.array(dtype=Any),
+            moment: wp.array(dtype=Any),
         ):
             # Get the global index
             i, j, k = wp.tid()
@@ -298,14 +352,16 @@ class MomentumTransfer(Operator):
                 bc_mask,
                 missing_mask,
                 force,
+                moment,
             )
 
         return functional, kernel
 
     @Operator.register_backend(ComputeBackend.WARP)
     def warp_implementation(self, f_0, f_1, bc_mask, missing_mask):
-        # Ensure the force is initialized to zero
+        # Ensure the force and moment are initialized to zero
         self.force *= self.compute_dtype(0.0)
+        self.moment *= self.compute_dtype(0.0)
 
         # Define the warp functionals needed for this operation
         self.fetcher_functional = self.fetcher.warp_functional
@@ -313,7 +369,7 @@ class MomentumTransfer(Operator):
         # Launch the warp kernel
         wp.launch(
             self.warp_kernel,
-            inputs=[f_0, f_1, bc_mask, missing_mask, self.force],
+            inputs=[f_0, f_1, bc_mask, missing_mask, self.force, self.moment],
             dim=f_0.shape[1:],
         )
         return self.force.numpy()[0]
@@ -331,6 +387,7 @@ class MomentumTransfer(Operator):
             bc_mask: Any,
             missing_mask: Any,
             force: Any,
+            moment: Any,
         ):
             def container_launcher(loader: neon.Loader):
                 loader.set_grid(bc_mask.get_grid())
@@ -349,6 +406,7 @@ class MomentumTransfer(Operator):
                         bc_mask_pn,
                         missing_mask_pn,
                         force,
+                        moment,
                     )
 
                 loader.declare_kernel(container_kernel)
@@ -368,13 +426,14 @@ class MomentumTransfer(Operator):
     ):
         import neon
 
-        # Ensure the force is initialized to zero
+        # Ensure the force and moment are initialized to zero
         self.force *= self.compute_dtype(0.0)
+        self.moment *= self.compute_dtype(0.0)
 
         # Define the neon functionals needed for this operation
         self.fetcher_functional = self.fetcher.neon_functional
 
         # Launch the neon container
-        c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force)
+        c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, self.moment)
         c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
         return self.force.numpy()[0]

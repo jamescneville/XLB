@@ -41,6 +41,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         velocity_set: VelocitySet = None,
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
+        moment_reference_point=(0.0, 0.0, 0.0),
     ):
         from xlb.operator.force.momentum_transfer import LBMOperationSequence
 
@@ -72,7 +73,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         )
 
         # Call super
-        super().__init__(no_slip_bc_instance, operation_sequence, velocity_set, precision_policy, compute_backend)
+        super().__init__(no_slip_bc_instance, operation_sequence, velocity_set, precision_policy, compute_backend, moment_reference_point)
 
     def _construct_neon(self):
         import neon
@@ -87,9 +88,10 @@ class MultiresMomentumTransfer(MomentumTransfer):
             bc_mask: Any,
             missing_mask: Any,
             force: Any,
+            moment: Any,
             _rho: Any,
             _u: Any,
-            _relax: Any,           
+            _relax: Any,
             _norm_vec: Any,
             _norm_dist: Any,
             level: Any,
@@ -117,9 +119,10 @@ class MultiresMomentumTransfer(MomentumTransfer):
                         bc_mask_pn,
                         missing_mask_pn,
                         force,
+                        moment,
                         _rho0_pn,
                         _u0_pn,
-                        _relax_pn,                        
+                        _relax_pn,
                         _norm_vec_pn,
                         _norm_dist_pn
                     )
@@ -148,8 +151,9 @@ class MultiresMomentumTransfer(MomentumTransfer):
         if _rho is None or _u is None:
             raise TypeError("rho and u must be provided: momentum_transfer(f_0, f_1, bc_mask, missing_mask, rho, u)")
 
-        # Ensure the force is initialized to zero
+        # Ensure the force and moment are initialized to zero
         self.force *= self.compute_dtype(0.0)
+        self.moment *= self.compute_dtype(0.0)
 
         # Define the neon functionals needed for this operation
         self.fetcher_functional = self.fetcher.neon_functional
@@ -157,6 +161,6 @@ class MultiresMomentumTransfer(MomentumTransfer):
         grid = bc_mask.get_grid()
         for level in range(grid.num_levels):
             # Launch the neon container
-            c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, _rho, _u,_relax, _norm_vec_pn, _norm_dist_pn, level)
+            c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, self.moment, _rho, _u,_relax, _norm_vec_pn, _norm_dist_pn, level)
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
         return self.force.numpy()[0]
