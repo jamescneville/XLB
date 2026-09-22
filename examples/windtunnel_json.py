@@ -37,6 +37,32 @@ import httpx, logging, getopt, json
 from json.decoder import JSONDecodeError
 from uuid import uuid4
 from threading import Thread
+import ctypes
+
+# NCU profiling window: set XLB_NCU_PROFILE_STEPS=start,end (e.g. "10,20") to
+# bracket sim.step() calls in that range with cudaProfilerStart/Stop, so `ncu
+# --profile-from-start off` skips mesh/grid setup and only profiles those steps.
+_NCU_PROFILE_RANGE = None
+_ncu_range_env = os.environ.get("XLB_NCU_PROFILE_STEPS")
+if _ncu_range_env:
+    _start_str, _end_str = _ncu_range_env.split(",")
+    _NCU_PROFILE_RANGE = (int(_start_str), int(_end_str))
+    _cudart = ctypes.CDLL("libcudart.so")
+
+
+def _ncu_profiler_hook(step):
+    if _NCU_PROFILE_RANGE is None:
+        return
+    start, end = _NCU_PROFILE_RANGE
+    if step == start:
+        print(f"[ncu] cudaProfilerStart at step {step}")
+        _cudart.cudaProfilerStart()
+    elif step == end:
+        # Async dispatch means step `start`'s kernels may still be in flight;
+        # sync before stopping so none of step `end`'s kernels bleed in.
+        wp.synchronize()
+        print(f"[ncu] cudaProfilerStop at step {step}")
+        _cudart.cudaProfilerStop()
 
 # Use 8 CPU devices if running on ACP
 acp_env = os.environ.get('ACP_ENVIRONMENT', '')
@@ -2476,6 +2502,7 @@ def solve(
             # Async dispatch: no per-step sync (that would serialize CPU/GPU every
             # step and prevent Neon from pipelining). Throughput is measured over the
             # whole interval at each MLUPS print instead.
+            _ncu_profiler_hook(step)
             sim.step()
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
@@ -2682,6 +2709,7 @@ def solve(
             # Async dispatch: no per-step sync (that would serialize CPU/GPU every
             # step and prevent Neon from pipelining). Throughput is measured over the
             # whole interval at each MLUPS print instead.
+            _ncu_profiler_hook(step)
             sim.step()
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
