@@ -88,7 +88,7 @@ def _maybe_enable_fast_math():
     if os.environ.get("XLB_FAST_MATH", "0").strip().lower() not in ("1", "true", "yes", "on"):
         return False
 
-    from warp.context import Module
+    from warp import Module
 
     if not getattr(Module, "_xlb_fast_math_patched", False):
         _original_init = Module.__init__
