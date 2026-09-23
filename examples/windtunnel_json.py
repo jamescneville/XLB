@@ -569,7 +569,7 @@ def obj_to_binary_stl_stream(
 
 wp.clear_kernel_cache()
 wp.config.quiet = True
-wp.enable_backward = False
+# wp.enable_backward = False
 
 def prep_inputs(input_file):
     version = '2027.0'
@@ -2507,7 +2507,7 @@ def solve(
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
             #scm_progress(np.floor(percent_complete))
-            if step % int(num_steps / 100) == 0:
+            if step % max(1, int(num_steps / 100)) == 0:
                 scm_progress(np.floor(percent_complete))
                 print(f"Percent Complete {percent_complete}")
                 print(f"Step {step} completed out of {num_steps}")
@@ -2719,7 +2719,7 @@ def solve(
             if elapsed/60 >= jsonfile['settings']['limit']:
                 time_out = True
 
-            if step % int(num_steps / 100) == 0:
+            if step % max(1, int(num_steps / 100)) == 0:
                 scm_progress(np.floor(percent_complete))
                 print(f"Percent Complete {percent_complete}")
                 print(f"Step {step} completed out of {num_steps}")
