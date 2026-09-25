@@ -793,22 +793,32 @@ def prep_inputs(input_file):
     scm_progress(15)
     print(f"Progress 15%")
 
-    # Front/rear wheel-center reference points (used below to compute the
-    # front/rear lift split), derived from the wheel filenames.
-    front_center = rear_center = None
-    if wheel_vertices is not None:
-        front_center, rear_center, _, _ = classify_wheel_axles(wheel_centers, jsonfile['vehicle']['wheels'])
+    # Front/rear aerodynamic balance always uses the axle stations inferred
+    # from the final voxelized geometry (compute_voxel_statistics_and_reference_area
+    # / infer_axle_reference_points_from_voxels). This works whether the vehicle
+    # used separate wheel meshes or one combined body+wheel mesh, and removes any
+    # reliance on wheel filename conventions.
+    front_center = stats["front_axle_point"]
+    rear_center = stats["rear_axle_point"]
+
+    if front_center is not None and rear_center is not None:
+        moment_reference_point = tuple(float(v) for v in front_center)
+        print(f"Front axle reference (lattice): {front_center} (model units): {front_center*voxel_size - shift}")
+        print(f"Equivalent rear axle reference (lattice): {rear_center} (model units): {rear_center*voxel_size - shift}")
+    else:
+        moment_reference_point = None
+        print("Front/rear axle reference not available; Cl_f / Cl_r will be disabled.")
 
     # Setup momentum transfer.
-    # When wheels are present, body and wheel forces/moments are all taken about
-    # front_center so they can be combined into a single moment for the front/rear
-    # lift decomposition in print_lift_drag; otherwise the reference point is
-    # irrelevant since only the net force is used.
+    # When an axle reference is available, body and wheel forces/moments are all
+    # taken about front_center so they can be combined into a single moment for
+    # the front/rear lift decomposition in print_lift_drag; otherwise the
+    # operators stay force-only (moment_reference_point=None).
     momentum_transfer = MultiresMomentumTransfer(
         boundary_conditions[0],
         mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
         compute_backend=compute_backend,
-        moment_reference_point=tuple(front_center) if front_center is not None else (0.0, 0.0, 0.0),
+        moment_reference_point=moment_reference_point,
     )
     wheel_momentum = None
     if wheel_vertices is not None:
@@ -818,7 +828,7 @@ def prep_inputs(input_file):
                 boundary_conditions[-1-i],
                 mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
                 compute_backend=compute_backend,
-                moment_reference_point=tuple(front_center),
+                moment_reference_point=moment_reference_point,
             )
             wheel_momentum.append(mt)
 
@@ -1241,72 +1251,22 @@ def setup_boundary_conditions(grid, level_data, body_vertices, wheel_vertices, w
 
 # Utility Functions
 # =================
-def classify_wheel_axles(wheel_centers, wheel_filenames):
-    """
-    Determine front/rear wheel-center reference points and axle membership from
-    the wheel filenames (production naming convention), not from voxel-index
-    geometry — wheel_centers are in voxel-index units (always >= 0), so a
-    coordinate-sign heuristic (e.g. "left is negative y") cannot work there.
-
-    Keys on the substrings "front_left", "front_right", "rear_left", "rear_right"
-    (case-insensitive) in each filename. wheel_filenames must be in the same
-    order as wheel_centers (both ultimately come from jsonfile['vehicle']['wheels'],
-    preserved in order through mesh_prep).
-
-    Parameters
-    ----------
-    wheel_centers : list of (center_xyz, diameter)
-        As produced by mesh_prep, in lattice-voxel units.
-    wheel_filenames : list of str
-        jsonfile['vehicle']['wheels'], same order as wheel_centers.
-
-    Returns
-    -------
-    front_center, rear_center : np.ndarray of shape (3,)
-        Front/rear axle reference points, on the vehicle centerline (y=0), using
-        the *_left wheel's x and z (per-side simplification).
-    front_indices, rear_indices : list of int
-        Indices into wheel_centers belonging to the front/rear axle.
-    """
-    names = [os.path.basename(str(f)).lower() for f in wheel_filenames]
-
-    def find_unique(tag):
-        matches = [i for i, name in enumerate(names) if tag in name]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Expected exactly one wheel filename containing '{tag}', found {len(matches)} "
-                f"among {wheel_filenames}. Check jsonfile['vehicle']['wheels'] naming."
-            )
-        return matches[0]
-
-    i_front_left = find_unique("front_left")
-    i_rear_left = find_unique("rear_left")
-    front_indices = [i for i, name in enumerate(names) if "front_left" in name or "front_right" in name]
-    rear_indices = [i for i, name in enumerate(names) if "rear_left" in name or "rear_right" in name]
-    if sorted(front_indices + rear_indices) != list(range(len(names))):
-        raise ValueError(
-            f"Every wheel filename must contain one of front_left/front_right/rear_left/rear_right: {wheel_filenames}"
-        )
-
-    front_x = wheel_centers[i_front_left][0][0]
-    rear_x = wheel_centers[i_rear_left][0][0]
-    front_center = np.array([front_x, 0.0, wheel_centers[i_front_left][0][2]])
-    rear_center = np.array([rear_x, 0.0, wheel_centers[i_rear_left][0][2]])
-    return front_center, rear_center, front_indices, rear_indices
-
-
 def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values,
                      front_center=None, rear_center=None):
     """
-    Calculate and print lift and drag coefficients, plus (when wheels are present
-    and front_center/rear_center are provided) the front/rear lift split.
+    Calculate and print lift and drag coefficients, plus (when front_center/
+    rear_center are available) the front/rear lift split. Works whether the
+    vehicle used separate wheel BCs (wheel_momentum not None) or one combined
+    body+wheel mesh (wheel_momentum is None and momentum_transfer alone covers
+    the whole car) — front_center/rear_center are inferred from the voxelized
+    geometry either way.
 
     The front/rear split is a static two-point equivalent-load decomposition: it
     uses the total force and the total moment about front_center (accumulated by
     momentum_transfer and every wheel_momentum instance, all constructed with
     moment_reference_point=front_center) to find the vertical loads L_f, L_r at
-    the front/rear wheel-center stations that reproduce both the true net lift
-    and the true pitching moment about the front axle.
+    the front/rear axle stations that reproduce both the true net lift and the
+    true pitching moment about the front axle.
     """
     boundary_force = momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
     wheel_force = np.array([0.0, 0.0, 0.0])
@@ -1322,12 +1282,20 @@ def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference
     drag_values.append([step, cd, cl])
 
     cl_f = cl_r = pct_rear = None
-    if wheel_momentum is not None and front_center is not None and rear_center is not None:
-        # Combined moment about front_center: body + all wheels (linear, so the
-        # per-instance moments accumulated with the same reference point just add).
+    if front_center is not None and rear_center is not None:
+        # Combined moment about front_center: body (whether it covers the whole
+        # car or just the body-only mesh) + any separate wheel BCs, all
+        # constructed with moment_reference_point=front_center. Linear, so the
+        # per-instance moments accumulated with the same reference point just add.
+        # get_moment() returns None if momentum_transfer was built without a
+        # moment reference; that shouldn't happen when front_center is set, but
+        # guard anyway rather than silently producing a wrong split.
         moment_front = momentum_transfer.get_moment()
-        for i in range(len(wheel_momentum)):
-            moment_front = moment_front + wheel_momentum[i].get_moment()
+        if moment_front is None:
+            raise ValueError("front_center/rear_center are set but momentum_transfer has no moment reference.")
+        if wheel_momentum is not None:
+            for i in range(len(wheel_momentum)):
+                moment_front = moment_front + wheel_momentum[i].get_moment()
 
         b = float(rear_center[0] - front_center[0])  # wheelbase (x_rear - x_front), > 0
         my_front = moment_front[1]
@@ -1400,48 +1368,277 @@ def plot_drag_lift(drag_values, output_dir, script_name, percentile_range=(15, 8
     plt.savefig(os.path.join(output_dir, 'drag_lift_plot.png'))
     plt.close()
 
-def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, level_data, actual_num_levels, sparsity_pattern, boundary_conditions, voxel_size, wheel_ids=[]):
+def infer_axle_reference_points_from_voxels(
+    solid_voxel_indices,
+    flow_direction=1.0,
+    ground_z=0.0,
+    min_contact_layers=2,
+    max_contact_layers=4,
+    max_internal_x_gap=2,
+):
     """
-    Compute active/solid voxels, totals, lattice updates, and reference area based on simulation data.
+    Infer equivalent front/rear axle reference points from a full-vehicle
+    voxel scan.
+
+    The vehicle voxels are projected onto the XZ plane. The lowest surviving
+    vehicle voxel layers are inspected to identify distinct tire/contact-patch
+    regions along X. This same voxel-based path is used whether the source
+    geometry contained separate wheel meshes or one combined vehicle mesh.
+
+    Any number of detected axle stations is supported. Axle stations are
+    ordered front-to-rear according to ``flow_direction`` and reduced to two
+    equivalent support locations:
+
+        front_x = front-most detected axle
+        rear_x  = arithmetic mean of every remaining detected axle
+
+    Examples:
+
+        2-axle passenger vehicle:
+            [F, R] -> front=F, rear=R
+
+        3-axle rigid truck:
+            [F, R1, R2] -> front=F, rear=mean(R1, R2)
+
+        5-axle tractor/trailer:
+            [F, D1, D2, T1, T2]
+            -> front=F, rear=mean(D1, D2, T1, T2)
+
+    The returned Z coordinate is the known physical ground plane ``ground_z``
+    rather than the Z coordinate of the lowest surviving vehicle voxels. This
+    is important when wheel geometry has been trimmed upward to avoid overlap
+    between wheel and ground boundary conditions.
+
+    Parameters
+    ----------
+    solid_voxel_indices : array-like, shape (N, 3)
+        Global finest-lattice coordinates of vehicle solid voxels.
+
+    flow_direction : float, optional
+        For the current SWT convention, non-negative means smaller X is the
+        front of the vehicle. Negative reverses that ordering.
+
+    ground_z : float, optional
+        Ground-plane Z coordinate in the same global finest-lattice frame.
+        Default is 0.0.
+
+    min_contact_layers, max_contact_layers : int
+        Number of lowest surviving vehicle layers inspected for contact
+        regions. The search expands from min to max only if necessary.
+
+    max_internal_x_gap : int
+        Largest unoccupied X gap still permitted inside one contact region.
+
+    Returns
+    -------
+    (front_point, rear_point) : tuple[np.ndarray | None, np.ndarray | None]
+        Equivalent axle reference points. Returns (None, None) if at least two
+        valid axle stations cannot be identified.
     """
-    # Compute macro fields
+
+    voxels = np.asarray(solid_voxel_indices)
+
+    if (
+        voxels.ndim != 2
+        or voxels.shape[1] != 3
+        or voxels.shape[0] == 0
+    ):
+        return None, None
+
+    # Project onto XZ. Removing Y collapses left/right tires and dual tires on
+    # a common axle onto the same longitudinal contact region.
+    xz = np.unique(voxels[:, [0, 2]], axis=0)
+
+    if xz.shape[0] < 2:
+        return None, None
+
+    x_min_vehicle = float(np.min(xz[:, 0]))
+    x_max_vehicle = float(np.max(xz[:, 0]))
+    vehicle_x_span = x_max_vehicle - x_min_vehicle
+
+    if vehicle_x_span <= 0.0:
+        return None, None
+
+    # Pitch moment itself is independent of Y for the Fx/Fz decomposition, but
+    # the vehicle centerline gives a sensible complete 3-D reference point.
+    center_y = 0.5 * (
+        float(np.min(voxels[:, 1]))
+        + float(np.max(voxels[:, 1]))
+    )
+
+    # Lowest SURVIVING vehicle voxel layer. This may sit above the actual
+    # ground because wheel geometry is intentionally trimmed away from the
+    # ground BC. It is used only to locate contact patches.
+    z_min_vehicle = float(np.min(xz[:, 1]))
+
+    min_layers = max(1, int(min_contact_layers))
+    max_layers = max(min_layers, int(max_contact_layers))
+    max_internal_x_gap = max(0, int(max_internal_x_gap))
+
+    for num_layers in range(min_layers, max_layers + 1):
+        z_max = z_min_vehicle + float(num_layers - 1)
+        bottom_xz = xz[xz[:, 1] <= z_max]
+
+        if bottom_xz.shape[0] < 2:
+            continue
+
+        unique_x = np.sort(np.unique(bottom_xz[:, 0]))
+        if unique_x.size < 2:
+            continue
+
+        # Split the lowest-layer occupancy into longitudinal contact regions.
+        split_locations = (
+            np.where(np.diff(unique_x) > max_internal_x_gap)[0] + 1
+        )
+        x_groups = [
+            group
+            for group in np.split(unique_x, split_locations)
+            if group.size > 0
+        ]
+
+        if len(x_groups) < 2:
+            continue
+
+        # Reduce each physical contact region to ONE axle station so wide tires,
+        # larger patches, and different voxel counts do not change its weight.
+        axle_stations = []
+        for x_group in x_groups:
+            group_points = bottom_xz[np.isin(bottom_xz[:, 0], x_group)]
+            if group_points.shape[0] == 0:
+                continue
+
+            axle_stations.append(float(np.mean(group_points[:, 0])))
+
+        if len(axle_stations) < 2:
+            continue
+
+        axle_stations = np.asarray(axle_stations, dtype=float)
+
+        # Sort FRONT -> REAR. Current SWT +X flow convention means lower X is
+        # the vehicle front; reverse ordering is retained for negative-X flow.
+        axle_stations = np.sort(axle_stations)
+        if float(flow_direction) < 0.0:
+            axle_stations = axle_stations[::-1]
+
+        # Reject small neighboring fragments that do not span a meaningful
+        # fraction of overall vehicle length.
+        detected_axle_span = abs(
+            float(axle_stations[-1] - axle_stations[0])
+        )
+        if detected_axle_span < 0.20 * vehicle_x_span:
+            continue
+
+        # General N-axle convention:
+        #   front = front-most axle
+        #   rear  = equal-weight geometric mean of every remaining axle
+        front_x = float(axle_stations[0])
+        rear_axles = axle_stations[1:]
+
+        if rear_axles.size == 0:
+            continue
+
+        rear_x = float(np.mean(rear_axles))
+        if abs(rear_x - front_x) <= 1.0e-8:
+            continue
+
+        # Reference points lie on the known physical ground plane, not at the
+        # height of the surviving trimmed tire voxels.
+        front_point = np.array(
+            [front_x, center_y, float(ground_z)],
+            dtype=float,
+        )
+        rear_point = np.array(
+            [rear_x, center_y, float(ground_z)],
+            dtype=float,
+        )
+
+        return front_point, rear_point
+
+    return None, None
+
+
+def compute_voxel_statistics_and_reference_area(
+    jsonfile, sim, h5exporter, level_data, actual_num_levels, sparsity_pattern, boundary_conditions, voxel_size, wheel_ids=None,
+):
+    """
+    Compute voxel statistics, frontal reference area, and equivalent axle points.
+
+    Axle inference always uses the final voxelized vehicle geometry. For RAY
+    voxelization, the body BC and any separate wheel BC IDs are combined before
+    extracting vehicle voxels. This keeps Cl_f / Cl_r independent of whether
+    the input vehicle used separate wheel files or one combined mesh.
+    """
+    if wheel_ids is None:
+        wheel_ids = []
+
     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
     fields_data = h5exporter.get_fields_data({"bc_mask": sim.bc_mask})
     bc_mask_data = fields_data["bc_mask_0"]
     level_id_field = h5exporter.level_id_field
 
-    # Compute solid voxels per level (assuming 255 is the solid marker)
     solid_voxels = []
     for lvl in range(actual_num_levels):
         level_mask = level_id_field == lvl
         solid_voxels.append(np.sum(bc_mask_data[level_mask] == 255))
 
-    # Compute active voxels (total non-zero in sparsity minus solids)
     active_voxels = [np.count_nonzero(mask) for mask in sparsity_pattern]
-    active_voxels = [max(0, active_voxels[lvl] - solid_voxels[lvl]) for lvl in range(actual_num_levels)]
+    active_voxels = [
+        max(0, active_voxels[lvl] - solid_voxels[lvl])
+        for lvl in range(actual_num_levels)
+    ]
 
-    # Totals
     total_voxels = sum(active_voxels)
-    total_lattice_updates_per_step = sum(active_voxels[lvl] * (2 ** (actual_num_levels - 1 - lvl)) for lvl in range(actual_num_levels))
+    total_lattice_updates_per_step = sum(
+        active_voxels[lvl] * (2 ** (actual_num_levels - 1 - lvl))
+        for lvl in range(actual_num_levels)
+    )
 
-    # Compute reference area (projected on YZ plane at finest level)
+    # Reuse one finest-level vehicle extraction for both:
+    #   1) existing frontal-area YZ projection
+    #   2) axle/contact-patch XZ inference
+    # so there is no second field export/readback.
     finest_level = 0
     mask_finest = level_id_field == finest_level
     bc_mask_finest = bc_mask_data[mask_finest]
-    active_indices_finest = np.argwhere(level_data[0][0])
-    
+    active_indices_finest = np.argwhere(level_data[finest_level][0])
+
     if jsonfile["BCtypes"]["car_voxelization"] == "RAY":
-        target_ids = [bc.id for bc in wheel_ids]
-        target_ids.append(boundary_conditions[0].id)
+        target_ids = [boundary_conditions[0].id]
+        target_ids.extend(bc.id for bc in wheel_ids)
         is_target_voxel = np.isin(bc_mask_finest, target_ids)
     else:
         is_target_voxel = bc_mask_finest == 255
-    
-    solid_voxels_indices = active_indices_finest[is_target_voxel]    
-    unique_jk = np.unique(solid_voxels_indices[:, 1:3], axis=0)
+
+    solid_voxel_indices_local = active_indices_finest[is_target_voxel]
+
+    # Existing frontal reference area: number of unique occupied YZ columns.
+    unique_jk = np.unique(solid_voxel_indices_local[:, 1:3], axis=0)
     reference_area = unique_jk.shape[0]
-    
-    reference_area_physical = reference_area * (voxel_size ** 2)
+    reference_area_physical = reference_area * (voxel_size**2)
+
+    # wp.neon_global_idx() used by the force/moment operator is expressed in
+    # finest-level GLOBAL lattice coordinates. np.argwhere() above is local to
+    # the finest refinement box, so add its origin before using these points as
+    # moment references. At level 0 the refinement factor is 1.
+    finest_origin = np.asarray(level_data[finest_level][2], dtype=float)
+    solid_voxel_indices_global = (
+        solid_voxel_indices_local.astype(float, copy=False) + finest_origin
+    )
+
+    front_axle_point, rear_axle_point = infer_axle_reference_points_from_voxels(
+        solid_voxel_indices_global,
+        flow_direction=jsonfile["InletBC"]["x"],
+        ground_z=0.0,
+        min_contact_layers=2,
+        max_contact_layers=4,
+        max_internal_x_gap=2,
+    )
+
+    if front_axle_point is None or rear_axle_point is None:
+        print(
+            "Warning: unable to identify at least two axle/contact-patch stations "
+            "from the voxelized vehicle; Cl_f / Cl_r will be disabled."
+        )
 
     return {
         "active_voxels": active_voxels,
@@ -1449,7 +1646,9 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
         "total_voxels": total_voxels,
         "total_lattice_updates_per_step": total_lattice_updates_per_step,
         "reference_area": reference_area,
-        "reference_area_physical": reference_area_physical
+        "reference_area_physical": reference_area_physical,
+        "front_axle_point": front_axle_point,
+        "rear_axle_point": rear_axle_point,
     }
 
 def save_slices1(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize):

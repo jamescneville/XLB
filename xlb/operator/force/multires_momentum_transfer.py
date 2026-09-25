@@ -32,6 +32,9 @@ class MultiresMomentumTransfer(MomentumTransfer):
     velocity_set : VelocitySet, optional
     precision_policy : PrecisionPolicy, optional
     compute_backend : ComputeBackend, optional
+    moment_reference_point=None keeps the operator force-only.
+    Supplying a 3-component lattice-coordinate reference point enables pitch/roll/yaw moment
+    accumulation using the same momentum-exchange forces.
     """
 
     def __init__(
@@ -41,7 +44,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         velocity_set: VelocitySet = None,
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
-        moment_reference_point=(0.0, 0.0, 0.0),
+        moment_reference_point=None,
     ):
         from xlb.operator.force.momentum_transfer import LBMOperationSequence
 
@@ -153,7 +156,8 @@ class MultiresMomentumTransfer(MomentumTransfer):
 
         # Ensure the force and moment are initialized to zero
         self.force *= self.compute_dtype(0.0)
-        self.moment *= self.compute_dtype(0.0)
+        if self.moment_reference_point is not None:
+            self.moment *= self.compute_dtype(0.0)
 
         # Define the neon functionals needed for this operation
         self.fetcher_functional = self.fetcher.neon_functional
