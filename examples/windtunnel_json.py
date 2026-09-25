@@ -2686,9 +2686,10 @@ def solve(
                     keep_state=True,
                     bounds=iso_region,
                     grid_resolution=jsonfile['settings']['isoGrid'],
-                    lengthScale=jsonfile['settings']['isoScale']
+                    lengthScale=jsonfile['settings']['isoScale'],
+                    solid_buffer_radius=voxel_size,
                 )
-            scm_results_available() 
+            scm_results_available()
         scm_progress(95)
         print(f"Progress 95%")
         jsonfile['results'] ={}
@@ -2812,9 +2813,10 @@ def solve(
                     keep_state=True,
                     bounds=iso_region,
                     grid_resolution=jsonfile['settings']['isoGrid'],
-                    lengthScale=jsonfile['settings']['isoScale']
+                    lengthScale=jsonfile['settings']['isoScale'],
+                    solid_buffer_radius=voxel_size,
                 )
-            scm_results_available() 
+            scm_results_available()
         scm_progress(95)
         print(f"Progress 95%")
         # Save drag and lift data to CSV
