@@ -1103,7 +1103,7 @@ def setup_boundary_conditions(grid, level_data, body_vertices, wheel_vertices, w
         
         
 
-    bc_outlet = DoNothingBC(indices=right_indices)
+    bc_outlet = ExtrapolationOutflowBC(indices=right_indices)
 
     # Setup walls moving, static of fall back to FullBounce
     if jsonfile['BCtypes']['walls'] == "moving":

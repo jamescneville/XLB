@@ -439,7 +439,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         
         # Factory for apply_bc: generates compile-time specialized variants
-        def make_apply_bc(is_post_streaming: bool):
+        # f0_is_post_stream: True for split collide kernels (coarse levels), where f_0 already holds
+        # post-stream populations. Only ExtrapolationOutflowBC reads neighbour data from f_0 and needs this.
+        def make_apply_bc(is_post_streaming: bool, f0_is_post_stream: bool = False):
             @wp.func
             def apply_bc_impl(
                 index: Any,
@@ -478,9 +480,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 )
                         if wp.static(self.boundary_conditions[i].id in extrapolation_outflow_bc_ids):
                             if _boundary_id == wp.static(self.boundary_conditions[i].id):
-                                f_result = wp.static(self.boundary_conditions[i].assemble_auxiliary_data)(
-                                    index, timestep, _missing_mask, f_0, f_1, f_pre, f_post
-                                )
+                                if wp.static(f0_is_post_stream):
+                                    f_result = wp.static(self.boundary_conditions[i].assemble_auxiliary_data_post_stream)(
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post
+                                    )
+                                else:
+                                    f_result = wp.static(self.boundary_conditions[i].assemble_auxiliary_data)(
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post
+                                    )
                 return f_result
 
             return apply_bc_impl
@@ -488,6 +495,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         # Compile-time specialized BC application variants
         apply_bc_post_streaming = make_apply_bc(is_post_streaming=True)
         apply_bc_post_collision = make_apply_bc(is_post_streaming=False)
+        apply_bc_post_collision_split = make_apply_bc(is_post_streaming=False, f0_is_post_stream=True)
 
         @wp.func
         def neon_get_thread_data(
@@ -546,7 +554,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 wp.neon_write(f_0_pn, index, _opp_indices[l], self.store_dtype(_f1_thread))
 
         # Factory for neon_collide_pipeline: generates compile-time specialized variants
-        def make_collide_pipeline(do_bc: bool, do_accumulation: bool):
+        def make_collide_pipeline(do_bc: bool, do_accumulation: bool, f0_is_post_stream: bool = False):
+            apply_bc_collision = apply_bc_post_collision_split if f0_is_post_stream else apply_bc_post_collision
+
             @wp.func
             def collide_pipeline_impl(
                 index: Any,
@@ -580,7 +590,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     )
 
                 if wp.static(do_bc):
-                    _f_post_collision = apply_bc_post_collision(
+                    _f_post_collision = apply_bc_collision(
                         index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, _f_post_stream, _f_post_collision,
                         _rho0_pn, _u0_pn, _relax_pn, _norm_vec_pn, _norm_dist_pn
                     )
@@ -608,6 +618,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         # Compile-time specialized collision pipeline variants
         collide_bc_accum = make_collide_pipeline(do_bc=True, do_accumulation=True)
+        # Split collide kernels (coarse levels) run after a separate stream, so f_0 is post-stream there
+        collide_bc_accum_split = make_collide_pipeline(do_bc=True, do_accumulation=True, f0_is_post_stream=True)
         collide_bc_only = make_collide_pipeline(do_bc=True, do_accumulation=False)
         collide_simple = make_collide_pipeline(do_bc=False, do_accumulation=False)
         collide_accum_only = make_collide_pipeline(do_bc=False, do_accumulation=True)
@@ -689,7 +701,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         return
                     if not wp.neon_has_child(f_0_pn, index):
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
-                        collide_bc_accum(
+                        collide_bc_accum_split(
                             index,
                             timestep,
                             _boundary_id,
@@ -800,7 +812,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         return
                     if not wp.neon_has_child(f_0_pn, index):
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
-                        collide_bc_accum(
+                        collide_bc_accum_split(
                             index,
                             timestep,
                             _boundary_id,

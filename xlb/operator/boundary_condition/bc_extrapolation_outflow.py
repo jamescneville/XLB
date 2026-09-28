@@ -210,40 +210,58 @@ class ExtrapolationOutflowBC(BoundaryCondition):
                     _f[_opp_indices[l]] = (self.compute_dtype(1.0) - sound_speed) * _f_pre[l] + sound_speed * f_aux
             return _f
 
-        @wp.func
-        def assemble_auxiliary_data_neon(
-            index: Any,
-            timestep: Any,
-            missing_mask: Any,
-            f_0: Any,
-            f_1: Any,
-            _f_pre: Any,
-            _f_post: Any,
-            level: Any = 0,
-        ):
-            # Prepare time-dependent dynamic data for imposing the boundary condition in the next iteration after streaming.
-            # We use directions that leave the domain for storing this prepared data.
-            # Since this function is called post-collisiotn: f_pre = f_post_stream and f_post = f_post_collision
-            _f = _f_post
-            nv = get_normal_vectors(missing_mask)
-            for lattice_dir in range(self.velocity_set.q):
-                if missing_mask[lattice_dir] == wp.uint8(1):
-                    # f_0 is the post-collision values of the current time-step
-                    # Get pull index associated with the "neighbours" pull_index
-                    offset = wp.vec3i(-_c[0, lattice_dir], -_c[1, lattice_dir], -_c[2, lattice_dir])
-                    for d in range(self.velocity_set.d):
-                        offset[d] = offset[d] - nv[d]
-                    offset_pull_index = wp.neon_ngh_idx(wp.int8(offset[0]), wp.int8(offset[1]), wp.int8(offset[2]))
+        def make_assemble_auxiliary_data_neon(f0_is_post_stream: bool):
+            # The post-streaming value of the interior neighbour (x_b - n) in direction l is needed.
+            # - Fused stream+collide kernels (finest level): f_0 holds pre-stream populations, so the value
+            #   is pulled from (x_b - n) - c_l.
+            # - Split collide kernels (coarse levels): f_0 already holds post-stream populations, so the value
+            #   is read directly at (x_b - n). Pulling again would apply streaming twice.
+            @wp.func
+            def assemble_auxiliary_data_neon(
+                index: Any,
+                timestep: Any,
+                missing_mask: Any,
+                f_0: Any,
+                f_1: Any,
+                _f_pre: Any,
+                _f_post: Any,
+                level: Any = 0,
+            ):
+                # Prepare time-dependent dynamic data for imposing the boundary condition in the next iteration after streaming.
+                # We use directions that leave the domain for storing this prepared data.
+                # Since this function is called post-collision: f_pre = f_post_stream and f_post = f_post_collision
+                _f = _f_post
+                nv = get_normal_vectors(missing_mask)
+                for lattice_dir in range(self.velocity_set.q):
+                    if missing_mask[lattice_dir] == wp.uint8(1):
+                        offset = wp.vec3i(-nv[0], -nv[1], -nv[2])
+                        if wp.static(not f0_is_post_stream):
+                            for d in range(self.velocity_set.d):
+                                offset[d] = offset[d] - _c[d, lattice_dir]
 
-                    # The following is the post-streaming values of the neighbor cell
-                    # This function reads a field value at a given neighboring index and direction.
-                    unused_is_valid = wp.bool(False)
-                    f_aux = self.compute_dtype(wp.neon_read_ngh(f_0, index, offset_pull_index, lattice_dir, self.store_dtype(0.0), unused_is_valid))
-                    _f[_opp_indices[lattice_dir]] = (self.compute_dtype(1.0) - sound_speed) * _f_pre[lattice_dir] + sound_speed * f_aux
-            return _f
+                        # Zero-gradient fallback, used when the neighbour is missing at this level
+                        # (domain edge or resolution jump on the outlet plane).
+                        f_aux = _f_pre[lattice_dir]
+                        if offset[0] == 0 and offset[1] == 0 and offset[2] == 0:
+                            f_aux = self.compute_dtype(wp.neon_read(f_0, index, lattice_dir))
+                        else:
+                            offset_pull_index = wp.neon_ngh_idx(wp.int8(offset[0]), wp.int8(offset[1]), wp.int8(offset[2]))
+                            is_valid = wp.bool(False)
+                            f_ngh = self.compute_dtype(wp.neon_read_ngh(f_0, index, offset_pull_index, lattice_dir, self.store_dtype(0.0), is_valid))
+                            # A neighbour covered by a finer level holds multires accumulation data, not populations
+                            if is_valid and not wp.neon_has_finer_ngh(f_0, index, offset_pull_index):
+                                f_aux = f_ngh
+                        _f[_opp_indices[lattice_dir]] = (self.compute_dtype(1.0) - sound_speed) * _f_pre[lattice_dir] + sound_speed * f_aux
+                return _f
+
+            return assemble_auxiliary_data_neon
 
         kernel = self._construct_kernel(functional)
-        assemble_auxiliary_data = assemble_auxiliary_data_warp if self.compute_backend == ComputeBackend.WARP else assemble_auxiliary_data_neon
+        if self.compute_backend == ComputeBackend.WARP:
+            assemble_auxiliary_data = assemble_auxiliary_data_warp
+        else:
+            self.assemble_auxiliary_data_post_stream = make_assemble_auxiliary_data_neon(f0_is_post_stream=True)
+            assemble_auxiliary_data = make_assemble_auxiliary_data_neon(f0_is_post_stream=False)
 
         return (functional, assemble_auxiliary_data), kernel
 
