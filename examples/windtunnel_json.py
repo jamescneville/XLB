@@ -2704,7 +2704,14 @@ def solve(
             
         scm_results_available(True)
     else:
-        print_interval=max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))        
+        print_interval=max(1, int((num_steps-crossover_step) * (jsonfile['settings']['solutionPrintFreq'] / 100.0)))
+        # Field-average accumulation (accumulate_time_average) pulls the full 3D velocity/density
+        # field to host and synthesizes derived fields every time it's called - far more expensive
+        # than the boundary-only force integral. Sample it on its own cadence via a dedicated
+        # setting, independent of both the force-polling interval and postCrossover_frames (which
+        # governs periodic full HDF writes, a separate concern).
+        field_avg_frames = jsonfile['settings'].get('resultsAvgFrames', 100)
+        field_avg_interval = max(1, int((num_steps - crossover_step) / field_avg_frames)) if field_avg_frames > 0 else num_steps + 1
         for step in range(num_steps):
             # Async dispatch: no per-step sync (that would serialize CPU/GPU every
             # step and prevent Neon from pipelining). Throughput is measured over the
@@ -2733,7 +2740,10 @@ def solve(
                     steps_since_last_print = 0
                 print(f"  MLUPS: {MLUPS:.1f}")
 
-            if (step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)) or time_out:
+            do_force_poll = step >= crossover_step and (step % print_interval == 0 or step == num_steps - 1)
+            do_field_avg = step >= crossover_step and (step % field_avg_interval == 0 or step == num_steps - 1)
+
+            if do_force_poll or do_field_avg or time_out:
                     print(f"Step {step} completed out of {num_steps}")
                     # Measure compute throughput over the interval BEFORE any I/O below.
                     # If the progress block above already consumed this interval, keep its value.
@@ -2743,9 +2753,15 @@ def solve(
                         interval_time = measured
                         MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_time / 1e6
                         print(f"  MLUPS: {MLUPS:.1f}")
+                    # Both readouts need macroscopic fields, but only compute them once per step.
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)
-                    cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
-                    h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
+                    if do_force_poll or time_out:
+                        cd, cl, drag = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, drag_values)
+                    if do_field_avg or time_out:
+                        # Expensive: full-field extraction + derived-field synthesis + accumulation.
+                        # Deliberately sampled on its own coarser cadence (field_avg_interval), not
+                        # tied to how densely we poll the (cheap) force integral above.
+                        h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
                     wp.synchronize()
                     # Reset the interval AFTER I/O so output time is excluded from the next interval.
                     interval_start = time.time()
