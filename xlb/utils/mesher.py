@@ -2414,7 +2414,7 @@ class MultiresIO(object):
         normals_flat = np.repeat(surface_normals, n_shells, axis=0)
 
         kk = min(int(k), len(centroids))
-        distances, indices = tree.query(queries_flat, k=kk)
+        distances, indices = tree.query(queries_flat, k=kk, workers=-1)
 
         if kk == 1:
             distances = distances[:, None]
@@ -2846,15 +2846,25 @@ class MultiresIO(object):
 
     @staticmethod
     def _usd_vec_array(arr, ncomp):
-        """Format an (N, ncomp) float array as a USD tuple array body: '(a, b, c), ...'."""
+        """Format an (N, ncomp) float array as a USD tuple array body: '(a, b, c), ...'.
+
+        Formats via ``np.savetxt`` into an in-memory buffer rather than chained
+        ``np.char.add``/``np.char.mod`` calls: numpy's fixed-width unicode dtype
+        makes each ``np.char`` op reallocate and re-copy the *entire* string
+        array (padded to the longest element), so for a few `ncomp`-1 chained
+        concatenations that is several full-array copies at O(N) unicode-object
+        cost each - the dominant cost for meshes with millions of vertices.
+        ``savetxt`` streams row-by-row Python ``%``-formatting straight into the
+        buffer, which avoids that repeated-reallocation blowup.
+        """
+        import io
+
         arr = np.asarray(arr, dtype=np.float32).reshape(-1, ncomp)
-        cols = [np.char.mod("%.6g", arr[:, i]) for i in range(ncomp)]
-        joined = cols[0]
-        for c in cols[1:]:
-            joined = np.char.add(np.char.add(joined, ", "), c)
-        rows = np.char.add(np.char.add("(", joined), ")")
-        return ", ".join(rows.tolist())
-    
+        fmt = "(" + ", ".join(["%.6g"] * ncomp) + ")"
+        buf = io.StringIO()
+        np.savetxt(buf, arr, fmt=fmt)
+        return ", ".join(buf.getvalue().splitlines())
+
     def _infer_surface_field_clim(self, field_base_name, component=None):
             """Default colour range (vmin, vmax) for a surface field's USD export.
 
@@ -2893,10 +2903,18 @@ class MultiresIO(object):
 
     @staticmethod
     def _usd_scalar_array(arr, fmt="%.6g"):
-        """Format a 1-D array as a USD scalar array body: 'a, b, c'."""
+        """Format a 1-D array as a USD scalar array body: 'a, b, c'.
+
+        See :meth:`_usd_vec_array` for why this goes through ``savetxt``
+        instead of ``np.char.mod`` for large arrays.
+        """
+        import io
+
         arr = np.asarray(arr).ravel()
-        return ", ".join(np.char.mod(fmt, arr).tolist())
-    
+        buf = io.StringIO()
+        np.savetxt(buf, arr.reshape(-1, 1), fmt=fmt)
+        return ", ".join(buf.getvalue().splitlines())
+
     def _write_polydata_usd(
         self,
         usd_filename,
@@ -3090,7 +3108,7 @@ class MultiresIO(object):
         usd_cmap=None,
         solid_mask=None,
         side_selector=None,
-        export_debug_arrays=True,
+        export_debug_arrays=False,
     ):
         tic_write = time.perf_counter()
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
