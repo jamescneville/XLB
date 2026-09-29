@@ -684,6 +684,20 @@ def prep_inputs(input_file):
         surface_mesh_for_vtk = car_mesh.copy()
     else:
         surface_mesh_for_vtk = body_mesh.copy()
+    # Optional: resample the surface-field (USD/VTK) mesh to a uniform edge length.
+    # Independent of the mesh used for voxelization; gaps/open shells are left alone.
+    remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
+    if remesh_cfg.get("enabled", False) and str(jsonfile.get("settings", {}).get("surfaceField", "")).strip():
+        from xlb.utils.surface_remesh import remesh_surface_isolated
+        try:
+            surface_mesh_for_vtk = remesh_surface_isolated(
+                surface_mesh_for_vtk,
+                target_edge=remesh_cfg.get("targetEdge", voxel_size),  # meters
+                max_faces=remesh_cfg.get("maxFaces"),
+            )
+        except Exception as e:  # don't lose a run over a cosmetic export mesh
+            print(f" WARNING: surfaceRemesh failed ({e}); using the original surface mesh. "
+                  f"(missing dependency? pip install pyacvd)")
     scm_progress(2)
     print(f"Progress 2%")
     level_data, body_vertices, wheel_vertices, wheel_centers, grid_shape_zip, partSize, actual_num_levels, shift, sparsity_pattern, level_origins = mesh_prep(
