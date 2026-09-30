@@ -690,10 +690,19 @@ def prep_inputs(input_file):
     if remesh_cfg.get("enabled", False) and str(jsonfile.get("settings", {}).get("surfaceField", "")).strip():
         from xlb.utils.surface_remesh import remesh_surface_isolated
         try:
+            wrap_cfg = remesh_cfg.get("wrap", {})
+            wrap_on = wrap_cfg.get("enabled", False)
             surface_mesh_for_vtk = remesh_surface_isolated(
                 surface_mesh_for_vtk,
-                target_edge=remesh_cfg.get("targetEdge", voxel_size),  # meters
+                # meters; with the wrap on and no targetEdge, the wrapped mesh is used as-is
+                target_edge=remesh_cfg.get("targetEdge", None if wrap_on else voxel_size),
                 max_faces=remesh_cfg.get("maxFaces"),
+                wrap_resolution=wrap_cfg.get("resolution", voxel_size / 2) if wrap_on else None,
+                wrap_offset=wrap_cfg.get("offset") if wrap_on else None,
+                gap_closure=wrap_cfg.get("gapClosure", 0.0) if wrap_on else 0.0,
+                # meters; pulls the wrapped mesh back toward the original CAD (sharper edges). Omit to disable.
+                snap_offset=(lambda v: float(v) if v is not None and v is not False and float(v) >= 0 else None)(
+                    wrap_cfg.get("snapOffset")) if wrap_on else None,
             )
         except Exception as e:  # don't lose a run over a cosmetic export mesh
             print(f" WARNING: surfaceRemesh failed ({e}); using the original surface mesh. "
