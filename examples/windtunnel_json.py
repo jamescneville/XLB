@@ -697,13 +697,23 @@ def prep_inputs(input_file):
                 # meters; with the wrap on and no targetEdge, the wrapped mesh is used as-is
                 target_edge=remesh_cfg.get("targetEdge", None if wrap_on else voxel_size),
                 max_faces=remesh_cfg.get("maxFaces"),
+                # degrees; recovers the CAD's sharp edges in the export mesh. Omit/null/false to disable.
+                feature_angle=(lambda v: float(v) if v is not None and v is not False and float(v) > 0 else None)(
+                    remesh_cfg.get("featureAngle")),
                 wrap_resolution=wrap_cfg.get("resolution", voxel_size / 2) if wrap_on else None,
                 wrap_offset=wrap_cfg.get("offset") if wrap_on else None,
                 gap_closure=wrap_cfg.get("gapClosure", 0.0) if wrap_on else 0.0,
                 # meters; pulls the wrapped mesh back toward the original CAD (sharper edges). Omit to disable.
                 snap_offset=(lambda v: float(v) if v is not None and v is not False and float(v) >= 0 else None)(
                     wrap_cfg.get("snapOffset")) if wrap_on else None,
+                # global relaxation steps after the resample; evens out triangle shape (0 disables)
+                relax_iters=int(wrap_cfg.get("relaxIterations", 3)) if wrap_on else 0,
+                # GPU (Warp) distance queries when available; false forces the CPU path
+                use_gpu=bool(remesh_cfg.get("useGpu", True)),
             )
+            if wrap_on:
+                # closed shell with outward winding: safe for the outward-only surface-field sampling
+                surface_mesh_for_vtk.metadata["outward_normals"] = True
         except Exception as e:  # don't lose a run over a cosmetic export mesh
             print(f" WARNING: surfaceRemesh failed ({e}); using the original surface mesh. "
                   f"(missing dependency? pip install pyacvd)")
@@ -947,6 +957,26 @@ def prep_inputs(input_file):
 
 # Mesh Generation Functions
 # =========================
+def resolve_surface_side_selector(jsonfile, surface_mesh):
+    """
+    Side-selection mode for the surface-field mapping.
+
+    settings.surfaceSideSelector: "velocity" (default; probe both sides, keep the faster one),
+    "outward" (probe the +normal side only) or "outward_check" (velocity selection, and report how
+    often it disagrees with the normals). The outward modes need the boundary wrap: its shell has
+    reliable outward normals. Without a successful wrap they fall back to "velocity".
+    """
+    sel = str(jsonfile.get("settings", {}).get("surfaceSideSelector", "velocity")).strip().lower()
+    if sel not in ("velocity", "outward", "outward_check"):
+        print(f" WARNING: unknown surfaceSideSelector '{sel}'; using 'velocity'.")
+        return "velocity"
+    if sel != "velocity" and not surface_mesh.metadata.get("outward_normals", False):
+        print(f" WARNING: surfaceSideSelector='{sel}' needs surfaceRemesh.wrap to have run "
+              f"(reliable outward normals); using 'velocity'.")
+        return "velocity"
+    return sel
+
+
 def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile):
     
     # Compute bounds on full car
@@ -3036,7 +3066,7 @@ def solve(
                 export=jsonfile['settings']['surfaceFieldExport'],
                 usd_clim=clim,
                 usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
-                side_selector="velocity",
+                side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
             scm_results_available() 
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
@@ -3169,7 +3199,7 @@ def solve(
                 export=jsonfile['settings']['surfaceFieldExport'],
                 usd_clim=clim,
                 usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
-                side_selector="velocity",
+                side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
             scm_results_available() 
 

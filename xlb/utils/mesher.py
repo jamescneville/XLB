@@ -2470,6 +2470,8 @@ class MultiresIO(object):
         aggregate="median",
         selector_values=None,
         solid_mask=None,
+        outward_only=False,
+        report_outward=False,
     ):
         tree = None
         centroids = None
@@ -2494,7 +2496,8 @@ class MultiresIO(object):
             if selector_sample is not None:
                 selector_sample = np.ascontiguousarray(selector_sample[fluid])
 
-        # Always sample the requested field here.
+        # Always sample the requested field here (the +normal side; with outward_only the
+        # surface normals are trusted to point into the flow, so this is the only side).
         plus_vals, plus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
             surface_normals=surface_normals,
@@ -2509,6 +2512,17 @@ class MultiresIO(object):
             tree=tree,
             centroids=centroids,
         )
+
+        if outward_only:
+            print(
+                "\tOUTWARD ONLY: sampling the +normal side; "
+                f"mapped range=[{np.nanmin(plus_vals):.6g}, {np.nanmax(plus_vals):.6g}]"
+            )
+            return (
+                plus_vals.astype(np.float32),
+                surface_normals.astype(np.float32),
+                np.zeros(len(plus_vals), dtype=bool),
+            )
 
         minus_vals, minus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
@@ -2562,6 +2576,14 @@ class MultiresIO(object):
             use_minus = side_pref < 0.0
         else:
             use_minus = ~(minus_score > plus_score)
+
+        if report_outward:
+            print(
+                "\tOUTWARD CHECK: the selector picked the -normal side for "
+                f"{100.0 * float(np.mean(use_minus)):.2f}% of vertices "
+                f"({int(np.sum(use_minus)):,} of {len(use_minus):,}); "
+                "near 0% means the normals point into the flow and 'outward' is safe."
+            )
 
         mapped = plus_vals.copy()
         mapped[use_minus] = minus_vals[use_minus]
@@ -3113,7 +3135,13 @@ class MultiresIO(object):
         tic_write = time.perf_counter()
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
         selector_values = None
-        if side_selector == "velocity":
+        outward_only = side_selector == "outward"
+        report_outward = side_selector == "outward_check"
+        if report_outward:
+            side_selector = "velocity"  # decide with velocity as before, only report the disagreement
+        if outward_only:
+            pass
+        elif side_selector == "velocity":
             vel_keys = sorted(
                 (kk for kk in fields_data if kk.startswith("velocity_")),
                 key=lambda kk: int(kk.rsplit("_", 1)[1]),
@@ -3128,7 +3156,9 @@ class MultiresIO(object):
                 print("\tside_selector='velocity' but no velocity field present; "
                       "falling back to per-field score selection.")
         elif side_selector not in ("velocity", "score"):
-            raise ValueError(f"Unknown side_selector '{side_selector}' (use 'velocity' or 'score').")
+            raise ValueError(
+                f"Unknown side_selector '{side_selector}' (use 'velocity', 'score', 'outward' or 'outward_check')."
+            )
 
         mesh = surface_mesh_filename
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -3159,7 +3189,9 @@ class MultiresIO(object):
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
             selector_values=selector_values,
-            solid_mask=solid_mask
+            solid_mask=solid_mask,
+            outward_only=outward_only,
+            report_outward=report_outward,
         )
         toc_write = time.perf_counter()
         print(f"\tSurface field mapped in {toc_write - tic_write:0.1f} seconds")
