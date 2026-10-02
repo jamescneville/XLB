@@ -1,13 +1,33 @@
+# Core runtime — required to `import xlb`
 jax[cuda]
-matplotlib
 numpy
+scipy            # xlb.utils.mesher (module-level cKDTree)
+matplotlib
 pyvista
-Rtree
 trimesh
+Rtree            # trimesh proximity/ray backends
 numpy-stl
+open3d           # xlb.utils.makemesh (module-level)
+pyacvd           # xlb.utils.surface_remesh (uniform surface resampling)
+tabulate         # xlb.utils.makemesh (module-level)
 pydantic
 nvtx
+warp-lang
+
+# Realtime viewer (xlb.utils.live_view). Optional: without pyglet the viewer
+# falls back to writing PNG frames, and it is off unless XLB_LIVE_VIEW=1.
+pyglet
+
+# Output / export paths (lazily imported — these fail at the END of a run)
+h5py             # MultiresIO HDF5 export
+scikit-image     # MultiresIO.to_isosurface_stl (marching cubes)
+Pillow           # PNG colorbar fallback in mesher
+usd-core         # pxr, USD export in examples/ibm
+
+# Examples
+tqdm
+httpx            # examples/windtunnel_json.py
+
+# Dev / test
 pytest
 ruff
-usd-core
-h5py

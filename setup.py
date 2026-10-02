@@ -87,23 +87,43 @@ setup(
     install_requires=[
         "matplotlib>=3.9.2",
         "numpy>=2.1.2",
+        "scipy>=1.14.0",  # xlb.utils.mesher imports scipy.spatial.cKDTree at module level
         "pyvista>=0.44.1",
         "trimesh>=4.4.9",
+        "Rtree>=1.3.0",  # trimesh proximity/ray backends (mesh signed-distance, ray masker)
         "numpy-stl>=3.1.2",
+        "open3d>=0.18.0",  # xlb.utils.makemesh imports open3d at module level
+        "pyacvd>=0.3.0",  # xlb.utils.surface_remesh (uniform surface-field mesh)
+        "tabulate>=0.9.0",  # xlb.utils.makemesh imports tabulate at module level
         "pydantic>=2.9.1",
         "ruff>=0.14.1",
         "jax>=0.8.2",  # Base JAX CPU-only requirement
         "warp-lang>=1.10.0",  # Required at import time (core modules import warp)
         "nvtx>=0.2.0",  # NVTX ranges (e.g. nse_multires_stepper); listed in requirements.txt
+        # Lazily imported by xlb.utils.mesher export paths. Kept in core (not an extra)
+        # because they are only reached at the END of a run -- a missing one throws away
+        # the whole simulation rather than failing fast at import.
+        "h5py>=3.10.0",  # MultiresIO HDF5 export
+        "scikit-image>=0.22.0",  # MultiresIO.to_isosurface_stl (marching cubes)
+        "Pillow>=10.0.0",  # PNG colorbar fallback when matplotlib's saver is unavailable
     ],
     extras_require={
         "warp": ["warp-lang>=1.10.0"],  # Kept for explicit `pip install xlb[warp]` / Neon uninstall hook docs
         "cuda": ["jax[cuda13]>=0.8.2"],  # For CUDA installations (pip install -U "jax[cuda13]")
         "tpu": ["jax[tpu]>=0.8.2"],  # For TPU installations
-        # h5py: MultiresIO / Neon multi-resolution export to HDF5 (see xlb.utils.mesher).
-        # scikit-image: marching-cubes iso-surface STL export (MultiresIO.to_isosurface_stl).
-        "neon": [_neon_wheel_requirement(), "h5py>=3.10.0", "scikit-image>=0.22.0"],
+        "neon": [_neon_wheel_requirement()],
         "test": ["pytest>=8.0.0"],
+        # xlb.utils.live_view window backend. Without it the viewer still runs and
+        # writes PNG frames, so this is genuinely optional.
+        "viz": ["pyglet>=2.0"],
+        # Dependencies used only by scripts under examples/, not by the xlb package.
+        "examples": [
+            "tqdm>=4.66.0",
+            "httpx>=0.27.0",  # examples/windtunnel_json.py
+            "usd-core>=24.0",  # pxr, USD export in examples/ibm
+        ],
+        # examples/out_of_core only -- CUDA-specific, intentionally not in core.
+        "ooc": ["cupy-cuda12x>=13.0.0", "kvikio-cu12>=24.0.0", "mpi4py>=3.1.0"],
     },
     python_requires=">=3.11",
     dependency_links=["https://storage.googleapis.com/jax-releases/libtpu_releases.html"],

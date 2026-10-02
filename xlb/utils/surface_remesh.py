@@ -185,7 +185,110 @@ def _make_kernels(st):
         else:
             out[tid] = wp.uint8(0)
 
+    @wp.kernel
+    def k_closest_val(
+        mesh: wp.uint64,
+        pts: wp.array(dtype=wp.vec3),
+        out_p: wp.array(dtype=wp.vec3),
+        out_v: wp.array(dtype=wp.float32),
+        maxd: float,
+    ):
+        # closest point on the mesh and a per-vertex value (stored in the mesh's "velocity" x) interpolated there
+        i = wp.tid()
+        q = wp.mesh_query_point_no_sign(mesh, pts[i], maxd)
+        if q.result:
+            out_p[i] = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
+            vel = wp.mesh_eval_velocity(mesh, q.face, q.u, q.v)
+            out_v[i] = vel[0]
+        else:
+            out_p[i] = pts[i]
+            out_v[i] = 1.0e9
+
+    @wp.kernel
+    def k_curv(
+        indptr: wp.array(dtype=wp.int32),
+        indices: wp.array(dtype=wp.int32),
+        verts: wp.array(dtype=wp.vec3),
+        nrm: wp.array(dtype=wp.vec3),
+        dmin: float,
+        out: wp.array(dtype=wp.float32),
+    ):
+        # largest normal turn per unit length towards any neighbour (1/radius of the tightest local curvature);
+        # the length is floored at dmin so the near-zero-length edges a wrap can contain do not read as huge curvature
+        i = wp.tid()
+        best = float(0.0)
+        for e in range(indptr[i], indptr[i + 1]):
+            j = indices[e]
+            d = wp.max(wp.length(verts[j] - verts[i]), dmin)
+            c = wp.clamp(wp.dot(nrm[i], nrm[j]), -1.0, 1.0)
+            best = wp.max(best, wp.acos(c) / d)
+        out[i] = best
+
+    @wp.kernel
+    def k_dilate(
+        indptr: wp.array(dtype=wp.int32),
+        indices: wp.array(dtype=wp.int32),
+        vin: wp.array(dtype=wp.float32),
+        vout: wp.array(dtype=wp.float32),
+    ):
+        i = wp.tid()
+        best = float(vin[i])
+        for e in range(indptr[i], indptr[i + 1]):
+            best = wp.max(best, vin[indices[e]])
+        vout[i] = best
+
+    @wp.kernel
+    def k_tosize(
+        kappa: wp.array(dtype=wp.float32), tol: float, smin: float, smax: float, out: wp.array(dtype=wp.float32)
+    ):
+        # chord-error sizing: an edge of length L on radius R deviates L^2/(8R) from the surface
+        i = wp.tid()
+        out[i] = wp.clamp(wp.sqrt(8.0 * tol / wp.max(kappa[i], 1.0e-9)), smin, smax)
+
+    @wp.kernel
+    def k_grade(
+        indptr: wp.array(dtype=wp.int32),
+        indices: wp.array(dtype=wp.int32),
+        verts: wp.array(dtype=wp.vec3),
+        sin: wp.array(dtype=wp.float32),
+        sout: wp.array(dtype=wp.float32),
+        g: float,
+    ):
+        # size gradation: s_i <= s_j + g * |p_i - p_j|
+        i = wp.tid()
+        best = float(sin[i])
+        for e in range(indptr[i], indptr[i + 1]):
+            j = indices[e]
+            best = wp.min(best, sin[j] + g * wp.length(verts[j] - verts[i]))
+        sout[i] = best
+
+    @wp.kernel
+    def k_spring(
+        indptr: wp.array(dtype=wp.int32),
+        indices: wp.array(dtype=wp.int32),
+        verts: wp.array(dtype=wp.vec3),
+        size: wp.array(dtype=wp.float32),
+        lam: float,
+        out: wp.array(dtype=wp.vec3),
+    ):
+        # every edge is a spring whose rest length is the local target size; move to the mean spring force
+        i = wp.tid()
+        acc = wp.vec3()
+        cnt = int(0)
+        for e in range(indptr[i], indptr[i + 1]):
+            j = indices[e]
+            d = verts[j] - verts[i]
+            L = wp.max(wp.length(d), 1.0e-9)
+            acc = acc + d * ((L - 0.5 * (size[i] + size[j])) / L)
+            cnt = cnt + 1
+        if cnt > 0:
+            out[i] = verts[i] + acc * (lam / float(cnt))
+        else:
+            out[i] = verts[i]
+
     st["k_dist"], st["k_closest"], st["k_field"], st["k_blockmask"] = k_dist, k_closest, k_field, k_blockmask
+    st["k_closest_val"], st["k_curv"], st["k_dilate"] = k_closest_val, k_curv, k_dilate
+    st["k_tosize"], st["k_grade"], st["k_spring"] = k_tosize, k_grade, k_spring
 
 
 def _gpu_selftest():
@@ -203,6 +306,15 @@ def _gpu_selftest():
     assert len(blocks) > 0, "block-selection kernel selected nothing"
     fld = _gpu_field(sc, blocks, 4, origin, 0.25, 0.05, (17, 17, 17), None)
     assert fld.shape == (17, 17, 17) and np.isfinite(fld).all(), "field kernel returned bad values"
+    # adaptive-remesh kernels: value interpolation (x coordinate is linear, so the interpolant must equal x)
+    sc.set_values(m.vertices[:, 0])
+    pv_, vv_ = sc.closest_val(np.array([[0.25, 0.25, 0.5], [0.8, 0.1, -0.3]]))
+    assert abs(vv_[0] - 0.25) < 1e-4 and abs(vv_[1] - 0.8) < 1e-4, f"value-interpolation kernel returned {vv_}"
+    ip, ix = _csr_adjacency(m.faces, 4)
+    g = _gpu_grade(np.asarray(m.vertices), ip, ix, np.array([1.0, 9.0, 9.0, 9.0]), 0.5, 3)
+    assert abs(g[1] - 1.5) < 1e-4 and abs(g[0] - 1.0) < 1e-4, f"gradation kernel returned {g}"
+    sp = _gpu_spring(np.asarray(m.vertices), ip, ix, np.full(4, 1.0), 0.0)
+    assert np.allclose(sp, m.vertices, atol=1e-5), "spring kernel moved a vertex with lam=0"
 
 
 def _gpu_ok():
@@ -272,6 +384,30 @@ class _GpuScene:
             op[a : a + len(c)] = OP.numpy()
             of[a : a + len(c)] = OF.numpy()
         return op.astype(np.float64), of
+
+    def set_values(self, values):
+        """Attach a per-vertex scalar so :meth:`closest_val` can interpolate it (stored as the mesh velocity x)."""
+        wp, dev = _GPU["wp"], _GPU["dev"]
+        vel = np.zeros((len(values), 3), dtype=np.float32)
+        vel[:, 0] = values
+        self._vel = wp.array(vel, dtype=wp.vec3, device=dev)
+        self.mesh_v = wp.Mesh(points=self._verts, indices=self._idx, velocities=self._vel)
+
+    def closest_val(self, points):
+        """(closest point on the mesh, attached per-vertex scalar interpolated at that point)"""
+        wp, dev = _GPU["wp"], _GPU["dev"]
+        pts = np.ascontiguousarray(points, dtype=np.float32)
+        op = np.empty((len(pts), 3), dtype=np.float32)
+        ov = np.empty(len(pts), dtype=np.float32)
+        for a in range(0, len(pts), self.CHUNK):
+            c = pts[a : a + self.CHUNK]
+            P = wp.array(c, dtype=wp.vec3, device=dev)
+            OP = wp.empty(len(c), dtype=wp.vec3, device=dev)
+            OV = wp.empty(len(c), dtype=wp.float32, device=dev)
+            wp.launch(_GPU["k_closest_val"], dim=len(c), inputs=[self.mesh_v.id, P, OP, OV, 1.0e3], device=dev)
+            op[a : a + len(c)] = OP.numpy()
+            ov[a : a + len(c)] = OV.numpy()
+        return op.astype(np.float64), ov.astype(np.float64)
 
 
 def _gpu_block_list(scene, origin, h, be, dims_e, off):
@@ -624,420 +760,71 @@ def wrap_surface(mesh, resolution, offset, gap_closure=0.0, verbose=True):
     return wrapped
 
 
-def _feature_chains(src, angle_deg, min_len):
+def _split_marked(V, F, marked):
     """
-    Sharp-edge polylines of the source CAD: mesh edges whose two faces differ by more than
-    ``angle_deg``, chained through valence-2 vertices. Chains shorter than ``min_len`` are dropped
-    (tessellation noise and details far below the export resolution).
-    Returns a list of (n,3) ordered point arrays.
+    Split the edges whose keys (``min*n + max``, sorted and unique) are in ``marked`` at their midpoints.
+
+    Each face is closed with a 1->2, 1->3 or 1->4 pattern depending on how many of its edges are split, so there
+    are no hanging nodes and the winding is preserved. Returns (V2, F2); the midpoints are appended to V in the
+    order of ``marked``.
     """
-    ang = src.face_adjacency_angles
-    e = np.asarray(src.face_adjacency_edges)[ang > np.radians(angle_deg)]
-    if len(e) == 0:
-        return []
-    e = np.unique(np.sort(e, axis=1), axis=0)
-    nbr = {}
-    for a, b in e.tolist():
-        nbr.setdefault(a, []).append(b)
-        nbr.setdefault(b, []).append(a)
-    seen = set()
-    chains = []
+    n = len(V)
+    F = np.asarray(F, dtype=np.int64)
+    a, b, c = F[:, 0], F[:, 1], F[:, 2]
+    lo = np.stack([np.minimum(a, b), np.minimum(b, c), np.minimum(c, a)], axis=1)
+    hi = np.stack([np.maximum(a, b), np.maximum(b, c), np.maximum(c, a)], axis=1)
+    key = lo * n + hi
+    pos = np.minimum(np.searchsorted(marked, key), len(marked) - 1)
+    mk = marked[pos] == key                                   # (F, 3): is this face edge split?
+    mid = n + pos                                             # midpoint vertex id of each face edge
+    V2 = np.vstack([V, 0.5 * (V[marked // n] + V[marked % n])])
+    cnt = mk.sum(axis=1)
 
-    def walk(start, nxt):
-        path = [start, nxt]
-        seen.add((min(start, nxt), max(start, nxt)))
-        prev, cur = start, nxt
-        while len(nbr[cur]) == 2:
-            n2 = nbr[cur][0] if nbr[cur][0] != prev else nbr[cur][1]
-            key = (min(cur, n2), max(cur, n2))
-            if key in seen:
-                break
-            seen.add(key)
-            path.append(n2)
-            prev, cur = cur, n2
-            if cur == start:
-                break
-        return path
-
-    for v, ns in nbr.items():          # start at chain ends and junctions first
-        if len(ns) != 2:
-            for n in ns:
-                if (min(v, n), max(v, n)) not in seen:
-                    chains.append(walk(v, n))
-    for v, ns in nbr.items():          # then closed loops
-        for n in ns:
-            if (min(v, n), max(v, n)) not in seen:
-                chains.append(walk(v, n))
-    V = np.asarray(src.vertices)
-    out = []
-    for c in chains:
-        P = V[np.asarray(c)]
-        if np.linalg.norm(np.diff(P, axis=0), axis=1).sum() >= min_len:
-            out.append(P)
-    return out
+    out = [F[cnt == 0]]
+    i3 = np.flatnonzero(cnt == 3)
+    if len(i3):
+        A, B, C = a[i3], b[i3], c[i3]
+        m01, m12, m20 = mid[i3, 0], mid[i3, 1], mid[i3, 2]
+        out += [np.stack([A, m01, m20], 1), np.stack([m01, B, m12], 1),
+                np.stack([m20, m12, C], 1), np.stack([m01, m12, m20], 1)]
+    i1 = np.flatnonzero(cnt == 1)
+    if len(i1):
+        k = np.argmax(mk[i1], axis=1)                          # which edge is split
+        rows, ar = F[i1], np.arange(len(i1))
+        p, q, r = rows[ar, k], rows[ar, (k + 1) % 3], rows[ar, (k + 2) % 3]
+        m = mid[i1, k]
+        out += [np.stack([p, m, r], 1), np.stack([m, q, r], 1)]
+    i2 = np.flatnonzero(cnt == 2)
+    if len(i2):
+        u = np.argmin(mk[i2], axis=1)                          # the unsplit edge
+        rows, ar = F[i2], np.arange(len(i2))
+        A, B, C = rows[ar, (u + 1) % 3], rows[ar, (u + 2) % 3], rows[ar, u]   # (A,B) and (B,C) are split
+        mab, mbc = mid[i2, (u + 1) % 3], mid[i2, (u + 2) % 3]
+        d1 = np.linalg.norm(V2[A] - V2[mbc], axis=1)           # diagonal A-mbc
+        d2 = np.linalg.norm(V2[mab] - V2[C], axis=1)           # diagonal mab-C
+        s = d1 <= d2
+        out += [np.stack([mab, B, mbc], 1),
+                np.where(s[:, None], np.stack([A, mab, mbc], 1), np.stack([A, mab, C], 1)),
+                np.where(s[:, None], np.stack([A, mbc, C], 1), np.stack([mab, mbc, C], 1))]
+    return V2, np.vstack(out)
 
 
-def _resample_polyline(P, step):
-    """Points every ``step`` of arc length along polyline P (ends included)."""
-    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
-    s = np.concatenate([[0.0], np.cumsum(seg)])
-    n = max(int(np.ceil(s[-1] / step)), 1)
-    t = np.linspace(0.0, s[-1], n + 1)
-    return np.stack([np.interp(t, s, P[:, k]) for k in range(3)], axis=1)
+def _dbg_topology(label, mesh):
+    """Opt-in (XLB_SURFACE_DEBUG=1): print boundary / non-manifold / winding-conflict / zero-area counts for a stage."""
+    import os
 
-
-def _smooth_polyline(P, edge, corner_deg=40.0):
-    """
-    Remove tessellation noise from a feature line while keeping its real corners.
-
-    Resample every edge/4, split where the line turns by more than ``corner_deg`` over a
-    +/-edge/2 window (a genuine corner), and moving-average each piece over ~1.25*edge with the
-    piece ends held fixed. Feature lines that follow the CAD triangulation are jagged at the mm
-    scale; snapping the mesh onto a jagged line makes the mesh jagged, so it is smoothed first.
-    """
-    ds = edge / 4.0
-    Q = _resample_polyline(P, ds)
-    n = len(Q)
-    if n < 7:
-        return Q
-    k = 2                                   # +/- edge/2 window, in samples
-    a = Q[k:] - Q[:-k]
-    turn = np.zeros(n)
-    u, w = a[:-k], a[k:]
-    cosv = np.einsum("ij,ij->i", u, w) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(w, axis=1), 1e-20)
-    turn[k : k + len(cosv)] = np.degrees(np.arccos(np.clip(cosv, -1, 1)))
-    corners = [0] + [i for i in range(1, n - 1) if turn[i] > corner_deg and turn[i] >= turn[max(i - 2, 0) : i + 3].max()] + [n - 1]
-    out = Q.copy()
-    for a_, b_ in zip(corners[:-1], corners[1:]):
-        if b_ - a_ < 5:
-            continue
-        seg = Q[a_ : b_ + 1]
-        half = 2
-        pad = np.vstack([np.repeat(seg[:1], half, axis=0), seg, np.repeat(seg[-1:], half, axis=0)])
-        sm = np.stack([np.convolve(pad[:, c], np.ones(2 * half + 1) / (2 * half + 1), mode="valid") for c in range(3)], axis=1)
-        sm[0], sm[-1] = seg[0], seg[-1]
-        out[a_ : b_ + 1] = sm
-    return out
-
-
-def recover_features(mesh, src, edge, angle_deg=35.0, verbose=True, smooth=True,
-                     relax_iters=3, project_to=None, offset=0.0):
-    """
-    Put the mesh's edges back on the CAD's sharp feature lines.
-
-    1. Find the CAD's feature polylines (dihedral > ``angle_deg``).
-    2. Every ``edge`` along a polyline, move the single nearest mesh vertex (within 0.75*edge)
-       onto the polyline, so one row of vertices lies exactly on the crease.
-    3. Consecutive snapped vertices are joined by real mesh edges via constrained edge flips
-       (Sloan): without that, triangles still cut across the crease and the edge zig-zags.
-    Only flips that keep the surface valid are made (convex quad, no normal reversal).
-    4. Snapping leaves the triangles beside the line irregular, so the vertices within two edges of
-       the snapped row are relaxed (``relax_iters`` Laplacian steps) and put back on ``project_to``
-       (the surface the mesh lies on; ``offset`` is how far it stands off that surface).
-    """
-    from collections import deque
-    from scipy.spatial import cKDTree
-
-    tic = time.perf_counter()
-    _fl = [tic]
-
-    def ftick(label):
-        if verbose:
-            now = time.perf_counter()
-            print(chr(9) + f"    features.{label}: {now - _fl[0]:.1f} s")
-            _fl[0] = now
-
-    # Moving a vertex only keeps the surface closed if every face that uses it shares it.
-    mesh = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.faces), process=False)
-    mesh.merge_vertices()
-    ftick("weld input")
-    chains = _feature_chains(src, angle_deg, min_len=3.0 * edge)
-    if smooth:
-        chains = [_smooth_polyline(P, edge) for P in chains]
-        ftick("feature lines + smoothing")
-    if not chains:
-        if verbose:
-            print("\tFeature recovery: no feature lines found")
-        return mesh
-    V = np.array(mesh.vertices, dtype=np.float64)
-    F = np.array(mesh.faces, dtype=np.int64)
-    R = 0.75 * edge
-
-    # 1. stations along every chain, nearest vertex each, unique assignment
-    stations, st_chain, st_idx = [], [], []
-    dense, dense_owner = [], []
-    for ci, P in enumerate(chains):
-        S = _resample_polyline(P, edge)
-        stations.append(S)
-        st_chain.extend([ci] * len(S))
-        st_idx.extend(range(len(S)))
-        D = _resample_polyline(P, 0.1 * edge)
-        dense.append(D)
-        dense_owner.extend([ci] * len(D))
-    stations = np.vstack(stations)
-    st_chain, st_idx = np.asarray(st_chain), np.asarray(st_idx)
-    dense = np.vstack(dense)
-    dtree = cKDTree(dense)
-
-    vtree = cKDTree(V)
-    ftick("vertex tree")
-    d, vi = vtree.query(stations, distance_upper_bound=R)
-    okst = np.isfinite(d)
-    best = {}
-    for s in np.flatnonzero(okst):
-        v = int(vi[s])
-        if v not in best or d[s] < best[v][0]:
-            best[v] = (d[s], int(s))
-    snapped = {}  # vertex -> station id
-    for v, (_, s) in best.items():
-        snapped[v] = s
-    if not snapped:
-        return mesh
-    sv = np.fromiter(snapped.keys(), dtype=np.int64)
-    # move onto the nearest point of the feature polyline
-    _, di = dtree.query(V[sv])
-    V[sv] = dense[di]
-
-    # 2. constraints: snapped vertices on adjacent stations of the same chain
-    by_station = {}
-    for v, s in snapped.items():
-        by_station[s] = v
-    cons = []
-    for s, v in by_station.items():
-        s2 = s + 1
-        if s2 in by_station and st_chain[s2] == st_chain[s] and st_idx[s2] == st_idx[s] + 1:
-            if v != by_station[s2]:
-                cons.append((v, by_station[s2]))
-
-    # 3. constrained edge recovery by flipping
-    # Plain-Python floats and cached tuples: this loop runs per constraint on 3-vectors, where numpy's
-    # per-call overhead costs far more than the arithmetic (about 8x faster than the numpy version).
-    from math import sqrt
-
-    order = np.argsort(F.ravel(), kind="stable")
-    counts = np.bincount(F.ravel(), minlength=len(V))
-    starts = np.concatenate([[0], np.cumsum(counts)])
-    vf = {}
-    pc = {}   # vertex id -> (x, y, z); positions do not change during this stage
-    fc = {}   # face id  -> [a, b, c]; mirrors F for the faces touched so far
-
-    def vfaces(v):
-        s = vf.get(v)
-        if s is None:
-            s = set((order[starts[v] : starts[v + 1]] // 3).tolist())
-            vf[v] = s
-        return s
-
-    def edge_faces(u, v):
-        return vfaces(u) & vfaces(v)
-
-    def P(i):
-        p = pc.get(i)
-        if p is None:
-            p = tuple(V[i].tolist())
-            pc[i] = p
-        return p
-
-    def FT(f):
-        t = fc.get(f)
-        if t is None:
-            t = F[f].tolist()
-            fc[f] = t
-        return t
-
-    def sub(a, b):
-        return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-    def dot(a, b):
-        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-    def cross(a, b):
-        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
-
-    def fnormal(f):
-        t = FT(f)
-        a, b, c = P(t[0]), P(t[1]), P(t[2])
-        n = cross(sub(b, a), sub(c, a))
-        ln = max(sqrt(dot(n, n)), 1e-30)
-        return (n[0] / ln, n[1] / ln, n[2] / ln)
-
-    def directed(f, u, v):
-        """third vertex if face f contains directed edge u->v, else None"""
-        t = FT(f)
-        for i in range(3):
-            if t[i] == u and t[(i + 1) % 3] == v:
-                return t[(i + 2) % 3]
-        return None
-
-    recovered = flips = failed = 0
-    ftick("stations + constraints")
-    for a, b in cons:
-        if edge_faces(a, b):
-            recovered += 1
-            continue
-        # local 2-D frame along a->b
-        pa = P(a)
-        tv = sub(P(b), pa)
-        L = sqrt(dot(tv, tv))
-        if L < 1e-12:
-            continue
-        tv = (tv[0] / L, tv[1] / L, tv[2] / L)
-        nx = ny = nz = 0.0
-        for f in list(vfaces(a)) + list(vfaces(b)):
-            fn = fnormal(f)
-            nx += fn[0]
-            ny += fn[1]
-            nz += fn[2]
-        dn = nx * tv[0] + ny * tv[1] + nz * tv[2]
-        nn = (nx - tv[0] * dn, ny - tv[1] * dn, nz - tv[2] * dn)
-        ln = sqrt(dot(nn, nn))
-        if ln < 1e-9:
-            failed += 1
-            continue
-        nn = (nn[0] / ln, nn[1] / ln, nn[2] / ln)
-        w = cross(nn, tv)
-
-        def xy(v, pa=pa, tv=tv, w=w):
-            r = sub(P(v), pa)
-            return dot(r, tv), dot(r, w)
-
-        def crosses(c, d, xy=xy, L=L):
-            xc, yc = xy(c)
-            xd, yd = xy(d)
-            if yc * yd >= 0 or abs(yc) < 1e-9 or abs(yd) < 1e-9:
-                return False
-            x = xc + (xd - xc) * (0 - yc) / (yd - yc)
-            return 1e-9 < x < L - 1e-9
-
-        # first crossed edge: opposite edge of the face at a that the segment passes through
-        q = deque()
-        prev_face, cur = None, None
-        for f in vfaces(a):
-            tri = [x for x in FT(f) if x != a]
-            if len(tri) == 2 and crosses(tri[0], tri[1]):
-                cur, prev_face = tuple(tri), f
-                break
-        if cur is None:
-            failed += 1
-            continue
-        ok = True
-        for _ in range(64):
-            q.append(cur)
-            c, d = cur
-            fs = [f for f in edge_faces(c, d) if f != prev_face]
-            if len(fs) != 1:
-                ok = False
-                break
-            f2 = fs[0]
-            e3 = [x for x in FT(f2) if x != c and x != d]
-            if len(e3) != 1:
-                ok = False
-                break
-            e3 = e3[0]
-            if e3 == b:
-                break
-            ye = xy(e3)[1]
-            if abs(ye) < 1e-9:
-                ok = False
-                break
-            cur = (e3, d) if (ye > 0) == (xy(c)[1] > 0) else (c, e3)
-            prev_face = f2
-        else:
-            ok = False
-        if not ok:
-            failed += 1
-            continue
-
-        it = 0
-        while q and it < 400:
-            it += 1
-            c, d = q.popleft()
-            fs = list(edge_faces(c, d))
-            if len(fs) != 2:
-                continue
-            f1, f2 = fs
-            p = directed(f1, c, d)
-            if p is not None:
-                u, vv, ff1, ff2 = c, d, f1, f2
-            else:
-                p = directed(f2, c, d)
-                if p is None:
-                    continue
-                u, vv, ff1, ff2 = c, d, f2, f1
-            qv = directed(ff2, vv, u)
-            if qv is None:
-                continue
-            # convex quad in the local frame?
-            pu, pv_, pp, pq = xy(u), xy(vv), xy(p), xy(qv)
-
-            def side(o, m, z):
-                return (m[0] - o[0]) * (z[1] - o[1]) - (m[1] - o[1]) * (z[0] - o[0])
-
-            if not (side(pp, pq, pu) * side(pp, pq, pv_) < 0 and side(pu, pv_, pp) * side(pu, pv_, pq) < 0):
-                q.append((c, d))
-                continue
-            # keep the surface valid: new faces must not turn against the old ones
-            n_old1, n_old2 = fnormal(ff1), fnormal(ff2)
-            A, B = (u, qv, p), (qv, vv, p)
-            nA = cross(sub(P(A[1]), P(A[0])), sub(P(A[2]), P(A[0])))
-            nB = cross(sub(P(B[1]), P(B[0])), sub(P(B[2]), P(B[0])))
-            if dot(nA, n_old1) <= 0 or dot(nB, n_old2) <= 0 or dot(nA, nB) <= 0:
-                q.append((c, d))
-                continue
-            F[ff1] = A
-            F[ff2] = B
-            fc[ff1] = list(A)
-            fc[ff2] = list(B)
-            vfaces(vv).discard(ff1)
-            vfaces(qv).add(ff1)
-            vfaces(u).discard(ff2)
-            vfaces(p).add(ff2)
-            flips += 1
-            if crosses(p, qv):
-                q.append((p, qv))
-        if edge_faces(a, b):
-            recovered += 1
-        else:
-            failed += 1
-
-    ftick("constrained flips")
-    if relax_iters and project_to is not None:
-        from scipy.sparse import coo_matrix
-
-        n = len(V)
-        rr = np.concatenate([F[:, 0], F[:, 1], F[:, 2], F[:, 1], F[:, 2], F[:, 0]])
-        cc = np.concatenate([F[:, 1], F[:, 2], F[:, 0], F[:, 0], F[:, 1], F[:, 2]])
-        A = coo_matrix((np.ones(len(rr)), (rr, cc)), shape=(n, n)).tocsr()
-        A.data[:] = 1.0
-        deg = np.maximum(np.asarray(A.sum(axis=1)).ravel(), 1)
-        fixed = np.zeros(n)
-        fixed[sv] = 1.0
-        reach = fixed.copy()
-        for _ in range(2):
-            reach = np.minimum(reach + A @ reach, 1.0)
-        region = (reach > 0) & (fixed == 0)
-        pscene = _closest_point_scene(project_to)
-        for _ in range(int(relax_iters)):
-            avg = (A @ V) / deg[:, None]
-            V[region] = 0.5 * V[region] + 0.5 * avg[region]
-            p_, _ = _closest(pscene, V[region])
-            dv = p_ - V[region]
-            dd = np.linalg.norm(dv, axis=1)
-            ok = dd > 1e-12
-            nr = V[region].copy()
-            nr[ok] = p_[ok] - dv[ok] / dd[ok, None] * np.minimum(float(offset), dd[ok])[:, None]
-            V[region] = nr
-
-    out = trimesh.Trimesh(V, F, process=False)
-    ftick("relax")
-    if verbose:
-        tot = sum(float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) for P in chains)
-        print(
-            f"\tFeature recovery: {len(chains):,} feature lines ({tot:.1f} m), {len(snapped):,} vertices moved onto them, "
-            f"{recovered:,}/{len(cons):,} feature edges now real mesh edges ({flips:,} flips, {failed:,} not recovered) "
-            f"in {time.perf_counter() - tic:0.1f} s"
-        )
-    return out
+    if os.environ.get("XLB_SURFACE_DEBUG", "0") != "1":
+        return
+    V, F = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+    de = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    e = np.sort(de, axis=1)
+    _, c = np.unique(e, axis=0, return_counts=True)
+    k = de[:, 0].astype(np.int64) * (len(V) + 1) + de[:, 1]
+    conf = int((np.unique(k, return_counts=True)[1] > 1).sum())
+    a, b, cc = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    zero = int((0.5 * np.linalg.norm(np.cross(b - a, cc - a), axis=1) < 1e-12).sum())
+    print(f"{chr(9)}  [topology after {label}: {len(F):,} faces, boundary {int((c == 1).sum())}, "
+          f"non-manifold {int((c > 2).sum())}, winding conflicts {conf}, zero-area faces {zero}]")
 
 
 def _nondegenerate_mask(mesh):
@@ -1092,8 +879,401 @@ def _snap_to_source(m, orig, max_dist, offset, verbose=True):
     return trimesh.Trimesh(new, np.asarray(m.faces), process=False)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Curvature-adaptive refinement
+#
+# The resample above is uniform at the coarse edge length. Here the triangles are made smaller where the wrapped
+# surface curves tightly, from a sizing field computed on the wrap alone (the CAD is not involved):
+#   1. per-vertex curvature of the wrap -> chord-error edge length sqrt(8*tol*R), clamped to [min, max],
+#      then graded so neighbouring sizes change by at most `grade` per unit distance;
+#   2. edges longer than 4/3 of the local size are split (conforming 1->2/3/4), the new vertices go back onto the wrap;
+#   3. Delaunay edge flips and size-aware spring smoothing (re-projected onto the wrap) restore the triangle shape.
+# Distance/projection queries, the sizing field and the smoothing run on the GPU (Warp); the connectivity changes are
+# vectorised numpy because they are irregular. Everything has a CPU fallback with the same result.
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _csr_adjacency(F, n):
+    """Unique vertex neighbours of a triangle mesh in CSR form (int32 indptr, indices)."""
+    from scipy.sparse import coo_matrix
+
+    F = np.asarray(F, dtype=np.int32)
+    r = np.concatenate([F[:, 0], F[:, 1], F[:, 2], F[:, 1], F[:, 2], F[:, 0]])
+    c = np.concatenate([F[:, 1], F[:, 2], F[:, 0], F[:, 0], F[:, 1], F[:, 2]])
+    A = coo_matrix((np.ones(len(r), dtype=np.int8), (r, c)), shape=(n, n)).tocsr()   # duplicates are summed away
+    return A.indptr.astype(np.int32), A.indices.astype(np.int32)
+
+
+def _seg_reduce(ufunc, vals, indptr, empty):
+    """Per-row reduction of ``vals`` over CSR rows (``ufunc.reduceat`` that is safe for empty rows)."""
+    n = len(indptr) - 1
+    out = np.full((n,) + vals.shape[1:], empty, dtype=vals.dtype)
+    ne = np.flatnonzero(np.diff(indptr) > 0)
+    if len(ne):
+        out[ne] = ufunc.reduceat(vals, indptr[ne].astype(np.int64), axis=0)
+    return out
+
+
+def _vertex_normals(V, F):
+    """Area-weighted unit vertex normals and the area share of every vertex (a third of each adjacent face)."""
+    V = np.asarray(V, dtype=np.float64)
+    F = np.asarray(F)
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    idx = F.ravel()
+    out = np.empty((len(V), 3))
+    for k in range(3):
+        out[:, k] = np.bincount(idx, weights=np.repeat(fn[:, k], 3), minlength=len(V))
+    out /= np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-30)
+    va = np.bincount(idx, weights=np.repeat(0.5 * np.linalg.norm(fn, axis=1) / 3.0, 3), minlength=len(V))
+    return out, va
+
+
+def _gpu_csr(indptr, indices):
+    wp, dev = _GPU["wp"], _GPU["dev"]
+    return (wp.array(np.ascontiguousarray(indptr, dtype=np.int32), dtype=wp.int32, device=dev),
+            wp.array(np.ascontiguousarray(indices, dtype=np.int32), dtype=wp.int32, device=dev))
+
+
+def _gpu_grade(V, indptr, indices, size, g, sweeps):
+    wp, dev = _GPU["wp"], _GPU["dev"]
+    ip, ix = _gpu_csr(indptr, indices)
+    verts = wp.array(np.ascontiguousarray(V, dtype=np.float32), dtype=wp.vec3, device=dev)
+    a = wp.array(np.ascontiguousarray(size, dtype=np.float32), dtype=wp.float32, device=dev)
+    b = wp.empty_like(a)
+    for _ in range(int(sweeps)):
+        wp.launch(_GPU["k_grade"], dim=len(V), inputs=[ip, ix, verts, a, b, float(g)], device=dev)
+        a, b = b, a
+    return a.numpy().astype(np.float64)
+
+
+def _gpu_spring(V, indptr, indices, size, lam):
+    wp, dev = _GPU["wp"], _GPU["dev"]
+    ip, ix = _gpu_csr(indptr, indices)
+    verts = wp.array(np.ascontiguousarray(V, dtype=np.float32), dtype=wp.vec3, device=dev)
+    sz = wp.array(np.ascontiguousarray(size, dtype=np.float32), dtype=wp.float32, device=dev)
+    out = wp.empty(len(V), dtype=wp.vec3, device=dev)
+    wp.launch(_GPU["k_spring"], dim=len(V), inputs=[ip, ix, verts, sz, float(lam), out], device=dev)
+    return out.numpy().astype(np.float64)
+
+
+class _WrapSizer:
+    """
+    Curvature of the wrap (computed once) and the target edge length derived from it for any
+    (min, max, tolerance, gradation); the GPU keeps the curvature so re-sizing is a few kernel launches.
+    """
+
+    def __init__(self, V, F, verbose=True):
+        self.V = np.asarray(V, dtype=np.float64)
+        n = len(self.V)
+        self.indptr, self.indices = _csr_adjacency(F, n)
+        nrm, self.va = _vertex_normals(self.V, F)
+        self.e_mean = float(np.sqrt(4.0 * self.va.sum() / len(F) / np.sqrt(3.0)))
+        dmin = 0.5 * self.e_mean
+        self.dev = None
+        if _gpu_ok():
+            try:
+                wp, dev = _GPU["wp"], _GPU["dev"]
+                ip, ix = _gpu_csr(self.indptr, self.indices)
+                verts = wp.array(np.ascontiguousarray(self.V, dtype=np.float32), dtype=wp.vec3, device=dev)
+                nr = wp.array(np.ascontiguousarray(nrm, dtype=np.float32), dtype=wp.vec3, device=dev)
+                k = wp.empty(n, dtype=wp.float32, device=dev)
+                wp.launch(_GPU["k_curv"], dim=n, inputs=[ip, ix, verts, nr, float(dmin), k], device=dev)
+                k2 = wp.empty_like(k)
+                for _ in range(2):                    # widen the curved zone by two rings so a thin crease is not missed
+                    wp.launch(_GPU["k_dilate"], dim=n, inputs=[ip, ix, k, k2], device=dev)
+                    k, k2 = k2, k
+                self.dev = (ip, ix, verts, k)
+            except Exception as e:
+                self.dev = None
+                if verbose:
+                    print(f"{chr(9)}  sizing field: GPU failed ({type(e).__name__}: {str(e)[:80]}); using the CPU")
+        if self.dev is None:
+            self.rows = np.repeat(np.arange(n, dtype=np.int32), np.diff(self.indptr))
+            self.d = np.linalg.norm(self.V[self.indices] - self.V[self.rows], axis=1)
+            cosv = np.clip(np.einsum("ij,ij->i", nrm[self.rows], nrm[self.indices]), -1.0, 1.0)
+            kap = _seg_reduce(np.maximum, np.arccos(cosv) / np.maximum(self.d, dmin), self.indptr, 0.0)
+            for _ in range(2):
+                kap = np.maximum(kap, _seg_reduce(np.maximum, kap[self.indices], self.indptr, 0.0))
+            self.kap = kap
+
+    def size(self, smin, smax, tol, grade):
+        """Target edge length per wrap vertex: chord error <= tol, clamped to [smin, smax], graded."""
+        sweeps = int(min(80, np.ceil((smax - smin) / (grade * self.e_mean)) + 2))
+        if self.dev is not None:
+            wp, dev = _GPU["wp"], _GPU["dev"]
+            ip, ix, verts, k = self.dev
+            a = wp.empty_like(k)
+            wp.launch(_GPU["k_tosize"], dim=len(self.V), inputs=[k, float(tol), float(smin), float(smax), a], device=dev)
+            b = wp.empty_like(a)
+            for _ in range(sweeps):
+                wp.launch(_GPU["k_grade"], dim=len(self.V), inputs=[ip, ix, verts, a, b, float(grade)], device=dev)
+                a, b = b, a
+            return a.numpy().astype(np.float64)
+        sz = np.clip(np.sqrt(8.0 * tol / np.maximum(self.kap, 1e-9)), smin, smax)
+        ge = grade * self.d
+        for _ in range(sweeps):
+            sz = np.minimum(sz, _seg_reduce(np.minimum, sz[self.indices] + ge, self.indptr, np.inf))
+        return sz
+
+    def estimate(self, size):
+        """Triangle count if the whole surface were meshed at ``size`` (the real result is ~1.2x this)."""
+        return float((self.va / (0.433 * size * size)).sum())
+
+
+class _SizeField:
+    """Sizing field defined on the wrap's vertices, evaluated (with the projection) at arbitrary points."""
+
+    def __init__(self, scene, V, size):
+        self.scene, self.gpu = scene, isinstance(scene, _GpuScene)
+        if self.gpu:
+            try:
+                scene.set_values(size)
+            except Exception:
+                self.gpu = False
+        if not self.gpu:
+            from scipy.spatial import cKDTree
+
+            self.tree, self.size = cKDTree(np.asarray(V)), np.asarray(size)
+
+    def project(self, P):
+        """(closest points on the wrap, target size there)"""
+        if self.gpu:
+            return self.scene.closest_val(P)
+        p, _ = _closest(self.scene, P)
+        _, i = self.tree.query(p, workers=-1)
+        return p, self.size[i]
+
+
+def _spring(V, indptr, indices, size, lam):
+    """One size-aware smoothing step: each edge pulls/pushes its ends toward the local target length."""
+    if _gpu_ok():
+        try:
+            return _gpu_spring(V, indptr, indices, size, lam)
+        except Exception:
+            pass
+    deg = np.diff(indptr)
+    rows = np.repeat(np.arange(len(V), dtype=np.int32), deg)
+    d = V[indices] - V[rows]
+    L = np.maximum(np.linalg.norm(d, axis=1), 1e-9)
+    f = d * ((L - 0.5 * (size[rows] + size[indices])) / L)[:, None]
+    return V + _seg_reduce(np.add, f, indptr, 0.0) * (lam / np.maximum(deg, 1))[:, None]
+
+
+def _split_long(V, F, s, ratio=4.0 / 3.0):
+    """Split every edge longer than ``ratio`` x its local target size. Returns (V, F, s, number of edges split)."""
+    n = len(V)
+    Fi = np.asarray(F, dtype=np.int64)
+    a, b = Fi.ravel(), Fi[:, [1, 2, 0]].ravel()
+    mk = np.linalg.norm(V[a] - V[b], axis=1) > ratio * 0.5 * (s[a] + s[b])
+    if not mk.any():
+        return V, Fi, s, 0
+    marked = np.unique((np.minimum(a, b) * n + np.maximum(a, b))[mk])
+    V2, F2 = _split_marked(V, Fi, marked)
+    return V2, F2, np.concatenate([s, 0.5 * (s[marked // n] + s[marked % n])]), len(marked)
+
+
+def _flip_delaunay(V, F, seeds=None, min_cos=0.75, max_iter=4):
+    """
+    Edge flips toward the (cotangent) Delaunay criterion, many independent flips per round.
+
+    Only the neighbourhood of ``seeds`` (face indices; None = the whole mesh) is examined in the first round, and
+    only the neighbourhood of the faces the previous round changed afterwards, so the cost follows the amount of
+    change and not the mesh size. A flip is refused if the new diagonal already exists, if it would leave a vertex
+    with fewer than 3 neighbours, or if either new triangle turns more than ~40 degrees from the pair's mean normal
+    (so creases are not cut across). Returns (F, total flips, indices of the faces that were changed).
+    """
+    n = len(V)
+    F = np.array(F, dtype=np.int64)
+    total = 0
+    changed = []
+    unit = lambda x: x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-30)
+
+    def cot(u, w):
+        return np.einsum("ij,ij->i", u, w) / np.maximum(np.linalg.norm(np.cross(u, w), axis=1), 1e-18)
+
+    for _ in range(int(max_iter)):
+        if seeds is None:
+            S = np.arange(len(F))
+            vm = np.ones(n, dtype=bool)
+        else:
+            if len(seeds) == 0:
+                break
+            vm = np.zeros(n, dtype=bool)                  # seed vertices: all faces around them are in the sub-mesh
+            vm[F[seeds].ravel()] = True
+            S = np.flatnonzero(vm[F].any(axis=1))
+        sub = F[S]
+        ha = sub.ravel()
+        hb = sub[:, [1, 2, 0]].ravel()
+        hc = sub[:, [2, 0, 1]].ravel()
+        key = np.minimum(ha, hb) * n + np.maximum(ha, hb)
+        order = np.argsort(key)
+        ks = key[order]
+        first = np.flatnonzero(ks[1:] == ks[:-1])
+        bad = np.zeros(len(first), dtype=bool)
+        i2 = first + 2
+        ok2 = i2 < len(ks)
+        bad[ok2] |= ks[i2[ok2]] == ks[first[ok2]]
+        bad |= (first > 0) & (ks[np.maximum(first - 1, 0)] == ks[first])
+        first = first[~bad]                                       # edges shared by exactly two half-edges
+        h0, h1 = order[first], order[first + 1]
+        good = (ha[h1] == hb[h0]) & (hb[h1] == ha[h0])            # consistently oriented
+        h0, h1 = h0[good], h1[good]
+        a, b, c, d = ha[h0], hb[h0], hc[h0], hc[h1]
+        f0, f1 = S[h0 // 3], S[h1 // 3]
+        ok = (c != d) & vm[c] & vm[d]                             # c, d interior to the sub-mesh: their edges are all visible
+        idx = np.flatnonzero(ok)
+        a, b, c, d, f0, f1 = a[idx], b[idx], c[idx], d[idx], f0[idx], f1[idx]
+        Pa, Pb, Pc, Pd = V[a], V[b], V[c], V[d]
+        gain = cot(Pa - Pc, Pb - Pc) + cot(Pb - Pd, Pa - Pd)      # < 0: the opposite angles sum to more than 180
+        pre = np.flatnonzero(gain < -1e-3)                        # cheap test first; the rest only for survivors
+        if len(pre) == 0:
+            break
+        a, b, c, d, f0, f1, gain = a[pre], b[pre], c[pre], d[pre], f0[pre], f1[pre], gain[pre]
+        Pa, Pb, Pc, Pd = Pa[pre], Pb[pre], Pc[pre], Pd[pre]
+        n0, n1 = np.cross(Pb - Pa, Pc - Pa), np.cross(Pa - Pb, Pd - Pb)
+        t1, t2 = np.cross(Pa - Pc, Pd - Pc), np.cross(Pd - Pc, Pb - Pc)
+        nav = unit(unit(n0) + unit(n1))
+        sel = (np.einsum("ij,ij->i", unit(t1), nav) > min_cos) & (np.einsum("ij,ij->i", unit(t2), nav) > min_cos)
+        idx = np.flatnonzero(sel)
+        if len(idx) == 0:
+            break
+        a, b, c, d, f0, f1, gain = a[idx], b[idx], c[idx], d[idx], f0[idx], f1[idx], gain[idx]
+        kcd = np.minimum(c, d) * n + np.maximum(c, d)             # the new diagonal must not exist yet
+        pos = np.minimum(np.searchsorted(ks, kcd), len(ks) - 1)
+        val = np.bincount(F.ravel(), minlength=n)
+        idx = np.flatnonzero((ks[pos] != kcd) & (val[a] > 3) & (val[b] > 3))
+        if len(idx) == 0:
+            break
+        a, b, c, d, f0, f1, gain = a[idx], b[idx], c[idx], d[idx], f0[idx], f1[idx], gain[idx]
+        prio = np.empty(len(a), dtype=np.int64)
+        prio[np.argsort(gain)] = np.arange(len(a))                # most negative first
+        claim = np.full(len(F), np.iinfo(np.int64).max)
+        np.minimum.at(claim, f0, prio)
+        np.minimum.at(claim, f1, prio)
+        idx = np.flatnonzero((claim[f0] == prio) & (claim[f1] == prio))     # each face takes part in one flip
+        a, b, c, d, f0, f1 = a[idx], b[idx], c[idx], d[idx], f0[idx], f1[idx]
+        dec = np.bincount(np.concatenate([a, b]), minlength=n)    # keep every valence >= 3
+        idx = np.flatnonzero((val[a] - dec[a] >= 3) & (val[b] - dec[b] >= 3))
+        if len(idx) == 0:
+            break
+        a, b, c, d, f0, f1 = a[idx], b[idx], c[idx], d[idx], f0[idx], f1[idx]
+        F[f0] = np.stack([c, a, d], axis=1)
+        F[f1] = np.stack([c, d, b], axis=1)
+        total += len(a)
+        seeds = np.concatenate([f0, f1])
+        changed.append(seeds)
+        if len(a) < 0.002 * len(h0):
+            break
+    return F, total, (np.unique(np.concatenate(changed)) if changed else np.zeros(0, dtype=np.int64))
+
+
+def adaptive_refine(base, wrap, scene, min_edge, max_edge, tol=None, grade=0.4, verbose=True, max_faces=None):
+    """
+    Refine the uniform mesh ``base`` (edge ~``max_edge``, lying on ``wrap``) where ``wrap`` is tightly curved.
+
+    ``tol`` is the chord error in meters (default min_edge/4): an edge on a radius R is kept below sqrt(8*tol*R).
+    Edge lengths stay within [min_edge, max_edge] and change by at most ``grade`` per unit distance.
+    ``max_faces`` (optional) is a budget: if the sizing field would give more triangles, ``tol`` is raised until it fits.
+    ``scene`` is the closest-point scene of ``wrap``. Returns a trimesh.Trimesh.
+    """
+    tic = time.perf_counter()
+    last = [tic]
+
+    def tk(label):
+        if verbose:
+            now = time.perf_counter()
+            print(f"{chr(9)}    adaptive.{label}: {now - last[0]:.1f} s")
+            last[0] = now
+
+    smin, smax = float(min_edge), float(max_edge)
+    tol = float(tol) if tol else 0.25 * smin
+    sizer = _WrapSizer(wrap.vertices, wrap.faces, verbose)
+    size_w = sizer.size(smin, smax, tol, grade)
+    tk("curvature + sizing field on the wrap")
+    if max_faces:
+        cap = float(max_faces) / 1.2                  # the sizing estimate runs ~20% below the real triangle count
+        if sizer.estimate(size_w) > cap:
+            lo, hi = tol, tol * 200.0
+            for _ in range(16):
+                mid = float(np.sqrt(lo * hi))
+                if sizer.estimate(sizer.size(smin, smax, mid, grade)) > cap:
+                    lo = mid
+                else:
+                    hi = mid
+            if verbose:
+                print(f"{chr(9)}  Curvature-adaptive: maxFaces {int(max_faces):,} raises the tolerance from "
+                      f"{tol * 1000:.2f} to {hi * 1000:.2f} mm")
+            tol = hi
+            size_w = sizer.size(smin, smax, tol, grade)
+    field = _SizeField(scene, np.asarray(wrap.vertices), size_w)
+    V = np.array(base.vertices, dtype=np.float64)
+    F = np.asarray(base.faces, dtype=np.int64)
+    V, s = field.project(V)
+    tk("sample sizes")
+    refined = (s < 0.9 * smax)
+    if verbose:
+        print(f"{chr(9)}  Curvature-adaptive: {refined.mean() * 100:.1f}% of the base vertices want a finer mesh "
+              f"(tol {tol * 1000:.2f} mm, size {smin * 1000:.1f}-{smax * 1000:.1f} mm, grade {grade:g})")
+
+    n_pass = int(np.ceil(np.log2(smax / smin))) + 2
+    n_base = len(V)
+    for it in range(n_pass):
+        V, F, s, ns = _split_long(V, F, s)
+        if ns == 0:
+            break
+        n0 = len(V) - ns
+        V[n0:], s[n0:] = field.project(V[n0:])
+        tk(f"pass {it + 1}: split {ns:,} edges -> {len(F):,} faces")
+        F, nflip, ch = _flip_delaunay(V, F, seeds=np.flatnonzero((F >= n0).any(axis=1)))
+        tk(f"pass {it + 1}: {nflip:,} flips")
+        ip, ix = _csr_adjacency(F, len(V))
+        for _ in range(3):
+            V, s = field.project(_spring(V, ip, ix, s, 0.5))
+        tk(f"pass {it + 1}: smooth")
+        if ns < 0.001 * len(F):                   # what is left is a handful of edges; not worth another pass
+            break
+
+    # final polish: shape first, then a little more smoothing; only around what was refined
+    vm = np.zeros(len(V), dtype=bool)
+    vm[n_base:] = True
+    for rnd in range(2):
+        F, nflip, ch = _flip_delaunay(V, F, seeds=np.flatnonzero(vm[F].any(axis=1)), max_iter=3 if rnd == 0 else 2)
+        ip, ix = _csr_adjacency(F, len(V))
+        for _ in range(3 if rnd == 0 else 2):
+            V, s = field.project(_spring(V, ip, ix, s, 0.5))
+    tk("final flips + smoothing")
+    out = trimesh.Trimesh(V, F.astype(np.int64), process=False)
+    keep = _nondegenerate_mask(out)
+    if not keep.all():
+        out.update_faces(keep)
+        out.remove_unreferenced_vertices()
+    if verbose:
+        el = np.linalg.norm(V[F] - V[F[:, [1, 2, 0]]], axis=2)
+        print(f"{chr(9)}  Curvature-adaptive: {len(base.faces):,} -> {len(out.faces):,} tris, edge "
+              f"p5/p50/p95 = {np.percentile(el, 5) * 1000:.2f}/{np.percentile(el, 50) * 1000:.2f}/"
+              f"{np.percentile(el, 95) * 1000:.2f} mm in {time.perf_counter() - tic:.1f} s")
+    return out
+
+
+def adaptive_kwargs(cfg):
+    """
+    Keyword arguments for :func:`remesh_surface` / :func:`remesh_surface_isolated` from the json block
+    ``surfaceRemesh.curvatureAdaptive`` = {enabled, minEdge, maxEdge, tolerance, gradation} (meters); ``{}`` when off.
+    ``maxEdge`` (default: the target edge) is the edge length on flat areas, ``minEdge`` (default maxEdge/2) the
+    smallest edge at tight curvature, ``tolerance`` the chord error (default minEdge/4), ``gradation`` how fast the
+    size may change with distance (default 0.4).
+    """
+    if not cfg or not cfg.get("enabled", False):
+        return {}
+    num = lambda v: float(v) if v is not None and v is not False and float(v) > 0 else None
+    mx, mn = num(cfg.get("maxEdge")), num(cfg.get("minEdge"))
+    return dict(adaptive_min_edge=mn if mn else (mx / 2.0 if mx else None), adaptive_max_edge=mx,
+                adaptive_tol=num(cfg.get("tolerance")), adaptive_grade=num(cfg.get("gradation")) or 0.4)
+
+
 def remesh_surface(mesh, target_edge=None, max_faces=None, project=True, workers=1, verbose=True,
-                   wrap_resolution=None, wrap_offset=None, gap_closure=0.0, snap_offset=None, feature_angle=None, relax_iters=0):
+                   wrap_resolution=None, wrap_offset=None, gap_closure=0.0, snap_offset=None, relax_iters=0,
+                   adaptive_min_edge=None, adaptive_max_edge=None, adaptive_tol=None, adaptive_grade=0.4):
     """
     Resample ``mesh`` to a roughly uniform ``target_edge`` (meters).
 
@@ -1154,12 +1334,22 @@ def remesh_surface(mesh, target_edge=None, max_faces=None, project=True, workers
         wrap_off = wrap_offset if wrap_offset else 0.75 * float(wrap_resolution)
         src = wrap_surface(src, wrap_resolution, wrap_off, gap_closure=gap_closure, verbose=verbose)
         tick("wrap (total)")
+        _dbg_topology("wrap", src)
         if target_edge is None:
             if snap_offset is not None:
                 src = _snap_to_source(src, orig, 1.5 * wrap_off, snap_offset, verbose)
             return src
 
     edge = target_edge
+    adaptive = adaptive_min_edge is not None and float(adaptive_min_edge) > 0 and project
+    if adaptive:
+        if adaptive_max_edge:
+            edge = float(adaptive_max_edge)           # the uniform base is made at the coarse end of the range
+        if float(adaptive_min_edge) >= edge:
+            adaptive = False
+            if verbose:
+                print(f"{chr(9)}Curvature-adaptive off: minEdge {float(adaptive_min_edge) * 1000:.2f} mm is not below "
+                      f"the base edge {edge * 1000:.2f} mm")
     if max_faces is not None:
         # faces ~= 2 * vertices = 2 * area / (0.866 * e^2)
         edge = max(edge, float(np.sqrt(2.0 * src.area / (_EQUILATERAL * max_faces))))
@@ -1238,26 +1428,20 @@ def remesh_surface(mesh, target_edge=None, max_faces=None, project=True, workers
             out = trimesh.Trimesh(out.vertices, f, process=False)
             tick("orientation fix")
 
-    if relax_iters and project:
+    if adaptive:
+        out = adaptive_refine(out, src, scene, float(adaptive_min_edge), edge, adaptive_tol, adaptive_grade, verbose,
+                              max_faces=max_faces)
+        tick("curvature-adaptive refinement (total)")
+        _dbg_topology("curvature-adaptive", out)
+    elif relax_iters and project:
         out = _relax_all(out, scene, relax_iters)
         tick(f"global relax x{relax_iters}")
     tick("assemble/clean")
+    _dbg_topology("resample + project + relax", out)
     if snap_offset is not None and orig is not None:
         out = _snap_to_source(out, orig, 1.5 * wrap_off, snap_offset, verbose)
         tick("snap to source (incl. BVH build)")
-
-    if feature_angle is not None:
-        if orig is not None:
-            # the feature lines live on the CAD, so the mesh must already stand close to it
-            if snap_offset is None:
-                out = _snap_to_source(out, orig, 1.5 * wrap_off, 0.001, verbose)
-                snap_offset = 0.001
-                if verbose:
-                    print("\tFeature recovery needs the mesh near the CAD: using snapOffset 1 mm")
-            out = recover_features(out, orig, edge, feature_angle, verbose, project_to=orig, offset=snap_offset)
-        else:
-            out = recover_features(out, src, edge, feature_angle, verbose, project_to=src, offset=0.0)
-        tick("feature recovery")
+        _dbg_topology("snap", out)
 
     if verbose:
         dev = ""
@@ -1274,7 +1458,8 @@ def remesh_surface(mesh, target_edge=None, max_faces=None, project=True, workers
 
 
 def remesh_surface_isolated(mesh, target_edge=None, max_faces=None, workers=None,
-                            wrap_resolution=None, wrap_offset=None, gap_closure=0.0, snap_offset=None, feature_angle=None, relax_iters=0, use_gpu=True):
+                            wrap_resolution=None, wrap_offset=None, gap_closure=0.0, snap_offset=None, relax_iters=0, use_gpu=True,
+                            adaptive_min_edge=None, adaptive_max_edge=None, adaptive_tol=None, adaptive_grade=0.4):
     """
     :func:`remesh_surface` in a clean child process, parallel across components.
 
@@ -1299,8 +1484,12 @@ def remesh_surface_isolated(mesh, target_edge=None, max_faces=None, workers=None
                 cmd += ["--wrap-offset", repr(float(wrap_offset))]
             if snap_offset is not None:
                 cmd += ["--snap-offset", repr(float(snap_offset))]
-        if feature_angle is not None:
-            cmd += ["--feature-angle", repr(float(feature_angle))]
+        if adaptive_min_edge:
+            cmd += ["--adaptive-min", repr(float(adaptive_min_edge)), "--adaptive-grade", repr(float(adaptive_grade))]
+            if adaptive_max_edge:
+                cmd += ["--adaptive-max", repr(float(adaptive_max_edge))]
+            if adaptive_tol:
+                cmd += ["--adaptive-tol", repr(float(adaptive_tol))]
         if relax_iters:
             cmd += ["--relax-iters", str(int(relax_iters))]
         if not use_gpu:
@@ -1321,8 +1510,11 @@ def _main():
     ap.add_argument("--wrap-offset", type=float, default=None, help="wrap offset in meters (default 0.75*wrap-res)")
     ap.add_argument("--snap-offset", type=float, default=None,
                     help="after the wrap, pull vertices back to within this distance (m) of the original CAD to recover edges")
-    ap.add_argument("--feature-angle", type=float, default=None,
-                    help="recover the CAD's sharp edges (dihedral above this many degrees, e.g. 35) in the output mesh")
+    ap.add_argument("--adaptive-min", type=float, default=None,
+                    help="curvature-adaptive refinement: smallest edge (m) at tight curvature; --edge/--adaptive-max is the largest")
+    ap.add_argument("--adaptive-max", type=float, default=None, help="largest edge (m) of the adaptive range (default --edge)")
+    ap.add_argument("--adaptive-tol", type=float, default=None, help="chord-error tolerance in meters (default adaptive-min/4)")
+    ap.add_argument("--adaptive-grade", type=float, default=0.4, help="max size change per unit distance (default 0.4)")
     ap.add_argument("--relax-iters", type=int, default=0, help="global Laplacian relaxation steps after the resample")
     ap.add_argument("--no-gpu", action="store_true", help="force the CPU (open3d) distance queries")
     ap.add_argument("--gap-closure", type=float, default=0.0, help="seal leaks up to ~2x this when dropping interiors (m)")
@@ -1344,7 +1536,9 @@ def _main():
         m.apply_scale(a.scale)
     r = remesh_surface(m, a.edge, max_faces=a.max_faces, workers=a.workers,
                        wrap_resolution=a.wrap_res, wrap_offset=a.wrap_offset, gap_closure=a.gap_closure,
-                       snap_offset=a.snap_offset, feature_angle=a.feature_angle, relax_iters=a.relax_iters)
+                       snap_offset=a.snap_offset, relax_iters=a.relax_iters,
+                       adaptive_min_edge=a.adaptive_min, adaptive_max_edge=a.adaptive_max, adaptive_tol=a.adaptive_tol,
+                       adaptive_grade=a.adaptive_grade)
     if a.output.endswith(".npz"):
         np.savez(a.output, v=np.asarray(r.vertices), f=np.asarray(r.faces))
     else:

@@ -688,7 +688,7 @@ def prep_inputs(input_file):
     # Independent of the mesh used for voxelization; gaps/open shells are left alone.
     remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
     if remesh_cfg.get("enabled", False) and str(jsonfile.get("settings", {}).get("surfaceField", "")).strip():
-        from xlb.utils.surface_remesh import remesh_surface_isolated
+        from xlb.utils.surface_remesh import remesh_surface_isolated, adaptive_kwargs
         try:
             wrap_cfg = remesh_cfg.get("wrap", {})
             wrap_on = wrap_cfg.get("enabled", False)
@@ -697,9 +697,6 @@ def prep_inputs(input_file):
                 # meters; with the wrap on and no targetEdge, the wrapped mesh is used as-is
                 target_edge=remesh_cfg.get("targetEdge", None if wrap_on else voxel_size),
                 max_faces=remesh_cfg.get("maxFaces"),
-                # degrees; recovers the CAD's sharp edges in the export mesh. Omit/null/false to disable.
-                feature_angle=(lambda v: float(v) if v is not None and v is not False and float(v) > 0 else None)(
-                    remesh_cfg.get("featureAngle")),
                 wrap_resolution=wrap_cfg.get("resolution", voxel_size / 2) if wrap_on else None,
                 wrap_offset=wrap_cfg.get("offset") if wrap_on else None,
                 gap_closure=wrap_cfg.get("gapClosure", 0.0) if wrap_on else 0.0,
@@ -710,6 +707,8 @@ def prep_inputs(input_file):
                 relax_iters=int(wrap_cfg.get("relaxIterations", 3)) if wrap_on else 0,
                 # GPU (Warp) distance queries when available; false forces the CPU path
                 use_gpu=bool(remesh_cfg.get("useGpu", True)),
+                # finer triangles where the wrapped surface curves tightly (see surfaceRemesh.curvatureAdaptive)
+                **adaptive_kwargs(remesh_cfg.get("curvatureAdaptive")),
             )
             if wrap_on:
                 # closed shell with outward winding: safe for the outward-only surface-field sampling
@@ -957,6 +956,40 @@ def prep_inputs(input_file):
 
 # Mesh Generation Functions
 # =========================
+def resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh):
+    """
+    ``shell_factors`` for the surface-field mapping: probe 1.5 voxels out along the vertex normal, plus
+    ``settings.surfaceProbeExtra``.
+
+    The probe is measured from the export vertex, so pulling the remeshed surface toward the CAD (snapOffset)
+    also pulls every probe point toward the wall, where the fluid cells are less reliable (solid-masked and
+    boundary-layer cells). ``surfaceProbeExtra`` moves the probes back out:
+
+      "auto" (default)  wrap offset - snap offset, i.e. exactly the distance the snap removed, so probes
+                        sit where they did before the snap; 0 if no wrap/snap ran
+      a number (m)      explicit extra distance added to the 1.5 * voxel base; 0 gives the old behaviour
+    """
+    st = jsonfile.get("settings", {})
+    rm = st.get("surfaceRemesh", {})
+    wrap = rm.get("wrap", {})
+    val = st.get("surfaceProbeExtra", "auto")
+    extra = 0.0
+    if isinstance(val, str) and val.strip().lower() == "auto":
+        if surface_mesh.metadata.get("outward_normals", False):          # the wrap ran
+            res = float(wrap.get("resolution", voxel_size / 2))
+            woff = float(wrap.get("offset") or 0.75 * res)
+            so = wrap.get("snapOffset")
+            so = float(so) if (so is not None and so is not False and float(so) >= 0) else None
+            if so is not None:
+                extra = max(0.0, woff - so)
+    else:
+        extra = float(val)
+    factor = 1.5 + extra / voxel_size
+    print(f" Surface probe: {factor * voxel_size * 1000:.1f} mm from each vertex "
+          f"(1.5 x voxel + {extra * 1000:.1f} mm extra; surfaceProbeExtra={val!r})")
+    return (factor,)
+
+
 def resolve_surface_side_selector(jsonfile, surface_mesh):
     """
     Side-selection mode for the surface-field mapping.
@@ -978,7 +1011,7 @@ def resolve_surface_side_selector(jsonfile, surface_mesh):
 
 
 def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile):
-    
+
     # Compute bounds on full car
     min_bound = car_mesh.vertices.min(axis=0)
     max_bound = car_mesh.vertices.max(axis=0)
@@ -3054,7 +3087,7 @@ def solve(
                 component=None,
                 keep_state=True,
                 sample_dx=voxel_size,
-                shell_factors=(1.50, ),
+                shell_factors=resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh_for_vtk),
                 k=8,
                 power=2.0,
                 max_distance=2.0 * voxel_size,
@@ -3068,7 +3101,7 @@ def solve(
                 usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
                 side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
-            scm_results_available() 
+            scm_results_available()
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
             filename = os.path.join(output_dir, f"average_iso")
@@ -3083,7 +3116,7 @@ def solve(
                     grid_resolution=jsonfile['settings']['isoGrid'],
                     lengthScale=jsonfile['settings']['isoScale']
                 )
-            scm_results_available() 
+            scm_results_available()
         scm_progress(95)
         print(f"Progress 95%")
         jsonfile['results'] ={}
@@ -3187,7 +3220,7 @@ def solve(
                 component=None,
                 keep_state=True,
                 sample_dx=voxel_size,
-                shell_factors=(1.50, ),
+                shell_factors=resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh_for_vtk),
                 k=8,
                 power=2.0,
                 max_distance=2.0 * voxel_size,
@@ -3201,7 +3234,7 @@ def solve(
                 usd_cmap=jsonfile['settings']['surfaceFieldColorMap'],
                 side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
-            scm_results_available() 
+            scm_results_available()
 
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
