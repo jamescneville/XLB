@@ -34,11 +34,9 @@ Builds the mesh used for the **USD/VTK surface-field export**. Nothing else uses
 | `curvatureAdaptive.minEdge` (m) | `maxEdge / 2` | Smallest edge at tight curvature. Below about the wrap resolution it cannot add real detail. |
 | `curvatureAdaptive.tolerance` (m) | `minEdge / 4` | Chord error: an edge on a radius R is kept under `sqrt(8 * tolerance * R)`. Larger means fewer refined areas. |
 | `curvatureAdaptive.gradation` | `0.4` | Largest size change per unit distance. Smaller means smoother size transitions and more triangles. |
-| `useGpu` | `true` | GPU (Warp) distance queries; falls back to CPU automatically. `false` forces CPU. |
 | `wrap.enabled` | off | Turns on the boundary wrap. |
 | `wrap.resolution` (m) | `voxelSize / 2` | Wrap grid cell size. |
 | `wrap.offset` (m) | 0.75 × resolution | How far outside the CAD the wrap sits. Needs to be at least about 0.5 × resolution. |
-| `wrap.gapClosure` (m) | `0` (off) | Seals leaks up to about twice this when deciding what is interior. |
 | `wrap.snapOffset` (m) | off (missing, `null`, `false` or negative) | Stand-off from the CAD after the snap. |
 | `wrap.relaxIterations` | `3` | Global relax steps (0 disables). |
 
@@ -48,7 +46,6 @@ Related setting, outside `surfaceRemesh`:
 |---|---|---|
 | `settings.surfaceSideSelector` | `velocity` | `velocity`, `outward` (probe the +normal side only) or `outward_check` (velocity selection plus a report of how often it disagrees with the normals). The outward modes need the wrap to have run, otherwise they fall back to `velocity` with a warning. |
 
-Other switches: environment variable `XLB_SURFACE_GPU=0` and the CLI flag `--no-gpu` force the CPU path.
 
 ### Curvature-adaptive refinement
 
@@ -60,7 +57,7 @@ The uniform resample is made at `maxEdge`; edges are then split where the wrap's
 
 `maxFaces` doubles as a budget: if the sizing field would give more triangles than that, `tolerance` is raised until it fits (the log says so).
 
-GPU: curvature, sizing, gradation, smoothing, projection and size lookup run in Warp. Splits and flips are vectorised numpy because they are irregular. A CPU fallback gives the same meshes to within a few percent.
+GPU: curvature, sizing, gradation, smoothing, projection and size lookup run in Warp. Splits and flips are vectorised numpy because they are irregular. The remesh needs Warp and a CUDA device; if either is missing it raises, and the solver carries on with the raw surface mesh (and prints a warning).
 
 GTU, wrap 4 mm / offset 3 mm, snap 1 mm (uniform 8 mm = 2.45M triangles, 55 s):
 
@@ -95,7 +92,6 @@ It concentrates triangles along creases and curved edges and leaves flat panels 
 |---|---|
 | Original CPU | 304 s (with feature recovery, since removed) |
 | GPU (current) | 70 s |
-| CPU fallback (current code) | 185 s |
 
 Current GPU stage breakdown: weld 9 s, wrap 25 s (of which mesh extraction about 10 s), shell split 4 s, clustering 10 s, project and assemble about 1 s, relax 6 s, snap under 1 s.
 
@@ -111,7 +107,6 @@ Quality of the current GPU pipeline versus the original slow one (equivalent): w
 - Convex edges round by roughly the offset.
 - Resolution is uniform, with no adaptivity; memory grows with the cube of extent over resolution.
 - Manifoldness is **not guaranteed**: the final GTU mesh had 6 boundary and 88 non-manifold edges out of 3.7M, and 0.01% of faces flipped. Normals point away from the CAD on about 99.99% of faces.
-- **`gapClosure` is effectively unusable as it stands:** slow (255–1,100 s), it trimmed only 6–22% of the area, and it bridged surfaces up to 30 mm off the CAD. It also can't tell real engine-bay flow passages from leaks.
 
 ### Resample, relax, snap
 - pyacvd has no awareness of creases or sharp edges.
@@ -119,7 +114,7 @@ Quality of the current GPU pipeline versus the original slow one (equivalent): w
 - Snapping cannot recover detail the wrap already merged, so the sharp-edge p90 stays around 5 mm. Sharp edges are no longer re-created separately: feature recovery was tried and removed. The curvature-adaptive refinement only puts more triangles where the wrap curves.
 
 ### Operational
-- The GPU path was tested with PyPI Warp 1.17 on Windows only. The server uses the Warp fork bundled with Neon; a start-up self-test falls back to CPU and logs why if anything fails.
+- The GPU path was tested with PyPI Warp 1.17 on Windows only. The server uses the Warp fork bundled with Neon. There is no CPU fallback and no self-test: check that the log line `GPU: Warp ..., cuda:0` appears. If a kernel fails the remesh raises and the solver uses the raw surface mesh.
 - The remesh runs before the simulation, so it delays startup by about 70 s (GPU) with no caching between runs.
 - Validation rests on my own metrics and a few renders; there are no unit tests in the repo.
 
@@ -129,7 +124,6 @@ Quality of the current GPU pipeline versus the original slow one (equivalent): w
 
 ### Wrap and speed
 - A signed field from the flood fill would allow a small offset on a coarse grid.
-- Do gap closure on a coarser, GPU-accelerated grid.
 - Use Warp's marching cubes instead of the block-by-block VTK loop, and skip welding when the input is already welded.
 - **Run the remesh in the background while the simulation runs.** The mesh is only needed at export time, so the startup delay could disappear.
 - Cache results by an input-and-options hash, stored outside the run folder that gets wiped.

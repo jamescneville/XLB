@@ -700,14 +700,11 @@ def prep_inputs(input_file):
                 max_faces=remesh_cfg.get("maxFaces"),
                 wrap_resolution=wrap_cfg.get("resolution", voxel_size / 2) if wrap_on else None,
                 wrap_offset=wrap_cfg.get("offset") if wrap_on else None,
-                gap_closure=wrap_cfg.get("gapClosure", 0.0) if wrap_on else 0.0,
                 # meters; pulls the wrapped mesh back toward the original CAD (sharper edges). Omit to disable.
                 snap_offset=(lambda v: float(v) if v is not None and v is not False and float(v) >= 0 else None)(
                     wrap_cfg.get("snapOffset")) if wrap_on else None,
                 # global relaxation steps after the resample; evens out triangle shape (0 disables)
                 relax_iters=int(wrap_cfg.get("relaxIterations", 3)) if wrap_on else 0,
-                # GPU (Warp) distance queries when available; false forces the CPU path
-                use_gpu=bool(remesh_cfg.get("useGpu", True)),
                 # finer triangles where the wrapped surface curves tightly (see surfaceRemesh.curvatureAdaptive)
                 **adaptive_kwargs(remesh_cfg.get("curvatureAdaptive")),
             )

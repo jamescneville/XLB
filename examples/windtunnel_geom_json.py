@@ -77,11 +77,9 @@ def build_surface_mesh(jsonfile, proj_path, output_dir, voxel_size):
                 max_faces=remesh_cfg.get("maxFaces"),
                 wrap_resolution=wrap_cfg.get("resolution", voxel_size / 2) if wrap_on else None,
                 wrap_offset=wrap_cfg.get("offset") if wrap_on else None,
-                gap_closure=wrap_cfg.get("gapClosure", 0.0) if wrap_on else 0.0,
                 snap_offset=(lambda v: float(v) if v is not None and v is not False and float(v) >= 0 else None)(
                     wrap_cfg.get("snapOffset")) if wrap_on else None,
                 relax_iters=int(wrap_cfg.get("relaxIterations", 3)) if wrap_on else 0,
-                use_gpu=bool(remesh_cfg.get("useGpu", True)),
                 # finer triangles where the wrapped surface curves tightly (see surfaceRemesh.curvatureAdaptive)
                 **adaptive_kwargs(remesh_cfg.get("curvatureAdaptive")),
             )
