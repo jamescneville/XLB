@@ -2,7 +2,9 @@
 Geometry-only variant of windtunnel_json.py: same input json, same output files, no solve.
 
 It loads the CAD, runs the surfaceRemesh (wrap / resample / curvature-adaptive / snap) exactly like the solver does,
-then writes the surface-field .usda with a DUMMY field in place of the mapped solution, plus Results.json with
+then writes the surface-field .usda with a DUMMY field in place of the mapped solution, the tufts .usda
+(settings.surfaceTufts; synthetic near-wall velocity: attached on front/sides, reversed + swirling on rear-facing
+surfaces, so the colouring and direction can be judged without a solve), plus Results.json with
 placeholder numbers, so the downstream load (Alias / VRED) behaves as it does after a real run.
 
     XLB_FAST_MATH=1 python3 examples/windtunnel_geom_json.py -i examples/cfd/stl-files/project.json
@@ -63,7 +65,8 @@ def build_surface_mesh(jsonfile, proj_path, output_dir, voxel_size):
 
     # --- same remesh block as windtunnel_json.prep_inputs ---
     remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
-    if remesh_cfg.get("enabled", False) and str(jsonfile.get("settings", {}).get("surfaceField", "")).strip():
+    if remesh_cfg.get("enabled", False) and (
+            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or wt.surface_tufts_enabled(jsonfile)):
         from xlb.utils.surface_remesh import remesh_surface_isolated, adaptive_kwargs
         try:
             wrap_cfg = remesh_cfg.get("wrap", {})
@@ -95,6 +98,69 @@ def dummy_surface_field(mesh, clim):
     n = np.asarray(mesh.vertex_normals, dtype=np.float64)
     t = 0.5 - 0.5 * n[:, 0]            # flow is +x: a normal facing -x (upstream) is the stagnation side
     return (clim[0] + (clim[1] - clim[0]) * t).astype(np.float32)
+
+
+def dummy_tuft_velocity(u_inf):
+    """
+    Synthetic near-wall velocity for tuft previews: returns sample_velocity(points, base_points, normals).
+
+    Front and side surfaces: flow slides along the surface (tangent projection of +x), faster where the surface is
+    edge-on, ~0 at the stagnation point. Rear-facing surfaces (normal.x > 0) get a separated-looking field:
+    reversed, lifting off the wall, with a cross-stream swirl that varies in space.
+    """
+    xhat = np.array([1.0, 0.0, 0.0])
+
+    def sample(points, base_points, normals):
+        n = np.asarray(normals, dtype=np.float64)
+        p = np.asarray(points, dtype=np.float64)
+        tang = xhat[None, :] - n[:, :1] * n          # +x projected onto the wall plane
+        tn = np.linalg.norm(tang, axis=1, keepdims=True)
+        d = tang / np.maximum(tn, 1e-9)
+        w = np.clip(n[:, :1] / 0.5, 0.0, 1.0)         # 0 = attached, 1 = fully separated
+        attached = 1.3 * u_inf * tang
+        swirl = np.cross(n, d) * (0.5 * u_inf * np.sin(60.0 * p[:, 2:3] + 40.0 * p[:, 1:2]))
+        separated = -0.35 * u_inf * d + 0.4 * u_inf * n + swirl
+        return (1.0 - w) * attached + w * separated, np.ones(len(p), dtype=bool)
+
+    return sample
+
+
+def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
+    """Tufts from the dummy field, same file name / options / colouring as the solver's surfaceTufts export."""
+    cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
+    if not wt.surface_tufts_enabled(jsonfile):
+        return
+    if not surface_mesh.metadata.get("outward_normals", False):
+        print(" WARNING: surfaceTufts needs surfaceRemesh.wrap to have run (outward normals); skipping tufts.")
+        return
+    from xlb.utils.tufts import build_tufts
+    from xlb.utils.mesher import MultiresIO
+
+    length = float(cfg.get("length", 0.025))
+    if length < 3.0 * voxel_size:
+        print(f" WARNING: tuft length {length * 1000:.1f} mm is under 3 voxels ({3 * voxel_size * 1000:.1f} mm).")
+    probe_height = wt.resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh)[0] * voxel_size
+    u_inf = float(jsonfile.get("InletBC", {}).get("x", 1.0))
+    shape = str(cfg.get("shape", "tube"))
+    writer = MultiresIO.__new__(MultiresIO)          # normals + USD writer need no grid
+    normals = writer._repair_and_smooth_vertex_normals(surface_mesh)
+    tape_args = wt.tuft_tape_args(jsonfile)
+    verts, faces, n, speed, tape = build_tufts(
+        np.asarray(surface_mesh.vertices, dtype=np.float64), np.asarray(surface_mesh.faces, dtype=np.int64),
+        normals, dummy_tuft_velocity(u_inf),
+        spacing=float(cfg.get("spacing", 0.03)), length=length, width=float(cfg.get("width", 0.0015)),
+        probe_height=probe_height, shape=shape, root_inset=float(cfg.get("rootInset", 0.0008)),
+        max_tufts=int(cfg.get("maxTufts", 150000)), tape_size=tape_args["tape_size"], tape_offset=tape_args["tape_offset"],
+        **wt.tuft_shape_limits(jsonfile),
+    )
+    if n == 0:
+        print(" No tufts generated.")
+        return
+    path = os.path.join(output_dir, f"{jsonfile['outputName']}_tufts.usda")
+    writer._write_tufts_usd(path, verts, faces, speed, tape=tape, tape_color=tape_args["tape_color"],
+                            **wt.tuft_color_args(jsonfile))
+    print(f" {n:,} dummy tufts ({shape}) written to {path}")
+    wt.scm_results_available()
 
 
 def run(input_file):
@@ -144,6 +210,14 @@ def run(input_file):
             clim=clim,
         )
         wt.scm_results_available()
+
+    # --- tufts from a synthetic near-wall velocity ---
+    try:
+        write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f" WARNING: dummy tufts failed ({e}); continuing.")
 
     # --- placeholder Results.json (same structure as the solver's) ---
     targets = jsonfile.get('vehicle', {}).get('targets', {})

@@ -2951,8 +2951,17 @@ class MultiresIO(object):
         up_axis="Z",
         meters_per_unit=1.0,
         prim_name="surface",
+        double_sided=False,
+        emissive=0.0,
+        append=False,
     ):
         """Write a triangle mesh + scalar fields to an OpenUSD ASCII (.usda) file.
+
+        With ``uniform_color`` (and no ``color_field``) the mesh also gets a constant-colour
+        ``UsdPreviewSurface`` material (``emissive`` is the fraction of the colour added as
+        emission), since VRED/Alias ignore ``displayColor``. ``double_sided`` marks the mesh
+        two-sided (thin ribbons / tubes). ``append=True`` adds this mesh as another top-level prim
+        to an existing file (no header) instead of overwriting it.
 
         Mirrors :meth:`_write_polydata_vtk` but emits USD that Autodesk VRED (and
         other USD-aware tools) imports natively. Every entry in ``point_data`` /
@@ -2984,12 +2993,15 @@ class MultiresIO(object):
             return ("_" + s) if (not s or s[0].isdigit()) else s
 
         buf = io.StringIO()
-        buf.write("#usda 1.0\n")
-        buf.write("(\n")
-        buf.write(f'    defaultPrim = "{prim_name}"\n')
-        buf.write(f"    metersPerUnit = {float(meters_per_unit)}\n")
-        buf.write(f'    upAxis = "{up_axis}"\n')
-        buf.write(")\n\n")
+        if append:
+            buf.write("\n")
+        else:
+            buf.write("#usda 1.0\n")
+            buf.write("(\n")
+            buf.write(f'    defaultPrim = "{prim_name}"\n')
+            buf.write(f"    metersPerUnit = {float(meters_per_unit)}\n")
+            buf.write(f'    upAxis = "{up_axis}"\n')
+            buf.write(")\n\n")
 
         buf.write(f'def Mesh "{prim_name}"\n')
         buf.write("{\n")
@@ -2999,6 +3011,8 @@ class MultiresIO(object):
         buf.write(f"    int[] faceVertexIndices = [{self._usd_scalar_array(faces.ravel(), fmt='%d')}]\n")
         buf.write(f"    point3f[] points = [{self._usd_vec_array(vertices, 3)}]\n")
         buf.write('    uniform token subdivisionScheme = "none"\n')
+        if double_sided:
+            buf.write("    uniform bool doubleSided = true\n")
 
         # Colour from the chosen scalar field, baked as a colormap texture +
         # per-vertex UVs + a UsdPreviewSurface material (what VRED renders), plus
@@ -3052,6 +3066,7 @@ class MultiresIO(object):
             buf.write(f"    color3f[] primvars:displayColor = [({r:.6g}, {g:.6g}, {b:.6g})] (\n")
             buf.write('        interpolation = "constant"\n')
             buf.write("    )\n")
+            buf.write(f"    rel material:binding = </{prim_name}/Material>\n")
 
         # Raw scalar/vector primvars (point data -> vertex, cell data -> uniform).
         for interp, data, expected in (("vertex", point_data, n_verts), ("uniform", cell_data, n_faces)):
@@ -3100,10 +3115,26 @@ class MultiresIO(object):
             buf.write("            float2 outputs:result\n")
             buf.write("        }\n")
             buf.write("    }\n")
+        elif uniform_color is not None:
+            buf.write(f'    def Material "Material"\n')
+            buf.write("    {\n")
+            buf.write("        token outputs:surface.connect = "
+                      f"</{prim_name}/Material/Shader.outputs:surface>\n")
+            buf.write('        def Shader "Shader"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdPreviewSurface"\n')
+            buf.write(f"            color3f inputs:diffuseColor = ({r:.6g}, {g:.6g}, {b:.6g})\n")
+            buf.write(f"            color3f inputs:emissiveColor = "
+                      f"({r * emissive:.4g}, {g * emissive:.4g}, {b * emissive:.4g})\n")
+            buf.write("            float inputs:roughness = 0.8\n")
+            buf.write("            float inputs:metallic = 0\n")
+            buf.write("            token outputs:surface\n")
+            buf.write("        }\n")
+            buf.write("    }\n")
 
         buf.write("}\n")
 
-        with open(usd_filename, "w") as f:
+        with open(usd_filename, "a" if append else "w") as f:
             f.write(buf.getvalue())
 
         print(f"\tUSD surface ({n_verts:,} verts, {n_faces:,} tris) written to {usd_filename}")
@@ -3389,6 +3420,122 @@ class MultiresIO(object):
                 export_debug_arrays=export_debug_arrays,
             )
    
+    def to_surface_tufts_time_average(
+        self,
+        output_filename,
+        surface_mesh,
+        probe_height,
+        sample_dx=None,
+        keep_state=True,
+        bc_mask=None,
+        spacing=0.03,
+        length=0.025,
+        width=0.0015,
+        shape="tube",
+        color=(1.0, 0.45, 0.0),
+        cmap="turbo",
+        clim=None,
+        tape_size=0.010,
+        tape_color=(0.2, 0.55, 1.0),
+        tape_offset=0.0005,
+        max_elevation_deg=35.0,
+        max_push=None,
+        root_inset=0.0008,
+        max_tufts=150000,
+        k=8,
+        power=2.0,
+        half_space_tolerance=0.15,
+        seed=0,
+    ):
+        """Write flow tufts (tube/ribbon triangle meshes) for the time-averaged near-wall velocity.
+
+        ``surface_mesh`` should be the remeshed export surface with outward normals (the boundary
+        wrap). Velocity is sampled with inverse-distance weighting over fluid cells only, at
+        ``probe_height`` above the surface (the same distance as the surface-field probe).
+        """
+        from xlb.utils.tufts import build_tufts
+
+        tic = time.perf_counter()
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+        vel_keys = sorted(
+            (kk for kk in avg_fields if kk.startswith("velocity_")),
+            key=lambda kk: int(kk.rsplit("_", 1)[1]),
+        )
+        if len(vel_keys) < 3:
+            raise KeyError("surface tufts need the averaged velocity_0..2 fields")
+        vel = np.stack([np.asarray(avg_fields[kk], dtype=np.float32) for kk in vel_keys[:3]], axis=1)
+
+        centroids = self.centroids
+        if bc_mask is not None:
+            solid = self._solid_mask_from_fields_data(self.get_fields_data({"bc_mask": bc_mask}))
+            fluid = ~np.asarray(solid, dtype=bool)
+            if not fluid.any():
+                raise ValueError("solid mask excludes all cells; no fluid data to sample.")
+            centroids = np.ascontiguousarray(centroids[fluid])
+            vel = np.ascontiguousarray(vel[fluid])
+        tree = cKDTree(centroids)
+        if sample_dx is None:
+            sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
+        sample_dx = float(sample_dx)
+        max_distance = 3.0 * sample_dx
+        kk = min(int(k), len(centroids))
+
+        def sample_velocity(points, base_points, normals):
+            d, idx = tree.query(np.asarray(points, dtype=np.float32), k=kk, workers=-1)
+            if kk == 1:
+                d, idx = d[:, None], idx[:, None]
+            signed = np.einsum("qki,qi->qk", centroids[idx] - base_points[:, None, :], normals)
+            valid = (signed >= -half_space_tolerance * sample_dx) & (d <= max_distance)
+            ok = valid.any(axis=1)
+            w = 1.0 / np.maximum(d, 1e-12) ** float(power)
+            w = np.where(ok[:, None], w * valid, w)
+            v = np.einsum("qk,qkj->qj", w, vel[idx]) / np.maximum(w.sum(axis=1), 1e-20)[:, None]
+            return v, ok
+
+        mesh_v = np.asarray(surface_mesh.vertices, dtype=np.float64)
+        mesh_f = np.asarray(surface_mesh.faces, dtype=np.int64)
+        normals = self._repair_and_smooth_vertex_normals(surface_mesh)
+        verts, faces, n_tufts, speed, tape = build_tufts(
+            mesh_v, mesh_f, normals, sample_velocity,
+            spacing=spacing, length=length, width=width, probe_height=probe_height,
+            shape=shape, root_inset=root_inset, max_tufts=max_tufts, seed=seed, tape_size=tape_size,
+            tape_offset=tape_offset, max_elevation_deg=max_elevation_deg, max_push=max_push,
+        )
+        if n_tufts == 0:
+            print("\tNo tufts generated; nothing written.")
+            return None
+        usd_filename = self._write_tufts_usd(output_filename, verts, faces, speed, color, cmap=cmap, clim=clim,
+                                             tape=tape, tape_color=tape_color)
+        print(f"\t{n_tufts:,} tufts ({shape}) written in {time.perf_counter() - tic:0.1f} seconds")
+        return usd_filename
+
+    def _write_tufts_usd(self, output_filename, verts, faces, speed, color, cmap="turbo", clim=None,
+                         tape=None, tape_color=(0.2, 0.55, 1.0)):
+        """Tuft triangles to USD: ``color`` is an RGB triple (constant) or ``"velocity"`` (near-wall speed via ``cmap``/``clim``).
+
+        ``tape`` = (verts, faces) adds the root tape patches as a second prim with a constant-colour material.
+        """
+        usd_filename = output_filename if output_filename.endswith(".usda") else output_filename + ".usda"
+        if isinstance(color, str):
+            if color.strip().lower() != "velocity":
+                raise ValueError(f"surfaceTufts.color must be [r, g, b] or 'velocity', got {color!r}")
+            self._write_polydata_usd(
+                usd_filename, verts, faces,
+                point_data={"velocity_magnitude": speed}, color_field="velocity_magnitude",
+                cmap=cmap, clim=clim, prim_name="tufts", double_sided=True,
+            )
+        else:
+            self._write_polydata_usd(
+                usd_filename, verts, faces,
+                uniform_color=color, prim_name="tufts", double_sided=True, emissive=0.15,
+            )
+        if tape is not None and len(tape[0]):
+            self._write_polydata_usd(
+                usd_filename, tape[0], tape[1],
+                uniform_color=tape_color, prim_name="tape", double_sided=True, append=True,
+            )
+        return usd_filename
+
     def _solid_mask_from_fields_data(self, fields_data, bc_mask_key="bc_mask_0"):
         """Per-cell bool mask (True == solid) from an extracted bc_mask field."""
         from xlb.cell_type import BC_SOLID

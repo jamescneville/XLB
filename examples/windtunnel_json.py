@@ -687,7 +687,8 @@ def prep_inputs(input_file):
     # Optional: resample the surface-field (USD/VTK) mesh to a uniform edge length.
     # Independent of the mesh used for voxelization; gaps/open shells are left alone.
     remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
-    if remesh_cfg.get("enabled", False) and str(jsonfile.get("settings", {}).get("surfaceField", "")).strip():
+    if remesh_cfg.get("enabled", False) and (
+            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or surface_tufts_enabled(jsonfile)):
         from xlb.utils.surface_remesh import remesh_surface_isolated, adaptive_kwargs
         try:
             wrap_cfg = remesh_cfg.get("wrap", {})
@@ -1008,6 +1009,85 @@ def resolve_surface_side_selector(jsonfile, surface_mesh):
               f"(reliable outward normals); using 'velocity'.")
         return "velocity"
     return sel
+
+
+def surface_tufts_enabled(jsonfile):
+    return bool(jsonfile.get("settings", {}).get("surfaceTufts", {}).get("enabled", False))
+
+
+def tuft_color_args(jsonfile):
+    """
+    ``color`` / ``cmap`` / ``clim`` for the tuft USD from settings.surfaceTufts:
+      color     [r, g, b] constant (default) or "velocity" (near-wall speed through the colormap)
+      colorMap  matplotlib colormap for "velocity" (default: surfaceFieldColorMap, else turbo)
+      velocityMin / velocityMax   colour range (default: 0 .. InletBC.x * slices.velocityFactor, as for the velocity slices)
+    """
+    st = jsonfile.get("settings", {})
+    cfg = st.get("surfaceTufts", {})
+    color = cfg.get("color", (1.0, 0.45, 0.0))
+    if isinstance(color, str):
+        vmax_default = float(jsonfile.get("InletBC", {}).get("x", 1.0)) * float(jsonfile.get("slices", {}).get("velocityFactor", 1.5))
+        clim = (float(cfg.get("velocityMin", 0.0)), float(cfg.get("velocityMax", vmax_default)))
+        return dict(color=color, cmap=cfg.get("colorMap", st.get("surfaceFieldColorMap", "turbo")), clim=clim)
+    return dict(color=tuple(float(c) for c in color), cmap="turbo", clim=None)
+
+
+def tuft_shape_limits(jsonfile):
+    """settings.surfaceTufts.maxElevation (deg above the wall, default 35) and maxPush (m out of the body, default half a segment)."""
+    cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
+    mp = cfg.get("maxPush")
+    return dict(max_elevation_deg=float(cfg.get("maxElevation", 35.0)),
+                max_push=None if mp is None else float(mp))
+
+
+def tuft_tape_args(jsonfile):
+    """settings.surfaceTufts.tape (default true), tapeSize (m, default 0.010; 0 = no tape), tapeColor (default light blue)."""
+    cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
+    on = bool(cfg.get("tape", True))
+    return dict(tape_size=float(cfg.get("tapeSize", 0.010)) if on else 0.0,
+                tape_offset=float(cfg.get("tapeOffset", 0.0005)),
+                tape_color=tuple(float(c) for c in cfg.get("tapeColor", (0.2, 0.55, 1.0))))
+
+
+def export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh, voxel_size, output_dir):
+    """
+    Flow tufts on the export surface (settings.surfaceTufts), written to <outputName>_tufts.usda.
+    Cosmetic: a failure is reported and the run carries on. Needs the surfaceRemesh wrap for outward normals.
+    """
+    cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
+    if not cfg.get("enabled", False):
+        return
+    try:
+        if not surface_mesh.metadata.get("outward_normals", False):
+            print(" WARNING: surfaceTufts needs surfaceRemesh.wrap to have run (outward normals); skipping tufts.")
+            return
+        length = float(cfg.get("length", 0.025))
+        if length < 3.0 * voxel_size:
+            print(f" WARNING: tuft length {length * 1000:.1f} mm is under 3 voxels ({3 * voxel_size * 1000:.1f} mm); "
+                  f"near-wall velocity is not resolved at that scale, so the tufts will mostly show noise.")
+        probe_height = resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh)[0] * voxel_size
+        h5exporter.to_surface_tufts_time_average(
+            output_filename=os.path.join(output_dir, f"{jsonfile['outputName']}_tufts"),
+            surface_mesh=surface_mesh,
+            probe_height=probe_height,
+            sample_dx=voxel_size,
+            keep_state=True,
+            bc_mask=sim.bc_mask,
+            spacing=float(cfg.get("spacing", 0.03)),
+            length=length,
+            width=float(cfg.get("width", 0.0015)),
+            shape=str(cfg.get("shape", "tube")),
+            **tuft_color_args(jsonfile),
+            **tuft_tape_args(jsonfile),
+            **tuft_shape_limits(jsonfile),
+            root_inset=float(cfg.get("rootInset", 0.0008)),
+            max_tufts=int(cfg.get("maxTufts", 150000)),
+        )
+        scm_results_available()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f" WARNING: surface tufts failed ({e}); continuing without them.")
 
 
 def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile):
@@ -3102,6 +3182,7 @@ def solve(
                 side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
             scm_results_available()
+        export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir)
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
             filename = os.path.join(output_dir, f"average_iso")
@@ -3235,6 +3316,7 @@ def solve(
                 side_selector=resolve_surface_side_selector(jsonfile, surface_mesh_for_vtk),
             )
             scm_results_available()
+        export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir)
 
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
