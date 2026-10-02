@@ -20,6 +20,10 @@ Flow tufts on the export surface: short filaments, tubes or ribbons, rooted on t
 | `velocityMin` / `velocityMax` | `0` / `InletBC.x * slices.velocityFactor` | Colour range for `"velocity"` (same default as the velocity slices). |
 | `tape` | `true` | Set `false` to leave the tape off (same as `tapeSize` 0). |
 | `tapeSize` (m) | `0.010` | Square tape patch at each root (0 = none), lying on the surface with its normal along the surface normal. Aligned with the tuft's first segment, root a quarter of the way in from the downstream edge. Written as a second prim, `tape`, in the same `.usda`. |
+| `followSurface` | `true` | Each joint uses the (smoothed) normal of the nearest surface vertices instead of the root's, so tufts wrap round lips and edges instead of leaving the surface. A tuft still higher above the local surface than the elevation cap allows is dropped. `false` gives the straight tangent-plane march. |
+| `maxNormalTurn` (deg) | `30` | Most the followed normal may change per segment (limits kinks near creases). |
+| `maxElevation` (deg) | `35` | Most a segment may rise above the wall. |
+| `maxPush` (m) | half a segment | A joint that needs pushing out of the body by more than this drops the tuft. |
 | `tapeOffset` (m) | `0.0005` | Height of the tape above the export surface, so it never coincides with it (z-fighting). |
 | `tapeColor` | `[0.2, 0.55, 1.0]` | Constant tape colour. |
 | `rootInset` (m) | `0.0008` | Sinks the root into the surface so it looks attached; the snapped wrap sits `snapOffset` off the CAD. |

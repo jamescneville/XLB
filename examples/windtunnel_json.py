@@ -1033,11 +1033,17 @@ def tuft_color_args(jsonfile):
 
 
 def tuft_shape_limits(jsonfile):
-    """settings.surfaceTufts.maxElevation (deg above the wall, default 35) and maxPush (m out of the body, default half a segment)."""
+    """
+    settings.surfaceTufts: maxElevation (deg above the wall, default 35), maxPush (m out of the body, default half a
+    segment), followSurface (default true: use the local surface normal along the tuft, so it wraps lips and edges)
+    and maxNormalTurn (deg per segment the followed normal may change, default 30).
+    """
     cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
     mp = cfg.get("maxPush")
     return dict(max_elevation_deg=float(cfg.get("maxElevation", 35.0)),
-                max_push=None if mp is None else float(mp))
+                max_push=None if mp is None else float(mp),
+                follow_surface=bool(cfg.get("followSurface", True)),
+                max_normal_turn_deg=float(cfg.get("maxNormalTurn", 30.0)))
 
 
 def tuft_tape_args(jsonfile):

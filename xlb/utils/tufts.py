@@ -81,13 +81,21 @@ def march_tufts(
     flow_dir=(1.0, 0.0, 0.0),
     max_elevation_deg=35.0,
     max_push=None,
+    follow_surface=False,
+    max_normal_turn_deg=30.0,
 ):
     """
-    March every tuft away from its root. Returns (P (T,nseg+1,3), keep (T,) bool, speed (T,nseg+1)).
+    March every tuft away from its root. Returns (P (T,nseg+1,3), keep (T,) bool, speed (T,nseg+1),
+    normals (T,nseg+1,3)).
 
-    Each segment is kept within ``max_elevation_deg`` of the root's tangent plane. A tuft whose joint needs
-    pushing out of the body by more than ``max_push`` (default half a segment) is dropped (``keep`` False)
-    rather than shoved out, which is what made tufts stand up in narrow grooves.
+    Each segment is kept within ``max_elevation_deg`` of the wall. A tuft whose joint needs pushing out of the
+    body by more than ``max_push`` (default half a segment) is dropped (``keep`` False) rather than shoved out,
+    which is what made tufts stand up in narrow grooves.
+
+    ``follow_surface``: instead of the root's normal for the whole chain, each joint uses the (inverse-distance
+    smoothed, turn-limited to ``max_normal_turn_deg`` per segment) normal of the nearest surface vertices, so
+    "along the wall", the elevation cap and the probe point all bend with the surface at lips and edges. A tuft
+    that still ends up higher above the local surface than the cap allows has left the surface and is dropped.
     """
     roots = np.asarray(roots, dtype=np.float64)
     nrm = np.asarray(normals, dtype=np.float64)
@@ -113,14 +121,34 @@ def march_tufts(
     fallback0 = np.where(np.linalg.norm(fallback0, axis=1, keepdims=True) < 1e-9,
                          _unit(np.cross(nrm, [0.0, 0.0, 1.0])), fallback0)
 
+    if follow_surface and surf_tree is None:
+        raise ValueError("follow_surface needs surface_vertices / surface_normals")
+    max_turn = np.radians(float(max_normal_turn_deg))
+    NL = np.repeat(nrm[:, None, :], nseg + 1, axis=1)
+
     prev_d = None
     prev_t = fallback0
     vref = None
     for i in range(nseg):
         p = P[:, i]
-        h = np.einsum("ij,ij->i", p - roots, nrm)
-        probe = p + nrm * np.maximum(0.0, probe_height - h)[:, None]
-        vel, ok = sample_velocity(probe, roots, nrm)
+        if follow_surface and i > 0:
+            dv, vi = surf_tree.query(p, k=4, workers=-1)
+            w = 1.0 / np.maximum(dv, 1e-4)
+            raw = _unit((surface_normals[vi] * w[:, :, None]).sum(axis=1), fallback=nl)
+            ang = np.arccos(np.clip(np.einsum("ij,ij->i", nl, raw), -1.0, 1.0))
+            a = np.minimum(1.0, max_turn / np.maximum(ang, 1e-9))
+            nl = _unit((1.0 - a)[:, None] * nl + a[:, None] * raw, fallback=nl)
+            base = surface_vertices[vi[:, 0]]
+            h = np.einsum("ij,ij->i", p - base, surface_normals[vi[:, 0]])
+            # higher above the local surface than the elevation cap allows: it left the surface
+            keep &= h <= i * ds * sin_cap + 2.0 * float(width) + 0.002
+        else:
+            nl = nrm
+            base = roots
+            h = np.einsum("ij,ij->i", p - roots, nrm)
+        NL[:, i] = nl
+        probe = p + nl * np.maximum(0.0, probe_height - h)[:, None]
+        vel, ok = sample_velocity(probe, base, nl)
         vel = np.asarray(vel, dtype=np.float64)
         speed = np.linalg.norm(vel, axis=1)
         S[:, i] = speed
@@ -129,8 +157,8 @@ def march_tufts(
             keep &= ok & (speed > 1e-3 * vref)
         tiny = 1e-3 * vref
 
-        un = np.einsum("ij,ij->i", vel, nrm)
-        ut = vel - un[:, None] * nrm
+        un = np.einsum("ij,ij->i", vel, nl)
+        ut = vel - un[:, None] * nl
         ut_mag = np.linalg.norm(ut, axis=1)
         good = ok & (ut_mag > tiny)
         t_hat = np.where(good[:, None], ut / np.maximum(ut_mag, 1e-20)[:, None], prev_t)
@@ -140,14 +168,14 @@ def march_tufts(
         floor = min(np.radians(4.0 + 11.0 * i / max(nseg - 1, 1)), cap)
         theta = np.arctan2(un, np.maximum(ut_mag, 1e-20))
         theta = np.clip(theta, floor, cap)
-        d_target = np.cos(theta)[:, None] * t_hat + np.sin(theta)[:, None] * nrm
+        d_target = np.cos(theta)[:, None] * t_hat + np.sin(theta)[:, None] * nl
         d = d_target if prev_d is None else _unit(stiffness * prev_d + (1.0 - stiffness) * d_target)
         # the blend can overshoot the cap; project back onto it
-        e = np.einsum("ij,ij->i", d, nrm)
+        e = np.einsum("ij,ij->i", d, nl)
         over = e > sin_cap
         if over.any():
-            tang = _unit(d - e[:, None] * nrm, fallback=t_hat)
-            d = np.where(over[:, None], cos_cap * tang + sin_cap * nrm, d)
+            tang = _unit(d - e[:, None] * nl, fallback=t_hat)
+            d = np.where(over[:, None], cos_cap * tang + sin_cap * nl, d)
         prev_d = d
 
         q = p + d * ds
@@ -160,7 +188,8 @@ def march_tufts(
         P[:, i + 1] = q
 
     S[:, nseg] = S[:, nseg - 1]
-    return P, keep, S
+    NL[:, nseg] = NL[:, nseg - 1]
+    return P, keep, S, NL
 
 
 def _taper(nseg):
@@ -173,7 +202,7 @@ def _frames(P, nrm):
     t[:, :-1] = P[:, 1:] - P[:, :-1]
     t[:, -1] = t[:, -2]
     t = _unit(t)
-    n_w = nrm[:, None, :]
+    n_w = nrm[:, None, :] if nrm.ndim == 2 else nrm  # (T,3) root normal or (T,J,3) per-joint normals
     a1 = np.cross(t, n_w)
     a1 = _unit(a1, fallback=_unit(np.cross(t, np.array([0.0, 0.0, 1.0]))))
     a2 = np.cross(t, a1)
@@ -277,6 +306,8 @@ def build_tufts(
     tape_offset=0.0005,
     max_elevation_deg=35.0,
     max_push=None,
+    follow_surface=False,
+    max_normal_turn_deg=30.0,
     log=print,
 ):
     """Roots on the surface -> marched chains -> tube/ribbon triangles.
@@ -303,27 +334,35 @@ def build_tufts(
     if len(roots) == 0:
         return empty
 
-    P, keep, S = march_tufts(
+    P, keep, S, NL = march_tufts(
         roots, nrm, sample_velocity,
         length=length, width=width, nseg=nseg, probe_height=probe_height, root_inset=root_inset,
         surface_vertices=vertices, surface_normals=vertex_normals, flow_dir=flow_dir,
         max_elevation_deg=max_elevation_deg, max_push=max_push,
+        follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg,
     )
-    log(f"\tTufts: dropped {int((~keep).sum()):,} (no usable flow, or pushed too far out of a groove); "
-        f"{int(keep.sum()):,} kept")
+    log(f"\tTufts: dropped {int((~keep).sum()):,} (no usable flow, pushed too far out of a groove"
+        f"{', or left the surface' if follow_surface else ''}); {int(keep.sum()):,} kept")
     roots = roots[keep]
-    P, nrm, S = P[keep], nrm[keep], S[keep]
+    P, nrm, S, NL = P[keep], nrm[keep], S[keep], NL[keep]
     if len(P) == 0:
         return empty
+    # how far the tips ended up above the local surface (a tuft lying at the elevation cap is length*sin(cap) up)
+    dv, vi = cKDTree(vertices).query(P[:, -1], k=1, workers=-1)
+    tip_h = np.einsum("ij,ij->i", P[:, -1] - vertices[vi], vertex_normals[vi])
+    log(f"\tTufts: tip height above the surface: median {np.median(tip_h) * 1000:.1f} mm, "
+        f"p99 {np.percentile(tip_h, 99) * 1000:.1f} mm, max {tip_h.max() * 1000:.1f} mm; "
+        f"{100.0 * float(np.mean(tip_h > 0.6 * length)):.2f}% above 0.6 x length")
+    frame_n = NL if follow_surface else nrm
     tape = None
     if tape_size > 0.0:
         tv, tf = tape_mesh(roots, nrm, P, float(tape_size), offset=float(tape_offset))
         tape = (tv.astype(np.float32), tf.astype(np.int32))
 
     if shape == "ribbon":
-        v, f = ribbon_mesh(P, nrm, width)
+        v, f = ribbon_mesh(P, frame_n, width)
         vs = ribbon_vertex_scalar(S)
     else:
-        v, f = tube_mesh(P, nrm, width)
+        v, f = tube_mesh(P, frame_n, width)
         vs = tube_vertex_scalar(S)
     return v.astype(np.float32), f.astype(np.int32), len(P), vs.astype(np.float32), tape
