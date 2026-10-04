@@ -688,7 +688,7 @@ def prep_inputs(input_file):
     # Independent of the mesh used for voxelization; gaps/open shells are left alone.
     remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
     if remesh_cfg.get("enabled", False) and (
-            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or surface_tufts_enabled(jsonfile)):
+            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or surface_extras_enabled(jsonfile)):
         from xlb.utils.surface_remesh import remesh_surface_isolated, adaptive_kwargs
         try:
             wrap_cfg = remesh_cfg.get("wrap", {})
@@ -1091,6 +1091,80 @@ def export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh, voxel_size, ou
         import traceback
         traceback.print_exc()
         print(f" WARNING: surface tufts failed ({e}); continuing without them.")
+
+
+def surface_maps_cfg(jsonfile):
+    """
+    Option dicts for the surface maps in settings.surfaceMaps (a block is None unless it has "enabled": true):
+
+      dragContribution  component "drag"|"lift" (default drag), range (default 0.5, symmetric colour range in
+                        units of q_inf per unit area), colorMap (default RdBu_r: red = adds drag/lift)
+      separation        outerOffset (m beyond the near-wall probe, default 3 voxels), slowFraction (default 0.05),
+                        colorMap (default RdYlGn: red = reversed flow, green = attached)
+      wallStreamlines   spacing (m, 0.06), length (m, 0.3 total), step (m, 1.5 voxels), width (m, 0.002),
+                        lift (m off the surface, 0.001), maxLines (60000), color ("velocity" default or [r,g,b]),
+                        colorMap, velocityMin / velocityMax (as for the tufts)
+    """
+    st = jsonfile.get("settings", {})
+    cfg = st.get("surfaceMaps", {})
+
+    def block(name):
+        b = cfg.get(name)
+        return dict(b) if isinstance(b, dict) and b.get("enabled", False) else None
+
+    out = {"drag": block("dragContribution"), "separation": block("separation"), "streamlines": block("wallStreamlines")}
+    sl = out["streamlines"]
+    if sl is not None:
+        color = sl.get("color", "velocity")
+        if isinstance(color, str):
+            vmax = float(jsonfile.get("InletBC", {}).get("x", 1.0)) * float(jsonfile.get("slices", {}).get("velocityFactor", 1.5))
+            sl["color"] = color
+            sl["cmap"] = sl.get("colorMap", st.get("surfaceFieldColorMap", "turbo"))
+            sl["clim"] = (float(sl.get("velocityMin", 0.0)), float(sl.get("velocityMax", vmax)))
+        else:
+            sl["color"] = tuple(float(c) for c in color)
+    return out
+
+
+def surface_maps_enabled(jsonfile):
+    return any(v is not None for v in surface_maps_cfg(jsonfile).values())
+
+
+def surface_extras_enabled(jsonfile):
+    """Anything that needs the remeshed, outward-normal export surface besides the surface field."""
+    return surface_tufts_enabled(jsonfile) or surface_maps_enabled(jsonfile)
+
+
+def export_surface_maps(jsonfile, h5exporter, sim, surface_mesh, voxel_size, output_dir, reference_area=None):
+    """
+    Drag/lift contribution, separation and wall-streamline USDs (settings.surfaceMaps), written next to the other
+    results as <outputName>_<name>.usda. Cosmetic: a failure is reported and the run carries on.
+    """
+    maps = surface_maps_cfg(jsonfile)
+    if all(v is None for v in maps.values()):
+        return
+    try:
+        if not surface_mesh.metadata.get("outward_normals", False):
+            print(" WARNING: surfaceMaps need surfaceRemesh.wrap to have run (outward normals); skipping.")
+            return
+        probe_height = resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh)[0] * voxel_size
+        h5exporter.to_surface_maps_time_average(
+            output_prefix=os.path.join(output_dir, f"{jsonfile['outputName']}"),
+            surface_mesh=surface_mesh,
+            probe_height=probe_height,
+            sample_dx=voxel_size,
+            keep_state=True,
+            bc_mask=sim.bc_mask,
+            drag=maps["drag"],
+            separation=maps["separation"],
+            streamlines=maps["streamlines"],
+            ref_area=reference_area,
+        )
+        scm_results_available()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f" WARNING: surface maps failed ({e}); continuing without them.")
 
 
 def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile):
@@ -3186,6 +3260,7 @@ def solve(
             )
             scm_results_available()
         export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir)
+        export_surface_maps(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir, reference_area_physical)
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():
             filename = os.path.join(output_dir, f"average_iso")
@@ -3320,6 +3395,7 @@ def solve(
             )
             scm_results_available()
         export_surface_tufts(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir)
+        export_surface_maps(jsonfile, h5exporter, sim, surface_mesh_for_vtk, voxel_size, output_dir, reference_area_physical)
 
         iso_quantity = jsonfile.get("settings", {}).get("isoQuantity", "")
         if isinstance(iso_quantity, str) and iso_quantity.strip():

@@ -66,7 +66,7 @@ def build_surface_mesh(jsonfile, proj_path, output_dir, voxel_size):
     # --- same remesh block as windtunnel_json.prep_inputs ---
     remesh_cfg = jsonfile.get("settings", {}).get("surfaceRemesh", {})
     if remesh_cfg.get("enabled", False) and (
-            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or wt.surface_tufts_enabled(jsonfile)):
+            str(jsonfile.get("settings", {}).get("surfaceField", "")).strip() or wt.surface_extras_enabled(jsonfile)):
         from xlb.utils.surface_remesh import remesh_surface_isolated, adaptive_kwargs
         try:
             wrap_cfg = remesh_cfg.get("wrap", {})
@@ -98,13 +98,16 @@ def dummy_surface_field(mesh, clim):
     return (clim[0] + (clim[1] - clim[0]) * t).astype(np.float32)
 
 
-def dummy_tuft_velocity(u_inf):
+def dummy_tuft_velocity(u_inf, outer=False):
     """
     Synthetic near-wall velocity for tuft previews: returns sample_velocity(points, base_points, normals).
 
     Front and side surfaces: flow slides along the surface (tangent projection of +x), faster where the surface is
     edge-on, ~0 at the stagnation point. Rear-facing surfaces (normal.x > 0) get a separated-looking field:
     reversed, lifting off the wall, with a cross-stream swirl that varies in space.
+
+    ``outer=True`` gives the attached-only field everywhere (what the flow a little further out would be doing),
+    so the separation map reads reversed exactly where the near-wall field has been made to separate.
     """
     xhat = np.array([1.0, 0.0, 0.0])
 
@@ -118,6 +121,8 @@ def dummy_tuft_velocity(u_inf):
         attached = 1.3 * u_inf * tang
         swirl = np.cross(n, d) * (0.5 * u_inf * np.sin(60.0 * p[:, 2:3] + 40.0 * p[:, 1:2]))
         separated = -0.35 * u_inf * d + 0.4 * u_inf * n + swirl
+        if outer:
+            return attached, np.ones(len(p), dtype=bool)
         return (1.0 - w) * attached + w * separated, np.ones(len(p), dtype=bool)
 
     return sample
@@ -163,6 +168,64 @@ def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
     writer._write_tufts_usd(path, verts, faces, speed, tape=tape, tape_color=tape_args["tape_color"],
                             **wt.tuft_color_args(jsonfile))
     print(f" {n:,} dummy tufts ({shape}) written to {path}")
+    wt.scm_results_available()
+
+
+def write_dummy_surface_maps(jsonfile, surface_mesh, output_dir, voxel_size):
+    """
+    Drag/lift contribution, separation and wall-streamline USDs from the dummy fields, same names / options /
+    colouring as the solver's surfaceMaps export. The dummy Cp is the surface-field dummy (high facing upstream,
+    low facing downstream), so the drag map shows where a front-high / rear-low Cp would load the shape.
+    """
+    maps = wt.surface_maps_cfg(jsonfile)
+    if all(v is None for v in maps.values()):
+        return
+    if not surface_mesh.metadata.get("outward_normals", False):
+        print(" WARNING: surfaceMaps need surfaceRemesh.wrap to have run (outward normals); skipping.")
+        return
+    from xlb.utils import surface_maps as sm
+    from xlb.utils.mesher import MultiresIO
+
+    writer = MultiresIO.__new__(MultiresIO)
+    V = np.asarray(surface_mesh.vertices, dtype=np.float64)
+    F = np.asarray(surface_mesh.faces, dtype=np.int64)
+    N = np.asarray(writer._repair_and_smooth_vertex_normals(surface_mesh), dtype=np.float64)
+    probe = wt.resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh)[0] * voxel_size
+    u_inf = float(jsonfile.get("InletBC", {}).get("x", 1.0))
+    near, outer_f = dummy_tuft_velocity(u_inf), dummy_tuft_velocity(u_inf, outer=True)
+    prefix = os.path.join(output_dir, f"{jsonfile['outputName']}")
+
+    if maps["drag"]:
+        d = maps["drag"]
+        comp = str(d.get("component", "drag"))
+        cp = dummy_surface_field(surface_mesh, (-1.0, 1.0))
+        dens = sm.force_density(cp, N, comp)
+        integral, area = sm.integrate_over_surface(dens, V, F)
+        print(f" {comp} map (dummy Cp): integral {integral:.4f} over {area:.2f} m2")
+        rng = float(d.get("range", 0.5))
+        name = f"{comp}_contribution"
+        writer._write_polydata_usd(f"{prefix}_{name}.usda", V, F, point_data={name: dens}, color_field=name,
+                                   cmap=d.get("colorMap", "RdBu_r"), clim=(-rng, rng), prim_name="surface")
+    if maps["separation"]:
+        d = maps["separation"]
+        outer = float(d.get("outerOffset", 3.0 * voxel_size))
+        vn, _ = near(V + N * probe, V, N)
+        vo, _ = outer_f(V + N * (probe + outer), V, N)
+        idx = sm.separation_index(vn, vo, float(d.get("slowFraction", 0.05)))
+        print(f" separation map (dummy): {100.0 * float(np.mean(idx < -0.2)):.1f}% of vertices reversed")
+        writer._write_polydata_usd(f"{prefix}_separation.usda", V, F, point_data={"separation": idx},
+                                   color_field="separation", cmap=d.get("colorMap", "RdYlGn"), clim=(-1.0, 1.0),
+                                   prim_name="surface")
+    if maps["streamlines"]:
+        d = maps["streamlines"]
+        P, NL, SP, valid = sm.wall_streamlines(
+            V, F, N, near, spacing=float(d.get("spacing", 0.06)), length=float(d.get("length", 0.3)),
+            step=float(d.get("step", 1.5 * voxel_size)), probe_height=probe, lift=float(d.get("lift", 0.001)),
+            max_lines=int(d.get("maxLines", 60000)))
+        if len(P):
+            v, f, vs = sm.polyline_tubes(P, NL, valid, SP, float(d.get("width", 0.002)))
+            writer._write_tufts_usd(f"{prefix}_wall_streamlines.usda", v, f, vs, d.get("color", "velocity"),
+                                    cmap=d.get("cmap", "turbo"), clim=d.get("clim"), prim_name="streamlines")
     wt.scm_results_available()
 
 
@@ -221,6 +284,14 @@ def run(input_file):
         import traceback
         traceback.print_exc()
         print(f" WARNING: dummy tufts failed ({e}); continuing.")
+
+    # --- drag / separation / wall streamlines from the dummy fields ---
+    try:
+        write_dummy_surface_maps(jsonfile, surface_mesh, output_dir, voxel_size)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f" WARNING: dummy surface maps failed ({e}); continuing.")
 
     # --- placeholder Results.json (same structure as the solver's) ---
     targets = jsonfile.get('vehicle', {}).get('targets', {})

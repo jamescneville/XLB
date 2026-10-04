@@ -3420,6 +3420,147 @@ class MultiresIO(object):
                 export_debug_arrays=export_debug_arrays,
             )
    
+    def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
+        """
+        Returns (sample_velocity, sample_dx). ``sample_velocity(points, base_points, normals) -> (vel (N,3), ok (N,))``
+        is inverse-distance weighting over the k nearest fluid cells, keeping only cells within 3 voxels and not
+        behind the wall plane through ``base_points`` (so cells on the far side of a thin panel are ignored).
+        Processed in chunks to bound memory.
+        """
+        vel_keys = sorted(
+            (kk for kk in avg_fields if kk.startswith("velocity_")),
+            key=lambda kk: int(kk.rsplit("_", 1)[1]),
+        )
+        if len(vel_keys) < 3:
+            raise KeyError("this surface export needs the averaged velocity_0..2 fields")
+        vel = np.stack([np.asarray(avg_fields[kk], dtype=np.float32) for kk in vel_keys[:3]], axis=1)
+
+        centroids = self.centroids
+        if bc_mask is not None:
+            solid = self._solid_mask_from_fields_data(self.get_fields_data({"bc_mask": bc_mask}))
+            fluid = ~np.asarray(solid, dtype=bool)
+            if not fluid.any():
+                raise ValueError("solid mask excludes all cells; no fluid data to sample.")
+            centroids = np.ascontiguousarray(centroids[fluid])
+            vel = np.ascontiguousarray(vel[fluid])
+        tree = cKDTree(centroids)
+        if sample_dx is None:
+            sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
+        sample_dx = float(sample_dx)
+        max_distance = 3.0 * sample_dx
+        kk = min(int(k), len(centroids))
+
+        def sample_velocity(points, base_points, normals, chunk=200000):
+            points = np.asarray(points, dtype=np.float32)
+            base_points = np.asarray(base_points, dtype=np.float64)
+            normals = np.asarray(normals, dtype=np.float64)
+            out_v = np.empty((len(points), 3), dtype=np.float64)
+            out_ok = np.empty(len(points), dtype=bool)
+            for a in range(0, len(points), chunk):
+                sl = slice(a, a + chunk)
+                d, idx = tree.query(points[sl], k=kk, workers=-1)
+                if kk == 1:
+                    d, idx = d[:, None], idx[:, None]
+                signed = np.einsum("qki,qi->qk", centroids[idx] - base_points[sl][:, None, :], normals[sl])
+                valid = (signed >= -half_space_tolerance * sample_dx) & (d <= max_distance)
+                ok = valid.any(axis=1)
+                w = 1.0 / np.maximum(d, 1e-12) ** float(power)
+                w = np.where(ok[:, None], w * valid, w)
+                out_v[sl] = np.einsum("qk,qkj->qj", w, vel[idx]) / np.maximum(w.sum(axis=1), 1e-20)[:, None]
+                out_ok[sl] = ok
+            return out_v, out_ok
+
+        return sample_velocity, sample_dx
+
+    def to_surface_maps_time_average(
+        self,
+        output_prefix,
+        surface_mesh,
+        probe_height,
+        sample_dx=None,
+        keep_state=True,
+        bc_mask=None,
+        drag=None,
+        separation=None,
+        streamlines=None,
+        ref_area=None,
+        cp_field="Cp",
+    ):
+        """
+        Surface maps from the time-averaged solution, each written to ``<output_prefix>_<name>.usda``.
+
+        ``drag`` / ``separation`` / ``streamlines`` are option dicts (None = skip); see ``examples/windtunnel_json.py``
+        (``export_surface_maps``) for the keys. ``surface_mesh`` is the remeshed export surface with outward normals.
+        Cp is mapped to the vertices exactly as the Cp surface field is (outward probe, median, 2 smoothing passes).
+        Returns {name: path}.
+        """
+        from xlb.utils import surface_maps as sm
+
+        tic = time.perf_counter()
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+        sample_velocity, dx = self._velocity_sampler(avg_fields, bc_mask, sample_dx)
+        V = np.asarray(surface_mesh.vertices, dtype=np.float64)
+        F = np.asarray(surface_mesh.faces, dtype=np.int64)
+        N = np.asarray(self._repair_and_smooth_vertex_normals(surface_mesh), dtype=np.float64)
+        out = {}
+
+        if drag is not None:
+            comp = str(drag.get("component", "drag"))
+            solid_mask = None
+            if bc_mask is not None:
+                solid_mask = self._solid_mask_from_fields_data(self.get_fields_data({"bc_mask": bc_mask}))
+            _, cell_cp = self._select_surface_field(avg_fields, cp_field)
+            cp, _, _ = self._sample_surface_scalar_bidirectional(
+                surface_points=V.astype(np.float32), surface_normals=N.astype(np.float32), cell_values=cell_cp,
+                sample_dx=dx, shell_factors=(probe_height / dx,), k=8, power=2.0, max_distance=2.0 * dx,
+                half_space_tolerance=0.15, aggregate="median", selector_values=None, solid_mask=solid_mask,
+                outward_only=True,
+            )
+            cp = self._smooth_surface_scalar(cp, F.astype(np.int32), iterations=2, relaxation=0.2)
+            dens = sm.force_density(cp, N, comp)
+            integral, area = sm.integrate_over_surface(dens, V, F)
+            msg = f"	{comp} map: pressure {comp} integral {integral:.4f} m2 (q-normalised) over {area:.2f} m2 of surface"
+            if ref_area:
+                msg += f" -> {integral / float(ref_area):.4f} of the reference area {float(ref_area):.2f} m2 (pressure only, this surface only)"
+            print(msg)
+            rng_ = float(drag.get("range", 0.5))
+            name = f"{comp}_contribution"
+            out[name] = self._write_polydata_usd(
+                f"{output_prefix}_{name}.usda", V, F, point_data={name: dens}, color_field=name,
+                cmap=drag.get("colorMap", "RdBu_r"), clim=(-rng_, rng_), prim_name="surface",
+            )
+
+        if separation is not None:
+            outer = float(separation.get("outerOffset", 3.0 * dx))
+            vn, _ = sample_velocity(V + N * probe_height, V, N)
+            vo, _ = sample_velocity(V + N * (probe_height + outer), V, N)
+            idx = sm.separation_index(vn, vo, float(separation.get("slowFraction", 0.05)))
+            print(f"	separation map: {100.0 * float(np.mean(idx < -0.2)):.1f}% of vertices reversed (index < -0.2), "
+                  f"{100.0 * float(np.mean(np.abs(idx) <= 0.2)):.1f}% stagnant/neutral; outer probe {outer * 1000:.0f} mm beyond the near-wall one")
+            out["separation"] = self._write_polydata_usd(
+                f"{output_prefix}_separation.usda", V, F, point_data={"separation": idx}, color_field="separation",
+                cmap=separation.get("colorMap", "RdYlGn"), clim=(-1.0, 1.0), prim_name="surface",
+            )
+
+        if streamlines is not None:
+            step = float(streamlines.get("step", 1.5 * dx))
+            P, NL, SP, valid = sm.wall_streamlines(
+                V, F, N, sample_velocity,
+                spacing=float(streamlines.get("spacing", 0.06)), length=float(streamlines.get("length", 0.3)),
+                step=step, probe_height=probe_height, lift=float(streamlines.get("lift", 0.001)),
+                max_lines=int(streamlines.get("maxLines", 60000)),
+            )
+            if len(P):
+                v, f, vs = sm.polyline_tubes(P, NL, valid, SP, float(streamlines.get("width", 0.002)))
+                out["wall_streamlines"] = self._write_tufts_usd(
+                    f"{output_prefix}_wall_streamlines.usda", v, f, vs, streamlines.get("color", "velocity"),
+                    cmap=streamlines.get("cmap", "turbo"), clim=streamlines.get("clim"), prim_name="streamlines",
+                )
+            else:
+                print("	No wall streamlines generated.")
+        print(f"	Surface maps done in {time.perf_counter() - tic:0.1f} seconds: {', '.join(out) or 'nothing written'}")
+        return out
+
     def to_surface_tufts_time_average(
         self,
         output_filename,
@@ -3459,40 +3600,8 @@ class MultiresIO(object):
 
         tic = time.perf_counter()
         avg_fields = self.finalize_time_average(keep_state=keep_state)
-        vel_keys = sorted(
-            (kk for kk in avg_fields if kk.startswith("velocity_")),
-            key=lambda kk: int(kk.rsplit("_", 1)[1]),
-        )
-        if len(vel_keys) < 3:
-            raise KeyError("surface tufts need the averaged velocity_0..2 fields")
-        vel = np.stack([np.asarray(avg_fields[kk], dtype=np.float32) for kk in vel_keys[:3]], axis=1)
-
-        centroids = self.centroids
-        if bc_mask is not None:
-            solid = self._solid_mask_from_fields_data(self.get_fields_data({"bc_mask": bc_mask}))
-            fluid = ~np.asarray(solid, dtype=bool)
-            if not fluid.any():
-                raise ValueError("solid mask excludes all cells; no fluid data to sample.")
-            centroids = np.ascontiguousarray(centroids[fluid])
-            vel = np.ascontiguousarray(vel[fluid])
-        tree = cKDTree(centroids)
-        if sample_dx is None:
-            sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
-        sample_dx = float(sample_dx)
-        max_distance = 3.0 * sample_dx
-        kk = min(int(k), len(centroids))
-
-        def sample_velocity(points, base_points, normals):
-            d, idx = tree.query(np.asarray(points, dtype=np.float32), k=kk, workers=-1)
-            if kk == 1:
-                d, idx = d[:, None], idx[:, None]
-            signed = np.einsum("qki,qi->qk", centroids[idx] - base_points[:, None, :], normals)
-            valid = (signed >= -half_space_tolerance * sample_dx) & (d <= max_distance)
-            ok = valid.any(axis=1)
-            w = 1.0 / np.maximum(d, 1e-12) ** float(power)
-            w = np.where(ok[:, None], w * valid, w)
-            v = np.einsum("qk,qkj->qj", w, vel[idx]) / np.maximum(w.sum(axis=1), 1e-20)[:, None]
-            return v, ok
+        sample_velocity, sample_dx = self._velocity_sampler(
+            avg_fields, bc_mask, sample_dx, k=k, power=power, half_space_tolerance=half_space_tolerance)
 
         mesh_v = np.asarray(surface_mesh.vertices, dtype=np.float64)
         mesh_f = np.asarray(surface_mesh.faces, dtype=np.int64)
@@ -3513,7 +3622,7 @@ class MultiresIO(object):
         return usd_filename
 
     def _write_tufts_usd(self, output_filename, verts, faces, speed, color, cmap="turbo", clim=None,
-                         tape=None, tape_color=(0.2, 0.55, 1.0)):
+                         tape=None, tape_color=(0.2, 0.55, 1.0), prim_name="tufts"):
         """Tuft triangles to USD: ``color`` is an RGB triple (constant) or ``"velocity"`` (near-wall speed via ``cmap``/``clim``).
 
         ``tape`` = (verts, faces) adds the root tape patches as a second prim with a constant-colour material.
@@ -3525,12 +3634,12 @@ class MultiresIO(object):
             self._write_polydata_usd(
                 usd_filename, verts, faces,
                 point_data={"velocity_magnitude": speed}, color_field="velocity_magnitude",
-                cmap=cmap, clim=clim, prim_name="tufts", double_sided=True,
+                cmap=cmap, clim=clim, prim_name=prim_name, double_sided=True,
             )
         else:
             self._write_polydata_usd(
                 usd_filename, verts, faces,
-                uniform_color=color, prim_name="tufts", double_sided=True, emissive=0.15,
+                uniform_color=color, prim_name=prim_name, double_sided=True, emissive=0.15,
             )
         if tape is not None and len(tape[0]):
             self._write_polydata_usd(
