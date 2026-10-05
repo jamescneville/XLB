@@ -16,12 +16,13 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 
-def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0):
+def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0, accept=None):
     """Area-weighted random sequential (dart-throwing) sampling of the surface.
 
     Two points closer than ``spacing`` exclude each other only if their normals agree
     (dot > 0), so the two faces of a thin sheet can both carry tufts.
-    Returns (points (T,3), normals (T,3)).
+    ``accept(points, normals) -> bool mask`` filters the candidates BEFORE the thinning, so an unusable candidate
+    never takes a slot from a good neighbour. Returns (points (T,3), normals (T,3)).
     """
     v = np.asarray(vertices, dtype=np.float64)
     f = np.asarray(faces, dtype=np.int64)
@@ -40,6 +41,11 @@ def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0)
     pts = np.einsum("ni,nij->nj", w, tri[fi])
     nrm = np.einsum("ni,nij->nj", w, np.asarray(vertex_normals, dtype=np.float64)[f[fi]])
     nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-20)
+    if accept is not None:
+        ok = np.asarray(accept(pts, nrm), dtype=bool)
+        pts, nrm, n_cand = pts[ok], nrm[ok], int(ok.sum())
+        if n_cand == 0:
+            return np.empty((0, 3)), np.empty((0, 3))
 
     tree = cKDTree(pts)
     neigh = tree.query_ball_point(pts, r=spacing, workers=-1)
@@ -192,6 +198,79 @@ def march_tufts(
     return P, keep, S, NL
 
 
+class TriIndex:
+    """Triangle arrays and a KD tree on triangle centres, built once and shared by the seed and tuft crossing tests."""
+
+    def __init__(self, vertices, faces):
+        V = np.asarray(vertices, dtype=np.float64)
+        F = np.asarray(faces, dtype=np.int64)
+        tri = V[F]
+        self.v0 = tri[:, 0]
+        self.e1 = tri[:, 1] - tri[:, 0]
+        self.e2 = tri[:, 2] - tri[:, 0]
+        fn = np.cross(self.e1, self.e2)
+        self.fn = fn / np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-30)
+        cen = tri.mean(axis=1)
+        self.tri_r = float(np.linalg.norm(tri - cen[:, None, :], axis=2).max())
+        self.tree = cKDTree(cen)
+
+
+def crossing_tufts(P, roots, root_normals, vertices, faces, root_zone, chunk=3_000_000, index=None):
+    """
+    Which tufts pass through the surface? Tests every centre-line segment against the triangles near it
+    (Moller-Trumbore, candidates from a KD tree on triangle centres). Returns (crossed (T,) bool, hits (T,) int).
+
+    A tuft is rooted 0.8 mm inside its own skin, so its first segment legitimately pierces the triangles at its
+    root: same-facing triangles (normal within ~70 deg of the root normal) whose plane passes within 2 mm of the root and whose hit point is within ``root_zone`` of the
+    root are ignored. Everything else counts: a hit on a triangle facing the other way is the other skin
+    of a panel (the tuft popped through); a same-facing hit away from the root is the tuft re-entering its own
+    surface.
+    """
+    ix = index if index is not None else TriIndex(vertices, faces)
+    v0, e1, e2, fn, tri_r, tree = ix.v0, ix.e1, ix.e2, ix.fn, ix.tri_r, ix.tree
+
+    T, J, _ = P.shape
+    a = P[:, :-1].reshape(-1, 3)
+    b = P[:, 1:].reshape(-1, 3)
+    seg_tuft = np.repeat(np.arange(T), J - 1)
+    seg_first = np.tile(np.arange(J - 1) == 0, T)
+    mid = 0.5 * (a + b)
+    rad = 0.5 * np.linalg.norm(b - a, axis=1) + tri_r + 1e-4
+    # query per segment; radius differs per segment only slightly, so use the largest for one batched query
+    neigh = tree.query_ball_point(mid, r=float(rad.max()), workers=-1)
+    counts = np.fromiter((len(n) for n in neigh), dtype=np.int64, count=len(neigh))
+    seg_idx = np.repeat(np.arange(len(a)), counts)
+    tri_idx = np.concatenate([np.asarray(n, dtype=np.int64) for n in neigh]) if counts.sum() else np.empty(0, np.int64)
+
+    hits = np.zeros(T, dtype=np.int64)
+    for s in range(0, len(seg_idx), chunk):
+        si, ti = seg_idx[s:s + chunk], tri_idx[s:s + chunk]
+        o, d = a[si], (b - a)[si]
+        pv = np.cross(d, e2[ti])
+        det = np.einsum("ij,ij->i", e1[ti], pv)
+        ok = np.abs(det) > 1e-18
+        inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+        tv = o - v0[ti]
+        u = np.einsum("ij,ij->i", tv, pv) * inv
+        qv = np.cross(tv, e1[ti])
+        w = np.einsum("ij,ij->i", d, qv) * inv
+        t = np.einsum("ij,ij->i", e2[ti], qv) * inv
+        hit = ok & (u >= 0.0) & (w >= 0.0) & (u + w <= 1.0) & (t >= 0.0) & (t <= 1.0)
+        if not hit.any():
+            continue
+        hs, ht = si[hit], ti[hit]
+        tuft = seg_tuft[hs]
+        hp = a[hs] + (b - a)[hs] * t[hit][:, None]
+        near_root = np.linalg.norm(hp - roots[tuft], axis=1) <= root_zone
+        same = np.einsum("ij,ij->i", fn[ht], root_normals[tuft]) > 0.34
+        # the root sits ~1 mm inside its skin: only a triangle whose plane passes within ~2 mm of the root is that skin
+        # (a second skin 4+ mm away, even facing the same way, is a pop-through)
+        own_plane = np.abs(np.einsum("ij,ij->i", roots[tuft] - v0[ht], fn[ht])) <= 0.002
+        count = ~(near_root & same & own_plane & seg_first[hs])      # only the first segment may pierce its own root skin
+        np.add.at(hits, tuft[count], 1)
+    return hits > 0, hits
+
+
 def _taper(nseg):
     return 1.0 - 0.4 * np.arange(nseg + 1) / nseg
 
@@ -308,6 +387,8 @@ def build_tufts(
     max_push=None,
     follow_surface=False,
     max_normal_turn_deg=30.0,
+    drop_crossing=True,
+    seed_clearance=0.6,
     log=print,
 ):
     """Roots on the surface -> marched chains -> tube/ribbon triangles.
@@ -328,7 +409,19 @@ def build_tufts(
         log(f"\tTufts: ~{est:,.0f} at the requested spacing exceeds maxTufts={max_tufts:,}; "
             f"spacing raised to {spacing * 1000:.1f} mm")
 
-    roots, nrm = poisson_roots(vertices, faces, vertex_normals, spacing, rng)
+    tri_index = TriIndex(vertices, faces) if (drop_crossing or seed_clearance > 0) else None
+    accept = None
+    if seed_clearance > 0:
+        reach = float(seed_clearance) * float(length)
+
+        def accept(pts, nr):
+            # a seed whose outward normal meets the surface within the tuft's reach cannot host a tuft: it sits on an
+            # inner skin / mis-oriented patch or in a slot. Tested before thinning so it never takes a slot from a good seed.
+            seg = np.stack([pts + nr * 0.0015, pts + nr * reach], axis=1)
+            blocked, _ = crossing_tufts(seg, pts, nr, vertices, faces, root_zone=0.0, index=tri_index)
+            return ~blocked
+
+    roots, nrm = poisson_roots(vertices, faces, vertex_normals, spacing, rng, accept=accept)
     log(f"\tTufts: {len(roots):,} roots on {area:.2f} m2 at {spacing * 1000:.1f} mm spacing")
     empty = (np.empty((0, 3)), np.empty((0, 3), dtype=np.int64), 0, np.empty(0), None)
     if len(roots) == 0:
@@ -343,6 +436,13 @@ def build_tufts(
     )
     log(f"\tTufts: dropped {int((~keep).sum()):,} (no usable flow, pushed too far out of a groove"
         f"{', or left the surface' if follow_surface else ''}); {int(keep.sum()):,} kept")
+    if drop_crossing and keep.any():
+        cr, hits = crossing_tufts(P[keep], roots[keep], nrm[keep], vertices, faces, root_zone=3.0 * float(width) + 0.004,
+                                index=tri_index)
+        idx = np.flatnonzero(keep)
+        keep[idx[cr]] = False
+        log(f"\tTufts: dropped {int(cr.sum()):,} that pass through the surface (popped through a panel or re-entered it); "
+            f"{int(keep.sum()):,} kept")
     roots = roots[keep]
     P, nrm, S, NL = P[keep], nrm[keep], S[keep], NL[keep]
     if len(P) == 0:

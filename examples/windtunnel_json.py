@@ -1033,14 +1033,19 @@ def tuft_shape_limits(jsonfile):
     """
     settings.surfaceTufts: maxElevation (deg above the wall, default 35), maxPush (m out of the body, default half a
     segment), followSurface (default true: use the local surface normal along the tuft, so it wraps lips and edges)
-    and maxNormalTurn (deg per segment the followed normal may change, default 30).
+    maxNormalTurn (deg per segment the followed normal may change, default 30), dropCrossing (default true: drop
+    any tuft whose centre line passes through the surface, e.g. one rooted on the inner skin of a panel that pops out)
+    and seedClearance (default 0.6 x the tuft length; 0 = off): candidate seeds whose outward normal meets the surface
+    within that reach are rejected before the spacing is applied, so unusable seeds never take a slot from a good one.
     """
     cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
     mp = cfg.get("maxPush")
     return dict(max_elevation_deg=float(cfg.get("maxElevation", 35.0)),
                 max_push=None if mp is None else float(mp),
                 follow_surface=bool(cfg.get("followSurface", True)),
-                max_normal_turn_deg=float(cfg.get("maxNormalTurn", 30.0)))
+                max_normal_turn_deg=float(cfg.get("maxNormalTurn", 30.0)),
+                drop_crossing=bool(cfg.get("dropCrossing", True)),
+                seed_clearance=float(cfg.get("seedClearance", 0.6)))
 
 
 def tuft_tape_args(jsonfile):

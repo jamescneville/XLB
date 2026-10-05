@@ -145,7 +145,7 @@ def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
     tape_args = wt.tuft_tape_args(jsonfile)
     limits = wt.tuft_shape_limits(jsonfile)          # maxElevation, maxPush, followSurface, maxNormalTurn
     print(f" Tufts: followSurface={limits['follow_surface']} (maxNormalTurn {limits['max_normal_turn_deg']:g} deg/segment), "
-          f"maxElevation {limits['max_elevation_deg']:g} deg, maxPush "
+          f"dropCrossing={limits['drop_crossing']}, seedClearance={limits['seed_clearance']:g}, maxElevation {limits['max_elevation_deg']:g} deg, maxPush "
           f"{'half a segment' if limits['max_push'] is None else str(limits['max_push']) + ' m'}")
     verts, faces, n, speed, tape = build_tufts(
         np.asarray(surface_mesh.vertices, dtype=np.float64), np.asarray(surface_mesh.faces, dtype=np.int64),
@@ -155,6 +155,7 @@ def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
         max_tufts=int(cfg.get("maxTufts", 150000)), tape_size=tape_args["tape_size"], tape_offset=tape_args["tape_offset"],
         max_elevation_deg=limits["max_elevation_deg"], max_push=limits["max_push"],
         follow_surface=limits["follow_surface"], max_normal_turn_deg=limits["max_normal_turn_deg"],
+        drop_crossing=limits["drop_crossing"], seed_clearance=limits["seed_clearance"],
     )
     if n == 0:
         print(" No tufts generated.")

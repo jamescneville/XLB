@@ -3442,6 +3442,8 @@ class MultiresIO(object):
         max_push=None,
         follow_surface=True,
         max_normal_turn_deg=30.0,
+        drop_crossing=True,
+        seed_clearance=0.6,
         root_inset=0.0008,
         max_tufts=150000,
         k=8,
@@ -3502,7 +3504,8 @@ class MultiresIO(object):
             spacing=spacing, length=length, width=width, probe_height=probe_height,
             shape=shape, root_inset=root_inset, max_tufts=max_tufts, seed=seed, tape_size=tape_size,
             tape_offset=tape_offset, max_elevation_deg=max_elevation_deg, max_push=max_push,
-            follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg,
+            follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg, drop_crossing=drop_crossing,
+            seed_clearance=seed_clearance,
         )
         if n_tufts == 0:
             print("\tNo tufts generated; nothing written.")
