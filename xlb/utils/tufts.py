@@ -16,13 +16,14 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 
-def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0, accept=None):
+def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0, accept=None, existing=None):
     """Area-weighted random sequential (dart-throwing) sampling of the surface.
 
     Two points closer than ``spacing`` exclude each other only if their normals agree
     (dot > 0), so the two faces of a thin sheet can both carry tufts.
     ``accept(points, normals) -> bool mask`` filters the candidates BEFORE the thinning, so an unusable candidate
-    never takes a slot from a good neighbour. Returns (points (T,3), normals (T,3)).
+    never takes a slot from a good neighbour. ``existing`` = (points, normals) of roots already placed: candidates
+    that one of them excludes are dropped (used to fill holes). Returns (points (T,3), normals (T,3)).
     """
     v = np.asarray(vertices, dtype=np.float64)
     f = np.asarray(faces, dtype=np.int64)
@@ -50,6 +51,11 @@ def poisson_roots(vertices, faces, vertex_normals, spacing, rng, oversample=5.0,
     tree = cKDTree(pts)
     neigh = tree.query_ball_point(pts, r=spacing, workers=-1)
     alive = np.ones(n_cand, dtype=bool)
+    if existing is not None and len(existing[0]):
+        ex_p, ex_n = np.asarray(existing[0], dtype=np.float64), np.asarray(existing[1], dtype=np.float64)
+        for i, nb in enumerate(cKDTree(ex_p).query_ball_point(pts, r=spacing, workers=-1)):
+            if nb and (ex_n[nb] @ nrm[i] > 0.0).any():
+                alive[i] = False
     keep = []
     for i in range(n_cand):  # candidates are already in random order
         if not alive[i]:
@@ -71,6 +77,38 @@ def _unit(a, fallback=None):
     return out
 
 
+def local_surface(tree, V, N, p, ref, same_skin=True, thin=0.001):
+    """
+    Nearest surface vertices to ``p`` that belong to the skin ``p`` is riding on. Returns (vi (T,4), w (T,4), v0 (T,)):
+    indices, inverse-distance weights (0 for rejected) and the nearest accepted vertex.
+
+    The 8 nearest vertices are screened and the 4 nearest accepted ones kept, so with a single skin nothing is
+    rejected and the result equals a plain 4-nearest query. A vertex is rejected when
+    it lies more than ``thin`` behind the nearest same-facing vertex's tangent plane AND its normal either faces
+    away from ``ref`` (the other face of a thin sheet) or is nearly parallel to that vertex's normal (a second skin
+    under this one). A crease that turns the normal is kept: its far side is behind the plane too, but its normal
+    is neither opposed nor parallel.
+    ``same_skin=False`` is the plain 4-nearest query.
+    """
+    if not same_skin:
+        dv, vi = tree.query(p, k=4, workers=-1)
+        return vi, 1.0 / np.maximum(dv, 1e-4), vi[:, 0]
+    dv, vi = tree.query(p, k=8, workers=-1)
+    rows = np.arange(len(p))
+    agree = np.einsum("tkj,tj->tk", N[vi], ref) >= 0.0
+    first = np.argmax(agree, axis=1)                       # nearest same-facing (0 if none)
+    v0 = vi[rows, first]
+    n0 = N[v0]
+    behind = np.einsum("tkj,tj->tk", V[vi] - V[v0][:, None, :], n0) < -thin
+    parallel = np.einsum("tkj,tj->tk", N[vi], n0) > 0.9
+    ok = ~(behind & (~agree | parallel))
+    ok[rows, first] = True
+    ok &= (np.cumsum(ok, axis=1) <= 4)
+    order = np.argsort(~ok, axis=1, kind="stable")[:, :4]
+    vi, dv, ok = (np.take_along_axis(a, order, axis=1) for a in (vi, dv, ok))
+    return vi, np.where(ok, 1.0 / np.maximum(dv, 1e-4), 0.0), v0
+
+
 def march_tufts(
     roots,
     normals,
@@ -89,6 +127,8 @@ def march_tufts(
     max_push=None,
     follow_surface=False,
     max_normal_turn_deg=30.0,
+    same_skin=True,
+    skin_gap=0.001,
 ):
     """
     March every tuft away from its root. Returns (P (T,nseg+1,3), keep (T,) bool, speed (T,nseg+1),
@@ -138,14 +178,13 @@ def march_tufts(
     for i in range(nseg):
         p = P[:, i]
         if follow_surface and i > 0:
-            dv, vi = surf_tree.query(p, k=4, workers=-1)
-            w = 1.0 / np.maximum(dv, 1e-4)
+            vi, w, v0 = local_surface(surf_tree, surface_vertices, surface_normals, p, nl, same_skin, skin_gap)
             raw = _unit((surface_normals[vi] * w[:, :, None]).sum(axis=1), fallback=nl)
             ang = np.arccos(np.clip(np.einsum("ij,ij->i", nl, raw), -1.0, 1.0))
             a = np.minimum(1.0, max_turn / np.maximum(ang, 1e-9))
             nl = _unit((1.0 - a)[:, None] * nl + a[:, None] * raw, fallback=nl)
-            base = surface_vertices[vi[:, 0]]
-            h = np.einsum("ij,ij->i", p - base, surface_normals[vi[:, 0]])
+            base = surface_vertices[v0]
+            h = np.einsum("ij,ij->i", p - base, surface_normals[v0])
             # higher above the local surface than the elevation cap allows: it left the surface
             keep &= h <= i * ds * sin_cap + 2.0 * float(width) + 0.002
         else:
@@ -186,11 +225,11 @@ def march_tufts(
 
         q = p + d * ds
         if surf_tree is not None:  # keep the tuft out of the body (concave corners, neighbouring panels)
-            _, vi = surf_tree.query(q, k=1, workers=-1)
-            signed = np.einsum("ij,ij->i", q - surface_vertices[vi], surface_normals[vi])
+            _, _, v0 = local_surface(surf_tree, surface_vertices, surface_normals, q, nl, same_skin, skin_gap)
+            signed = np.einsum("ij,ij->i", q - surface_vertices[v0], surface_normals[v0])
             push = np.maximum(0.0, clearance - signed)
             keep &= push <= max_push
-            q = q + surface_normals[vi] * np.minimum(push, max_push)[:, None]
+            q = q + surface_normals[v0] * np.minimum(push, max_push)[:, None]
         P[:, i + 1] = q
 
     S[:, nseg] = S[:, nseg - 1]
@@ -389,6 +428,9 @@ def build_tufts(
     max_normal_turn_deg=30.0,
     drop_crossing=True,
     seed_clearance=0.6,
+    same_skin=True,
+    refill_passes=2,
+    skin_gap=0.001,
     log=print,
 ):
     """Roots on the surface -> marched chains -> tube/ribbon triangles.
@@ -427,24 +469,61 @@ def build_tufts(
     if len(roots) == 0:
         return empty
 
-    P, keep, S, NL = march_tufts(
-        roots, nrm, sample_velocity,
-        length=length, width=width, nseg=nseg, probe_height=probe_height, root_inset=root_inset,
-        surface_vertices=vertices, surface_normals=vertex_normals, flow_dir=flow_dir,
-        max_elevation_deg=max_elevation_deg, max_push=max_push,
-        follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg,
-    )
-    log(f"\tTufts: dropped {int((~keep).sum()):,} (no usable flow, pushed too far out of a groove"
-        f"{', or left the surface' if follow_surface else ''}); {int(keep.sum()):,} kept")
-    if drop_crossing and keep.any():
-        cr, hits = crossing_tufts(P[keep], roots[keep], nrm[keep], vertices, faces, root_zone=3.0 * float(width) + 0.004,
-                                index=tri_index)
-        idx = np.flatnonzero(keep)
-        keep[idx[cr]] = False
-        log(f"\tTufts: dropped {int(cr.sum()):,} that pass through the surface (popped through a panel or re-entered it); "
-            f"{int(keep.sum()):,} kept")
-    roots = roots[keep]
-    P, nrm, S, NL = P[keep], nrm[keep], S[keep], NL[keep]
+    def grow(r, n, tag=""):
+        P, keep, S, NL = march_tufts(
+            r, n, sample_velocity,
+            length=length, width=width, nseg=nseg, probe_height=probe_height, root_inset=root_inset,
+            surface_vertices=vertices, surface_normals=vertex_normals, flow_dir=flow_dir,
+            max_elevation_deg=max_elevation_deg, max_push=max_push,
+            follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg,
+            same_skin=same_skin, skin_gap=skin_gap,
+        )
+        log(f"\tTufts{tag}: dropped {int((~keep).sum()):,} (no usable flow, pushed too far out of a groove"
+            f"{', or left the surface' if follow_surface else ''}); {int(keep.sum()):,} kept")
+        if drop_crossing and keep.any():
+            cr, _ = crossing_tufts(P[keep], r[keep], n[keep], vertices, faces, root_zone=3.0 * float(width) + 0.004,
+                                   index=tri_index)
+            idx = np.flatnonzero(keep)
+            keep[idx[cr]] = False
+            log(f"\tTufts{tag}: dropped {int(cr.sum()):,} that pass through the surface (popped through a panel or re-entered it); "
+                f"{int(keep.sum()):,} kept")
+        return P, keep, S, NL
+
+    P, keep, S, NL = grow(roots, nrm)
+    kept = [(roots[keep], nrm[keep], P[keep], S[keep], NL[keep])]
+    lost_p, lost_n = roots[~keep], nrm[~keep]
+    for it in range(int(refill_passes)):
+        if len(lost_p) == 0:
+            break
+        lost_tree = cKDTree(lost_p)
+
+        def refill_accept(pts, nr):
+            # only candidates in a hole, and not on the same skin patch as a root that already failed there
+            d, ii = lost_tree.query(pts, k=4, distance_upper_bound=spacing, workers=-1)
+            ok = np.isfinite(d[:, 0])
+            idx = np.flatnonzero(ok)
+            if len(idx):
+                ii = np.minimum(ii[idx], len(lost_p) - 1)
+                diff = pts[idx, None, :] - lost_p[ii]
+                same_patch = (np.isfinite(d[idx]) & (np.linalg.norm(diff, axis=2) < 0.5 * spacing)
+                              & (np.abs(np.einsum("nkj,nkj->nk", diff, lost_n[ii])) < 0.002)
+                              & (np.einsum("nj,nkj->nk", nr[idx], lost_n[ii]) > 0.9))
+                ok[idx] = ~same_patch.any(axis=1)
+            sub = np.flatnonzero(ok)
+            if accept is not None and len(sub):
+                ok[sub] = accept(pts[sub], nr[sub])
+            return ok
+
+        have = (np.concatenate([k[0] for k in kept]), np.concatenate([k[1] for k in kept]))
+        r2, n2 = poisson_roots(vertices, faces, vertex_normals, spacing, rng, accept=refill_accept, existing=have)
+        if len(r2) == 0:
+            break
+        P2, k2, S2, NL2 = grow(r2, n2, tag=f" (refill {it + 1})")
+        if k2.any():
+            kept.append((r2[k2], n2[k2], P2[k2], S2[k2], NL2[k2]))
+        lost_p = np.concatenate([lost_p, r2[~k2]])
+        lost_n = np.concatenate([lost_n, n2[~k2]])
+    roots, nrm, P, S, NL = (np.concatenate([k[j] for k in kept]) for j in range(5))
     if len(P) == 0:
         return empty
     # how far the tips ended up above the local surface (a tuft lying at the elevation cap is length*sin(cap) up)

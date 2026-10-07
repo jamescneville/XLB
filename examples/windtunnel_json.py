@@ -988,6 +988,22 @@ def resolve_surface_probe_factors(jsonfile, voxel_size, surface_mesh):
     return (factor,)
 
 
+def resolve_skin_gap(jsonfile):
+    """
+    Distance a surface neighbour must lie behind the local plane to count as another skin (same-skin filter of the
+    tufts and wall streamlines), derived from the remesh: the wrap puts the two faces of a zero-thickness sheet
+    2 x snapOffset apart (2 x wrap offset when there is no snap), so half of that separates them from the curvature
+    sag of a single skin.
+    """
+    st = jsonfile.get("settings", {})
+    wrap = st.get("surfaceRemesh", {}).get("wrap", {})
+    res = float(wrap.get("resolution", float(st.get("voxelSize", 0.008)) / 2))
+    woff = float(wrap.get("offset") or 0.75 * res)
+    so = wrap.get("snapOffset")
+    so = float(so) if (so is not None and so is not False and float(so) >= 0) else None
+    return max(0.0005, woff if so is None else so)
+
+
 def resolve_surface_side_selector(jsonfile, surface_mesh):
     """
     Side-selection mode for the surface-field mapping.
@@ -1037,6 +1053,9 @@ def tuft_shape_limits(jsonfile):
     any tuft whose centre line passes through the surface, e.g. one rooted on the inner skin of a panel that pops out)
     and seedClearance (default 0.6 x the tuft length; 0 = off): candidate seeds whose outward normal meets the surface
     within that reach are rejected before the spacing is applied, so unusable seeds never take a slot from a good one.
+    sameSkin (default true): surface lookups along a tuft ignore vertices of a second skin close by; refillPasses
+    (default 2): extra seeding passes that fill the slots left by dropped tufts; sampleRadius (voxels, default 3):
+    only fluid cells this close to the probe point enter the near-wall velocity average.
     """
     cfg = jsonfile.get("settings", {}).get("surfaceTufts", {})
     mp = cfg.get("maxPush")
@@ -1045,7 +1064,11 @@ def tuft_shape_limits(jsonfile):
                 follow_surface=bool(cfg.get("followSurface", True)),
                 max_normal_turn_deg=float(cfg.get("maxNormalTurn", 30.0)),
                 drop_crossing=bool(cfg.get("dropCrossing", True)),
-                seed_clearance=float(cfg.get("seedClearance", 0.6)))
+                seed_clearance=float(cfg.get("seedClearance", 0.6)),
+                same_skin=bool(cfg.get("sameSkin", True)),
+                refill_passes=int(cfg.get("refillPasses", 2)),
+                skin_gap=resolve_skin_gap(jsonfile),
+                sample_radius=None if cfg.get("sampleRadius") is None else float(cfg["sampleRadius"]))
 
 
 def tuft_tape_args(jsonfile):
