@@ -3423,7 +3423,8 @@ class MultiresIO(object):
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
         """
         Returns (sample_velocity, sample_dx). ``sample_velocity(points, base_points, normals) -> (vel (N,3), ok (N,))``
-        is inverse-distance weighting over the k nearest fluid cells, keeping only cells within 3 voxels and not
+        is inverse-distance weighting over the k nearest fluid cells, keeping only cells within ``radius`` voxels (default 3; a
+        per-call argument) and not
         behind the wall plane through ``base_points`` (so cells on the far side of a thin panel are ignored).
         Processed in chunks to bound memory.
         """
@@ -3443,6 +3444,16 @@ class MultiresIO(object):
                 raise ValueError("solid mask excludes all cells; no fluid data to sample.")
             centroids = np.ascontiguousarray(centroids[fluid])
             vel = np.ascontiguousarray(vel[fluid])
+        # Cells with effectively zero time-averaged velocity are not flow: they are cells that never received data
+        # (sheet layer of a thin single-surface body, covered / inactive cells). Averaged into a probe they drag the
+        # speed to ~0 and stop streamlines mid-panel, so they are left out of the sampling pool.
+        spd = np.linalg.norm(vel, axis=1)
+        zero = spd <= 1e-4 * max(float(np.percentile(spd, 99)), 1e-12)
+        print(f"\tVelocity sampler: {int(zero.sum()):,} of {len(zero):,} fluid cells ({100.0 * float(zero.mean()):.3f}%) "
+              f"have ~zero time-averaged velocity; {'excluded from sampling' if zero.any() else 'none to exclude'}")
+        if zero.any() and not zero.all():
+            centroids = np.ascontiguousarray(centroids[~zero])
+            vel = np.ascontiguousarray(vel[~zero])
         tree = cKDTree(centroids)
         if sample_dx is None:
             sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
@@ -3450,10 +3461,11 @@ class MultiresIO(object):
         max_distance = 3.0 * sample_dx
         kk = min(int(k), len(centroids))
 
-        def sample_velocity(points, base_points, normals, chunk=200000):
+        def sample_velocity(points, base_points, normals, chunk=200000, radius=None):
             points = np.asarray(points, dtype=np.float32)
             base_points = np.asarray(base_points, dtype=np.float64)
             normals = np.asarray(normals, dtype=np.float64)
+            reach = max_distance if radius is None else float(radius) * sample_dx   # radius in voxels, per call
             out_v = np.empty((len(points), 3), dtype=np.float64)
             out_ok = np.empty(len(points), dtype=bool)
             for a in range(0, len(points), chunk):
@@ -3462,7 +3474,7 @@ class MultiresIO(object):
                 if kk == 1:
                     d, idx = d[:, None], idx[:, None]
                 signed = np.einsum("qki,qi->qk", centroids[idx] - base_points[sl][:, None, :], normals[sl])
-                valid = (signed >= -half_space_tolerance * sample_dx) & (d <= max_distance)
+                valid = (signed >= -half_space_tolerance * sample_dx) & (d <= reach)
                 ok = valid.any(axis=1)
                 w = 1.0 / np.maximum(d, 1e-12) ** float(power)
                 w = np.where(ok[:, None], w * valid, w)
@@ -3485,6 +3497,7 @@ class MultiresIO(object):
         streamlines=None,
         ref_area=None,
         cp_field="Cp",
+        skin_gap=0.001,
     ):
         """
         Surface maps from the time-averaged solution, each written to ``<output_prefix>_<name>.usda``.
@@ -3544,17 +3557,24 @@ class MultiresIO(object):
 
         if streamlines is not None:
             step = float(streamlines.get("step", 1.5 * dx))
+            sl_radius = streamlines.get("sampleRadius")
+            sl_sample = sample_velocity if sl_radius is None else (
+                lambda pts, base, nl, _r=float(sl_radius): sample_velocity(pts, base, nl, radius=_r))
             P, NL, SP, valid = sm.wall_streamlines(
-                V, F, N, sample_velocity,
+                V, F, N, sl_sample,
                 spacing=float(streamlines.get("spacing", 0.06)), length=float(streamlines.get("length", 0.3)),
                 step=step, probe_height=probe_height, lift=float(streamlines.get("lift", 0.001)),
-                max_lines=int(streamlines.get("maxLines", 60000)),
+                max_lines=int(streamlines.get("maxLines", 60000)), same_skin=bool(streamlines.get("sameSkin", True)),
+                skin_gap=float(skin_gap),
+                smooth_normals=int(streamlines.get("smoothNormals", 3)),
+                max_step_turn_deg=streamlines.get("maxStepTurn", 30.0),
             )
             if len(P):
                 v, f, vs = sm.polyline_tubes(P, NL, valid, SP, float(streamlines.get("width", 0.002)))
                 out["wall_streamlines"] = self._write_tufts_usd(
                     f"{output_prefix}_wall_streamlines.usda", v, f, vs, streamlines.get("color", "velocity"),
-                    cmap=streamlines.get("cmap", "turbo"), clim=streamlines.get("clim"), prim_name="streamlines",
+                    cmap=streamlines.get("cmap", "turbo"),
+                    clim=streamlines.get("clim"), prim_name="streamlines",
                 )
             else:
                 print("	No wall streamlines generated.")
@@ -3608,6 +3628,9 @@ class MultiresIO(object):
         avg_fields = self.finalize_time_average(keep_state=keep_state)
         sample_velocity, sample_dx = self._velocity_sampler(
             avg_fields, bc_mask, sample_dx, k=k, power=power, half_space_tolerance=half_space_tolerance)
+        if sample_radius is not None:
+            _sv = sample_velocity
+            sample_velocity = lambda pts, base, nl, _r=float(sample_radius): _sv(pts, base, nl, radius=_r)
 
         mesh_v = np.asarray(surface_mesh.vertices, dtype=np.float64)
         mesh_f = np.asarray(surface_mesh.faces, dtype=np.int64)

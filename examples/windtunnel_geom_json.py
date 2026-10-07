@@ -221,11 +221,14 @@ def write_dummy_surface_maps(jsonfile, surface_mesh, output_dir, voxel_size):
         P, NL, SP, valid = sm.wall_streamlines(
             V, F, N, near, spacing=float(d.get("spacing", 0.06)), length=float(d.get("length", 0.3)),
             step=float(d.get("step", 1.5 * voxel_size)), probe_height=probe, lift=float(d.get("lift", 0.001)),
-            max_lines=int(d.get("maxLines", 60000)))
+            max_lines=int(d.get("maxLines", 60000)), same_skin=bool(d.get("sameSkin", True)),
+            skin_gap=wt.resolve_skin_gap(jsonfile), smooth_normals=int(d.get("smoothNormals", 3)),
+            max_step_turn_deg=d.get("maxStepTurn", 30.0))
         if len(P):
             v, f, vs = sm.polyline_tubes(P, NL, valid, SP, float(d.get("width", 0.002)))
             writer._write_tufts_usd(f"{prefix}_wall_streamlines.usda", v, f, vs, d.get("color", "velocity"),
-                                    cmap=d.get("cmap", "turbo"), clim=d.get("clim"), prim_name="streamlines")
+                                    cmap=d.get("cmap", "turbo"), clim=d.get("clim"),
+                                    prim_name="streamlines")
     wt.scm_results_available()
 
 

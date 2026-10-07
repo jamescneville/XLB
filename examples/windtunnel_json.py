@@ -1187,6 +1187,7 @@ def export_surface_maps(jsonfile, h5exporter, sim, surface_mesh, voxel_size, out
             separation=maps["separation"],
             streamlines=maps["streamlines"],
             ref_area=reference_area,
+            skin_gap=resolve_skin_gap(jsonfile),
         )
         scm_results_available()
     except Exception as e:

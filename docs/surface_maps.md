@@ -61,6 +61,8 @@ Tubes that follow the near-wall flow, hugging the surface (1 mm off it by defaul
 | `width` (m) | `0.002` | Tube diameter (3-sided). |
 | `lift` (m) | `0.001` | Height off the surface. |
 | `maxLines` | `60000` | Cap on seeds. |
+| `sampleRadius` | `3` | Voxels: only fluid cells this close to the probe point enter the velocity average (wall streamlines only; the other maps keep 3). Try `2` to keep cells behind a thin panel out; too small and lines stop as "no fluid". |
+| `sameSkin` | `true` | Normals and heights come only from the skin the line is on, so a second skin a few mm away no longer deflects or truncates it (same filter as the tufts). |
 | `color` | `"velocity"` | `"velocity"` (near-wall speed through the colormap) or `[r, g, b]`. |
 | `colorMap`, `velocityMin`, `velocityMax` | as for the tufts | Colour range for `"velocity"`. |
 

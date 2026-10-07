@@ -7,7 +7,7 @@ vertex normals. ``sample_velocity(points, base_points, normals) -> (vel (N,3), o
 import numpy as np
 from scipy.spatial import cKDTree
 
-from xlb.utils.tufts import poisson_roots, _unit
+from xlb.utils.tufts import poisson_roots, local_surface, _unit
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -62,7 +62,26 @@ def separation_index(v_near, v_outer, slow_fraction=0.05):
 # --------------------------------------------------------------------------------------------------------------
 # Wall streamlines
 # --------------------------------------------------------------------------------------------------------------
-def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe_height, lift, turn_cos, vref=None):
+def _smooth_normals(V, F, N, iterations):
+    """Steering normals: vertex normals averaged with their mesh neighbours ``iterations`` times (facet noise, creases)."""
+    if iterations <= 0:
+        return N
+    from scipy.sparse import coo_matrix
+
+    n = len(V)
+    i = np.concatenate([F[:, 0], F[:, 1], F[:, 2], F[:, 1], F[:, 2], F[:, 0]])
+    j = np.concatenate([F[:, 1], F[:, 2], F[:, 0], F[:, 0], F[:, 1], F[:, 2]])
+    A = coo_matrix((np.ones(len(i)), (i, j)), shape=(n, n)).tocsr()
+    A.data[:] = 1.0                                    # duplicates summed above: make it a 0/1 adjacency
+    A = A.multiply(1.0 / np.maximum(np.asarray(A.sum(axis=1)).ravel(), 1.0)[:, None]).tocsr()
+    out = N.copy()
+    for _ in range(int(iterations)):
+        out = _unit(0.5 * out + 0.5 * (A @ out), fallback=N)
+    return out
+
+
+def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe_height, lift, turn_cos, vref=None,
+           same_skin=True, steer=None, max_step_turn=None, skin_gap=0.001):
     T = len(roots)
     P = np.full((T, nsteps + 1, 3), np.nan)
     NL = np.zeros((T, nsteps + 1, 3))
@@ -74,6 +93,7 @@ def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe
     P[:, 0], NL[:, 0], valid[:, 0] = p, nl, True
     alive = np.ones(T, dtype=bool)
     prev = None
+    steer = N if steer is None else steer
     for s in range(nsteps):
         probe = p + nl * max(probe_height - lift, 0.0)
         vel, ok = sample_velocity(probe, base, nl)
@@ -89,11 +109,15 @@ def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe
         stop = ~ok | (um < 1e-3 * vref)
         if prev is not None:
             stop |= np.einsum("ij,ij->i", d, prev) < turn_cos       # sharp reversal: convergence / stagnation line
+        if prev is not None and max_step_turn is not None:
+            # a joint may not swing the line more than max_step_turn from the last step (kills one-step sideways jogs)
+            ang = np.arccos(np.clip(np.einsum("ij,ij->i", d, prev), -1.0, 1.0))
+            a = np.minimum(1.0, max_step_turn / np.maximum(ang, 1e-9))
+            d = _unit((1.0 - a)[:, None] * prev + a[:, None] * d, fallback=d)
         newp = p + d * step
-        dv, vi = tree.query(newp, k=4, workers=-1)
-        w = 1.0 / np.maximum(dv, 1e-4)
-        nl_new = _unit((N[vi] * w[:, :, None]).sum(axis=1), fallback=nl)
-        h = np.einsum("ij,ij->i", newp - V[vi[:, 0]], N[vi[:, 0]])
+        vi, w, v0 = local_surface(tree, V, N, newp, nl, same_skin, skin_gap)
+        nl_new = _unit((steer[vi] * w[:, :, None]).sum(axis=1), fallback=nl)
+        h = np.einsum("ij,ij->i", newp - V[v0], N[v0])
         newp = newp - nl_new * (h - lift)[:, None]
         stop |= np.linalg.norm(newp - p, axis=1) > 2.0 * step      # jumped onto another surface
         alive &= ~stop
@@ -102,7 +126,7 @@ def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe
         valid[alive, s + 1] = True
         p = np.where(alive[:, None], newp, p)
         nl = np.where(alive[:, None], nl_new, nl)
-        base = np.where(alive[:, None], V[vi[:, 0]], base)
+        base = np.where(alive[:, None], V[v0], base)
         prev = np.where(alive[:, None], d, prev if prev is not None else d)
         if not alive.any():
             break
@@ -111,10 +135,14 @@ def _trace(roots, nrm, sample_velocity, tree, V, N, *, sign, nsteps, step, probe
 
 
 def wall_streamlines(vertices, faces, vertex_normals, sample_velocity, *, spacing, length, step, probe_height,
-                     lift=0.001, turn_limit_deg=100.0, seed=0, max_lines=60000, min_joints=4, log=print):
+                     lift=0.001, turn_limit_deg=100.0, seed=0, max_lines=60000, min_joints=4, same_skin=True,
+                     smooth_normals=3, max_step_turn_deg=30.0, skin_gap=0.001, log=print):
     """
     Streamlines that hug the surface and follow the near-wall flow, traced both ways from Poisson-spaced seeds.
     Returns (P (L,J,3), NL (L,J,3), speed (L,J), valid (L,J)); valid joints are contiguous round the seed.
+
+    ``smooth_normals``: smoothing passes on the normals that steer the line (the tangent plane the flow is projected
+    onto). ``max_step_turn_deg``: most a joint may turn the line from the previous step (None = unlimited).
     """
     V = np.asarray(vertices, dtype=np.float64)
     N = np.asarray(vertex_normals, dtype=np.float64)
@@ -127,7 +155,10 @@ def wall_streamlines(vertices, faces, vertex_normals, sample_velocity, *, spacin
         log(f"\tWall streamlines: capped at {max_lines:,} seeds")
     log(f"\tWall streamlines: {len(roots):,} seeds at {spacing * 1000:.0f} mm spacing")
     nsteps = max(1, int(round(0.5 * length / step)))
-    kw = dict(nsteps=nsteps, step=step, probe_height=probe_height, lift=lift, turn_cos=np.cos(np.radians(turn_limit_deg)))
+    steer = _smooth_normals(V, np.asarray(faces, dtype=np.int64), N, smooth_normals)
+    kw = dict(nsteps=nsteps, step=step, probe_height=probe_height, lift=lift, turn_cos=np.cos(np.radians(turn_limit_deg)),
+              same_skin=same_skin, steer=steer, skin_gap=float(skin_gap),
+              max_step_turn=None if max_step_turn_deg is None else np.radians(float(max_step_turn_deg)))
     Pf, NLf, SPf, vf, vref = _trace(roots, nrm, sample_velocity, tree, V, N, sign=+1.0, **kw)
     Pb, NLb, SPb, vb, _ = _trace(roots, nrm, sample_velocity, tree, V, N, sign=-1.0, vref=vref, **kw)
     P = np.concatenate([Pb[:, :0:-1], Pf], axis=1)
