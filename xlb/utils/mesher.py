@@ -3444,6 +3444,10 @@ class MultiresIO(object):
         max_normal_turn_deg=30.0,
         drop_crossing=True,
         seed_clearance=0.6,
+        same_skin=True,
+        refill_passes=2,
+        skin_gap=0.001,
+        sample_radius=None,
         root_inset=0.0008,
         max_tufts=150000,
         k=8,
@@ -3477,11 +3481,21 @@ class MultiresIO(object):
                 raise ValueError("solid mask excludes all cells; no fluid data to sample.")
             centroids = np.ascontiguousarray(centroids[fluid])
             vel = np.ascontiguousarray(vel[fluid])
+        # Cells with effectively zero time-averaged velocity are not flow: they are cells that never received data
+        # (sheet layer of a thin single-surface body, covered / inactive cells). Averaged into a probe they drag the
+        # speed to ~0 and stop streamlines mid-panel, so they are left out of the sampling pool.
+        spd = np.linalg.norm(vel, axis=1)
+        zero = spd <= 1e-4 * max(float(np.percentile(spd, 99)), 1e-12)
+        print(f"\tVelocity sampler: {int(zero.sum()):,} of {len(zero):,} fluid cells ({100.0 * float(zero.mean()):.3f}%) "
+              f"have ~zero time-averaged velocity; {'excluded from sampling' if zero.any() else 'none to exclude'}")
+        if zero.any() and not zero.all():
+            centroids = np.ascontiguousarray(centroids[~zero])
+            vel = np.ascontiguousarray(vel[~zero])
         tree = cKDTree(centroids)
         if sample_dx is None:
             sample_dx = min(float(vs) for (_, vs, _, _) in self.levels_data)
         sample_dx = float(sample_dx)
-        max_distance = 3.0 * sample_dx
+        max_distance = (3.0 if sample_radius is None else float(sample_radius)) * sample_dx
         kk = min(int(k), len(centroids))
 
         def sample_velocity(points, base_points, normals):
@@ -3505,7 +3519,8 @@ class MultiresIO(object):
             shape=shape, root_inset=root_inset, max_tufts=max_tufts, seed=seed, tape_size=tape_size,
             tape_offset=tape_offset, max_elevation_deg=max_elevation_deg, max_push=max_push,
             follow_surface=follow_surface, max_normal_turn_deg=max_normal_turn_deg, drop_crossing=drop_crossing,
-            seed_clearance=seed_clearance,
+            seed_clearance=seed_clearance, same_skin=same_skin, refill_passes=refill_passes,
+            skin_gap=skin_gap,
         )
         if n_tufts == 0:
             print("\tNo tufts generated; nothing written.")

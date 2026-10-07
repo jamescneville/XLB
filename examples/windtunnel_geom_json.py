@@ -144,8 +144,9 @@ def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
     normals = writer._repair_and_smooth_vertex_normals(surface_mesh)
     tape_args = wt.tuft_tape_args(jsonfile)
     limits = wt.tuft_shape_limits(jsonfile)          # maxElevation, maxPush, followSurface, maxNormalTurn
+    limits.pop("sample_radius", None)                # the dummy field samples no cells
     print(f" Tufts: followSurface={limits['follow_surface']} (maxNormalTurn {limits['max_normal_turn_deg']:g} deg/segment), "
-          f"dropCrossing={limits['drop_crossing']}, seedClearance={limits['seed_clearance']:g}, maxElevation {limits['max_elevation_deg']:g} deg, maxPush "
+          f"dropCrossing={limits['drop_crossing']}, sameSkin={limits['same_skin']}, refillPasses={limits['refill_passes']}, seedClearance={limits['seed_clearance']:g}, maxElevation {limits['max_elevation_deg']:g} deg, maxPush "
           f"{'half a segment' if limits['max_push'] is None else str(limits['max_push']) + ' m'}")
     verts, faces, n, speed, tape = build_tufts(
         np.asarray(surface_mesh.vertices, dtype=np.float64), np.asarray(surface_mesh.faces, dtype=np.int64),
@@ -153,9 +154,7 @@ def write_dummy_tufts(jsonfile, surface_mesh, output_dir, voxel_size):
         spacing=float(cfg.get("spacing", 0.03)), length=length, width=float(cfg.get("width", 0.0015)),
         probe_height=probe_height, shape=shape, root_inset=float(cfg.get("rootInset", 0.0008)),
         max_tufts=int(cfg.get("maxTufts", 150000)), tape_size=tape_args["tape_size"], tape_offset=tape_args["tape_offset"],
-        max_elevation_deg=limits["max_elevation_deg"], max_push=limits["max_push"],
-        follow_surface=limits["follow_surface"], max_normal_turn_deg=limits["max_normal_turn_deg"],
-        drop_crossing=limits["drop_crossing"], seed_clearance=limits["seed_clearance"],
+        **limits,
     )
     if n == 0:
         print(" No tufts generated.")
