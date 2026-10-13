@@ -11,6 +11,7 @@ import warp as wp
 from xlb.operator.stepper import MultiresIncompressibleNavierStokesStepper
 from xlb.operator.macroscopic import MultiresMacroscopic
 from xlb.mres_perf_optimization_type import MresPerfOptimizationType
+from xlb.precision_policy import Precision
 
 
 class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
@@ -52,8 +53,9 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         force_vector=None,
         initializer=None,
         mres_perf_opt: MresPerfOptimizationType = MresPerfOptimizationType.NAIVE_COLLIDE_STREAM,
+        smagorinsky_constant = 0.0
     ):
-        super().__init__(grid, boundary_conditions, collision_type, forcing_scheme, force_vector)
+        super().__init__(grid, boundary_conditions, collision_type, forcing_scheme, force_vector, smagorinsky_constant)
 
         self.initializer = initializer
         self.count_levels = grid.count_levels
@@ -62,15 +64,98 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         # Create fields
         self.rho = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
         self.u = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.rho0 = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
+        self.u0 = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.rho1 = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
+        self.u1 = grid.create_field(cardinality=3, dtype=self.precision_policy.store_precision)
+        self.relax = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
         self.coalescence_factor = grid.create_field(cardinality=self.velocity_set.q, dtype=self.precision_policy.store_precision)
+
+        # Dedicated ExtrapolationOutflowBC storage.  The BC no longer hides
+        # auxiliary values inside physical distribution populations because
+        # those populations participate in multires coalescence/explosion.
+        #
+        # Allocate only when ExtrapolationOutflowBC is present and only the
+        # number of crossing populations required by a planar face
+        # (D3Q27 -> 9 rather than 27).  Neon mFields inherit the parent mGrid
+        # sparsity, so this first correctness pass still allocates those nine
+        # components on active voxels; only actual Extrap BC cells are accessed.
+        extrap_bcs = [
+            bc for bc in self.boundary_conditions
+            if getattr(bc, "uses_dedicated_aux_field", False)
+        ]
+        self.extrap_aux_levels = []
+        if extrap_bcs:
+            import neon
+
+            aux_cardinality = max(
+                int(bc.extrap_aux_cardinality) for bc in extrap_bcs
+            )
+            self.extrap_aux = grid.create_field(
+                cardinality=aux_cardinality,
+                dtype=self.precision_policy.store_precision,
+                neon_memory_type=neon.MemoryType.device(),
+            )
+
+            # We already know the explicit outlet indices.  Use them to avoid
+            # launching the one-time initialization kernel on levels where this
+            # BC does not exist.  This reduces initialization work (allocation
+            # remains tied to the parent mGrid; see comment above).
+            levels = set()
+            for bc in extrap_bcs:
+                if bc.indices is None:
+                    levels.update(range(self.count_levels))
+                    continue
+                for level, level_indices in enumerate(bc.indices):
+                    if level_indices is None or len(level_indices) == 0:
+                        continue
+                    try:
+                        has_points = len(level_indices[0]) > 0
+                    except (TypeError, IndexError):
+                        has_points = False
+                    if has_points:
+                        levels.add(level)
+            self.extrap_aux_levels = sorted(levels)
+        else:
+            self.extrap_aux = None
+
+        # One byte/voxel topology classification used only by the specialised
+        # finest SFV/CFV modes. It is computed once after masks are finalised
+        # and reused for every timestep because the multires grid is static.
+        if self.mres_perf_opt in (
+            MresPerfOptimizationType.FUSION_AT_FINEST_SFV,
+            MresPerfOptimizationType.FUSION_AT_FINEST_SFV_ALL,
+        ):
+            self.needs_mres = grid.create_field(cardinality=1, dtype=Precision.UINT8)
+        else:
+            self.needs_mres = None
 
         for level in range(self.count_levels):
             self.u.fill_run(level, 0.0, 0)
             self.rho.fill_run(level, 1.0, 0)
+            self.u0.fill_run(level, 0.0, 0)
+            self.rho0.fill_run(level, 1.0, 0)
+            self.u1.fill_run(level, 0.0, 0)
+            self.rho1.fill_run(level, 1.0, 0)
+            self.relax.fill_run(level, 0.0, 0)
             self.coalescence_factor.fill_run(level, 0.0, 0)
+            if self.needs_mres is not None:
+                self.needs_mres.fill_run(level, 0, 0)
 
         # Prepare fields
-        self.f_0, self.f_1, self.bc_mask, self.missing_mask = self.prepare_fields(self.rho, self.u, self.initializer)
+        self.f_0, self.f_1, self.bc_mask, self.missing_mask, self.normal_vector, self.normal_distance = self.prepare_fields(self.rho, self.u, self.initializer)
+
+        if self.extrap_aux is not None:
+            for level in self.extrap_aux_levels:
+                self.neon_container["initialize_extrap_aux"](
+                    level,
+                    self.f_0,
+                    self.bc_mask,
+                    self.missing_mask,
+                    self.extrap_aux,
+                ).run(0)
+            wp.synchronize()
+
         self.prepare_coalescence_count(coalescence_factor=self.coalescence_factor, bc_mask=self.bc_mask)
 
         self.iteration_idx = -1
@@ -148,8 +233,8 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             return
 
         omega = self.omega_list[level]
-        fields = dict(f_0_fd=self.f_0, f_1_fd=self.f_1, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask)
-        fields_swapped = dict(f_0_fd=self.f_1, f_1_fd=self.f_0, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask)
+        fields = dict(f_0_fd=self.f_0, f_1_fd=self.f_1, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask, _rho0=self.rho0, _u0=self.u0, _rho1=self.rho1, _u1=self.u1, _relax=self.relax,normal_vector = self.normal_vector, normal_distance = self.normal_distance)
+        fields_swapped = dict(f_0_fd=self.f_1, f_1_fd=self.f_0, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask, _rho0=self.rho1, _u0=self.u1, _rho1=self.rho0, _u1=self.u0, _relax=self.relax,normal_vector = self.normal_vector, normal_distance = self.normal_distance)
 
         if level == 0 and config["finest_ops"] is not None:
             for op_name, swap, extra in config["finest_ops"]:
@@ -158,7 +243,18 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             return
 
         for op_name in config["coarse_collide_ops"]:
-            self.add_to_app(app=app, op_name=op_name, level=level, **fields, omega=omega, timestep=0)
+            collide_extra = {}
+            if op_name in ("collide_coarse", "CFV_collide_coarse"):
+                collide_extra["extrap_aux_fd"] = self.extrap_aux
+            self.add_to_app(
+                app=app,
+                op_name=op_name,
+                level=level,
+                **fields,
+                omega=omega,
+                timestep=0,
+                **collide_extra,
+            )
 
         if config["fuse_finest"] and level - 1 == 0:
             self._build_recursion(level - 1, app, config)
@@ -181,17 +277,27 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         """
         self.app = []
 
-        stream_abc = {"coalescence_factor": self.coalescence_factor, "timestep": 0}
+        stream_abc = {
+            "coalescence_factor": self.coalescence_factor,
+            "timestep": 0,
+            "extrap_aux_fd": self.extrap_aux,
+        }
 
         # Finest-level op descriptors: (op_name, swap_f0_f1, extra_kwargs)
         fused_pull_finest = [
-            ("finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
-            ("finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+            ("finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
+            ("finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
         ]
+        # Finest-level structural specialization. Each CFV class is a separate
+        # compiled kernel so the common MRES/no-BC path contains no BC/wall code.
         sfv_fused_pull_finest = [
-            ("CFV_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True}),
+            ("CFV_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_MRES_NOBC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_MRES_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
             ("SFV_finest_fused_pull", False, {}),
-            ("CFV_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False}),
+            ("CFV_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_MRES_NOBC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_MRES_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
             ("SFV_finest_fused_pull", True, {}),
         ]
 
@@ -229,12 +335,22 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         # Pre-recursion SFV mask setup
         if self.mres_perf_opt == MresPerfOptimizationType.FUSION_AT_FINEST_SFV:
             wp.synchronize()
-            self.neon_container["SFV_reset_bc_mask"](0, self.f_0, self.f_1, self.bc_mask, self.bc_mask).run(0)
+            self.neon_container["SFV_reset_bc_mask"](0, self.f_0, self.f_1, self.bc_mask, self.bc_mask,
+                    self.rho0, self.u0, self.rho1, self.u1,self.relax,self.normal_vector,self.normal_distance).run(0)
             wp.synchronize()
         elif self.mres_perf_opt == MresPerfOptimizationType.FUSION_AT_FINEST_SFV_ALL:
             wp.synchronize()
             for l in range(self.f_0.get_grid().num_levels):
-                self.neon_container["SFV_reset_bc_mask"](l, self.f_0, self.f_1, self.bc_mask, self.bc_mask).run(0)
+                self.neon_container["SFV_reset_bc_mask"](l, self.f_0, self.f_1, self.bc_mask, self.bc_mask,
+                    self.rho0, self.u0, self.rho1, self.u1,self.relax,self.normal_vector,self.normal_distance).run(0)
+            wp.synchronize()
+
+        if self.needs_mres is not None:
+            # Topology and BC masks are now final. Classify the finest level once;
+            # both ping and pong fused passes read the same immutable byte field.
+            self.neon_container["mark_needs_mres"](
+                0, self.f_0, self.bc_mask, self.needs_mres
+            ).run(0)
             wp.synchronize()
 
         self._build_recursion(self.count_levels - 1, self.app, config)

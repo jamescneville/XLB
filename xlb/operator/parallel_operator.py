@@ -1,4 +1,5 @@
-from jax import shard_map
+#from jax import shard_map
+from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 from jax import lax
 

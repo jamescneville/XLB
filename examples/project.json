@@ -1,0 +1,234 @@
+{
+
+"mesher":{
+	"type":"mres",
+	"cuboid": [
+	[3, 4, 2.5, 2.5, 0, 4],  
+	[1.2, 1.25, 1.75, 1.75, 0, 1.65],  
+	[0.8, 1, 1.25, 1.25, 0, 1.25],  
+	[0.4, 0.4, 0.25, 0.25, 0, 0.2]
+	],
+	"mres":{
+		"levels":6,
+		"domain":{
+			"-x": 1.500,
+			"x": 2.0,
+			"-y": 4.0,
+			"y": 4.0,
+			"-z": 0.00,
+			"z": 5.0
+			},	
+		
+		"padding":[
+		[20, 150, 20, 20, 20, 20],
+		[20, 100, 15, 15, 15, 15],
+		[10, 200, 8, 8, 8, 8],
+		[8, 200, 8, 8, 8, 8],
+        [8, 30, 8, 8, 8, 8],
+		[8, 30, 8, 8, 8, 8],
+		[8, 30, 8, 8, 8, 8]
+		],
+		"ground_refinement_level":3,
+		"ground_voxel_height":4		
+	},
+	"trim":true,
+	"trim_voxels":4,
+	"close_voxels":0
+},			
+"vehicle":{
+	"body": [
+            "stl/AIF_body.obj"
+        ],
+        "wheels": [ 
+			"stl/AIF_front_left.obj",
+			"stl/AIF_front_right.obj",
+			"stl/AIF_rear_left.obj",
+			"stl/AIF_rear_right.obj"
+		]
+	
+},
+"outputName": "AIF_baseline5", 
+"fluid": {
+	"density": 1.2047,
+	"diffusivity": 1.0,
+	"viscosity": 1.817e-05
+		},
+"InletBC":{
+	"x": 27.0,
+	"y": 0.0,
+	"z": 0.0
+	},
+"settings": {	
+	"debug": false,
+	"doublePrecision": false,
+	"iterations": 100,
+	"solutionPrintFreq": 1,
+	"forcePrintFreq": 2,
+	"avgPrintFreq": 5,
+	"crossover":70, 
+	"preCrossover_frames":1, 
+	"postCrossover_frames":1, 	
+	"ulb":0.12,			
+	"fullData": true,
+	"flowPasses":2.0,
+	"voxelSize": 0.009,      
+	"limit":900,
+    "optimization":"254",	
+    "sgs": 0.1,
+	"isoQuantity":"CpTotalLoss",
+	"isoValue":0.85,
+	"isoGrid": 1024,
+	"isoScale": 1000,
+	"surfaceField": "Cp",
+	"surfaceFieldMin": -0.75,
+	"surfaceFieldMax": 0.75,
+	"surfaceFieldColorMap": "turbo",
+	"surfaceFieldExport":"both",
+	"surfaceFieldScope": "body",
+	"surfaceRemesh": {
+		"enabled": true,
+		"targetEdge": 0.008,
+		"maxFaces": 2000000,
+		"curvatureAdaptive": {
+			"enabled": true,
+			"minEdge": 0.003,
+			"maxEdge": 0.008,
+			"tolerance": 0.0015,
+			"gradation": 0.4
+		},
+		"wrap": {
+			"enabled": true,
+			"resolution": 0.004,
+			"offset": 0.003,
+			"snapOffset": 0.001,
+			"relaxIterations": 3
+		}
+	}
+
+},
+
+"surface_tufts": {
+	"enabled": true,
+	"probeHeight": 0.005,
+	"tuftShape": "tube",
+	"tuftLength": 0.05,
+	"tuftWidth": 0.0015,
+	"tuftSpacing": 0.03,
+	"tuftColor": "velocity",
+	"tuftColorMap": "nipy_spectral",
+	"tuftColorMin": 0.0,
+	"tuftColorMax": 1.5,	
+	"rootInset": 0.0008,
+	"maxTufts": 150000,
+	"tapeSize": 0.015,
+	"tapeColor": [0.2, 0.55, 1.0],
+	"skinGap": 0.001
+},
+"surface_streamlines": {
+	"enabled": true,
+	"probeHeight": 0.005,
+	"streamlineLength": 0.6,
+	"streamlineWidth": 0.002,
+	"streamlineSpacing": 0.06,
+	"streamlineColor": "velocity",
+	"streamlineColorMap": "nipy_spectral",
+	"streamlineColorMin": 0.0,
+	"streamlineColorMax": 1.5,	
+	"skinGap": 0.001
+},
+
+
+"slices":{
+	"grid_res": 1000, 
+	"velocity": true,
+	"velocityFactor": 1.5,
+	"velocityColorMap":"nipy_spectral",
+	"pressure":false,
+	"pressureMin": 101300,
+	"pressureMax": 101600,
+	"pressureColorMap":"turbo",
+	"cp":true,
+	"cpMin": -0.9,
+	"cpMax": 0.9,
+	"cpColorMap":"bwr",
+	"cptotal":false,
+	"cptotalMin": 0.5,
+	"cptotalMax": 1.0,
+	"cptotalColorMap":"turbo",
+	"cptotalloss":false,
+	"cptotallossMin": 0.0,
+	"cptotallossMax": 0.9,
+	"cptotallossColorMap":"seismic",
+    "numSlices": 11
+
+},
+"BCtypes": {
+	"inlet": "nonequilibrium_regularized",
+	"car": "nonequilibrium_regularized",
+    "car_voxelization":"AABB",    
+	"wheels": "nonequilibrium_regularized",
+    "wheel_voxelization":"AABB",
+    "wheel_motion":true,
+	"ground": "moving",
+	"walls": "moving"
+},	
+"outputSlices": [
+	{
+	"field": "velocity_magnitude",
+	"axis": "X",
+	"height": 3,
+	"heightVec": {
+		"x": 0.0,
+		"y": 0.0,
+		"z": 1.0
+	},
+	"width": 4,
+	"widthVec": {
+		"x": 0.0,
+		"y": 1.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	},
+	{
+	"field": "velocity_magnitude",
+	"axis": "Y",
+	"height": 3,
+	"heightVec": {
+		"x": 0.0,
+		"y": 0.0,
+		"z": 1.0
+	},
+	"width": 12,
+	"widthVec": {
+		"x": 1.0,
+		"y": 0.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	},
+	{
+	"field": "velocity_magnitude",
+	"axis": "Z",
+	"height": 4,
+	"heightVec": {
+		"x": 0.0,
+		"y": 1.0,
+		"z": 0.0
+	},
+	"width": 12,
+	"widthVec": {
+		"x": 1,
+		"y": 0.0,
+		"z": 0.0
+	},
+	"loadCase": 0,
+	"origin": []
+	}
+		
+			
+	]
+	
+}

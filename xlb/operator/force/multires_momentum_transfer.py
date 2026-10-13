@@ -32,6 +32,9 @@ class MultiresMomentumTransfer(MomentumTransfer):
     velocity_set : VelocitySet, optional
     precision_policy : PrecisionPolicy, optional
     compute_backend : ComputeBackend, optional
+    moment_reference_point=None keeps the operator force-only.  
+    Supplying a 3-component lattice-coordinate reference point enables pitch/roll/yaw moment
+    accumulation using the same momentum-exchange forces.
     """
 
     def __init__(
@@ -41,13 +44,13 @@ class MultiresMomentumTransfer(MomentumTransfer):
         velocity_set: VelocitySet = None,
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
+        moment_reference_point=None,
     ):
         from xlb.operator.force.momentum_transfer import LBMOperationSequence
 
         if compute_backend in [ComputeBackend.JAX, ComputeBackend.WARP]:
             raise NotImplementedError(f"Operator {self.__class__.__name__} not supported in {compute_backend} backend.")
 
-        # Set the sequence of operations based on the performance optimization type
         if mres_perf_opt == MresPerfOptimizationType.NAIVE_COLLIDE_STREAM:
             operation_sequence = LBMOperationSequence.COLLIDE_THEN_STREAM
         elif mres_perf_opt in (
@@ -59,25 +62,29 @@ class MultiresMomentumTransfer(MomentumTransfer):
         else:
             raise ValueError(f"Unknown performance optimization type: {mres_perf_opt}")
 
-        # Check if the performance optimization type is compatible with the use of mesh distance
         if operation_sequence != LBMOperationSequence.STREAM_THEN_COLLIDE:
             assert not no_slip_bc_instance.needs_mesh_distance, (
-                "Mesh distance is only supported in the MultiresMomentumTransfer operator when the LBM operation sequence is STREAM_THEN_COLLIDE."
+                "Mesh distance is only supported in the MultiresMomentumTransfer operator "
+                "when the LBM operation sequence is STREAM_THEN_COLLIDE."
             )
 
-        # Print a warning to the user about the boundary voxels
         print(
             "WARNING! make sure boundary voxels are all at the same level and not among the transition regions from one level to another. "
             "Otherwise, the results of force calculation are not correct!\n"
         )
 
-        # Call super
-        super().__init__(no_slip_bc_instance, operation_sequence, velocity_set, precision_policy, compute_backend)
+        super().__init__(
+            no_slip_bc_instance,
+            operation_sequence,
+            velocity_set,
+            precision_policy,
+            compute_backend,
+            moment_reference_point=moment_reference_point,
+        )
 
     def _construct_neon(self):
         import neon
 
-        # Use the warp functional for the NEON backend
         functional, _ = self._construct_warp()
 
         @neon.Container.factory(name="MomentumTransfer")
@@ -87,6 +94,12 @@ class MultiresMomentumTransfer(MomentumTransfer):
             bc_mask: Any,
             missing_mask: Any,
             force: Any,
+            moment: Any,
+            _rho: Any,
+            _u: Any,
+            _relax: Any,
+            _norm_vec: Any,
+            _norm_dist: Any,
             level: Any,
         ):
             def container_launcher(loader: neon.Loader):
@@ -95,10 +108,14 @@ class MultiresMomentumTransfer(MomentumTransfer):
                 missing_mask_pn = loader.get_mres_write_handle(missing_mask)
                 f_0_pn = loader.get_mres_write_handle(f_0)
                 f_1_pn = loader.get_mres_write_handle(f_1)
+                _rho0_pn = loader.get_mres_read_handle(_rho)
+                _u0_pn = loader.get_mres_read_handle(_u)
+                _relax_pn = loader.get_mres_read_handle(_relax)
+                _norm_vec_pn = loader.get_mres_read_handle(_norm_vec)
+                _norm_dist_pn = loader.get_mres_read_handle(_norm_dist)
 
                 @wp.func
                 def container_kernel(index: Any):
-                    # apply the functional
                     functional(
                         index,
                         f_0_pn,
@@ -106,6 +123,12 @@ class MultiresMomentumTransfer(MomentumTransfer):
                         bc_mask_pn,
                         missing_mask_pn,
                         force,
+                        moment,
+                        _rho0_pn,
+                        _u0_pn,
+                        _relax_pn,
+                        _norm_vec_pn,
+                        _norm_dist_pn,
                     )
 
                 loader.declare_kernel(container_kernel)
@@ -121,19 +144,39 @@ class MultiresMomentumTransfer(MomentumTransfer):
         f_1,
         bc_mask,
         missing_mask,
+        _rho=None,
+        _u=None,
+        _relax=None,
+        _norm_vec_pn=None,
+        _norm_dist_pn=None,
         stream=0,
     ):
         import neon
 
-        # Ensure the force is initialized to zero
-        self.force *= self.compute_dtype(0.0)
+        if _rho is None or _u is None:
+            raise TypeError("rho and u must be provided: momentum_transfer(f_0, f_1, bc_mask, missing_mask, rho, u)")
 
-        # Define the neon functionals needed for this operation
+        self.force *= self.compute_dtype(0.0)
+        if self.moment_reference_point is not None:
+            self.moment *= self.compute_dtype(0.0)
         self.fetcher_functional = self.fetcher.neon_functional
 
         grid = bc_mask.get_grid()
         for level in range(grid.num_levels):
-            # Launch the neon container
-            c = self.neon_container(f_0, f_1, bc_mask, missing_mask, self.force, level)
+            c = self.neon_container(
+                f_0,
+                f_1,
+                bc_mask,
+                missing_mask,
+                self.force,
+                self.moment,
+                _rho,
+                _u,
+                _relax,
+                _norm_vec_pn,
+                _norm_dist_pn,
+                level,
+            )
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
+
         return self.force.numpy()[0]

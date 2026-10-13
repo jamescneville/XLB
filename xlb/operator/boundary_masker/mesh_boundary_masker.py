@@ -67,92 +67,241 @@ class MeshBoundaryMasker(Operator):
             missing = not self.helper_masker.is_in_bounds(pull_index, grid_shape)
             return missing
 
-        # Function to precompute useful values per triangle, assuming spacing is (1,1,1)
-        # inputs: verts: triangle vertices, normal: triangle unit normal
-        # outputs: dist1, dist2, normal_edge0, normal_edge1, dist_edge
         @wp.func
-        def pre_compute(
-            verts: wp.mat33f,  # triangle vertices
-            normal: wp.vec3f,  # triangle normal
-        ):
-            corner = wp.vec3f(float(normal[0] > 0.0), float(normal[1] > 0.0), float(normal[2] > 0.0))
+        def _min3(a: wp.float32, b: wp.float32, c: wp.float32):
+            return wp.min(a, wp.min(b, c))
 
-            dist1 = wp.dot(normal, corner - verts[0])
-            dist2 = wp.dot(normal, wp.vec3f(1.0, 1.0, 1.0) - corner - verts[0])
-
-            edges = wp.transpose(wp.mat33(verts[1] - verts[0], verts[2] - verts[1], verts[0] - verts[2]))
-            normal_edge0 = wp.mat33f(0.0)
-            normal_edge1 = wp.mat33f(0.0)
-            dist_edge = wp.mat33f(0.0)
-
-            for axis0 in range(0, 3):
-                axis1 = (axis0 + 1) % 3
-                axis2 = (axis0 + 2) % 3
-
-                sgn = 1.0
-                if normal[axis2] < 0.0:
-                    sgn = -1.0
-
-                for i in range(0, 3):
-                    normal_edge0[i, axis0] = -1.0 * sgn * edges[i, axis1]
-                    normal_edge1[i, axis0] = sgn * edges[i, axis0]
-
-                    dist_edge[i, axis0] = (
-                        -1.0 * (normal_edge0[i, axis0] * verts[i, axis0] + normal_edge1[i, axis0] * verts[i, axis1])
-                        + wp.max(0.0, normal_edge0[i, axis0])
-                        + wp.max(0.0, normal_edge1[i, axis0])
-                    )
-
-            return dist1, dist2, normal_edge0, normal_edge1, dist_edge
-
-        # Check whether this triangle intersects the unit cube at position low
         @wp.func
-        def triangle_box_intersect(
-            low: wp.vec3f,
-            normal: wp.vec3f,
-            dist1: wp.float32,
-            dist2: wp.float32,
-            normal_edge0: wp.mat33f,
-            normal_edge1: wp.mat33f,
-            dist_edge: wp.mat33f,
-        ):
-            if (wp.length(normal) > 0.0) and (wp.dot(normal, low) + dist1) * (wp.dot(normal, low) + dist2) <= 0.0:
-                intersect = True
-                #  Loop over primary axis for projection
-                for ax0 in range(0, 3):
-                    ax1 = (ax0 + 1) % 3
-                    for i in range(0, 3):
-                        intersect = intersect and (normal_edge0[i, ax0] * low[ax0] + normal_edge1[i, ax0] * low[ax1] + dist_edge[i, ax0] >= 0.0)
+        def _max3(a: wp.float32, b: wp.float32, c: wp.float32):
+            return wp.max(a, wp.max(b, c))
 
-                return intersect
-            else:
+        @wp.func
+        def _sat_axis_overlap(
+            axis: wp.vec3f,
+            v0: wp.vec3f,
+            v1: wp.vec3f,
+            v2: wp.vec3f,
+            half: wp.vec3f,
+            eps: wp.float32,
+        ):
+            """
+            Separating-axis test for one candidate axis.
+
+            This does not care about normal orientation. The axis sign is irrelevant
+            because we test both min/max projection against +/- projected box radius.
+            """
+            axis_len2 = wp.dot(axis, axis)
+
+            # Degenerate cross-product axis. It cannot separate.
+            if axis_len2 <= wp.float32(1.0e-20):
+                return True
+
+            p0 = wp.dot(v0, axis)
+            p1 = wp.dot(v1, axis)
+            p2 = wp.dot(v2, axis)
+
+            tri_min = _min3(p0, p1, p2)
+            tri_max = _max3(p0, p1, p2)
+
+            box_radius = (
+                half[0] * wp.abs(axis[0])
+                + half[1] * wp.abs(axis[1])
+                + half[2] * wp.abs(axis[2])
+            )
+
+            if tri_min > box_radius + eps:
                 return False
+
+            if tri_max < -box_radius - eps:
+                return False
+
+            return True
+
+        @wp.func
+        def _triangle_overlaps_expanded_unit_cube(
+            v0_local: wp.vec3f,
+            v1_local: wp.vec3f,
+            v2_local: wp.vec3f,
+            surface_band_voxels: wp.float32,
+        ):
+            """
+            Conservative triangle / expanded-voxel overlap test.
+
+            The voxel is the unit cube [0, 1]^3 in local coordinates.
+            We expand that cube by `surface_band_voxels` in all directions, so
+            the tested box is:
+
+                [-band, 1 + band]^3
+
+            A triangle exactly on a shared voxel face will overlap both adjacent
+            expanded voxel boxes.
+
+            This is a SAT triangle-AABB test. It uses a triangle plane normal
+            computed from geometry, but the sign/orientation of that normal is
+            irrelevant.
+            """
+            eps = wp.float32(1.0e-6)
+
+            center = wp.vec3f(0.5, 0.5, 0.5)
+            half = wp.vec3f(
+                0.5 + surface_band_voxels,
+                0.5 + surface_band_voxels,
+                0.5 + surface_band_voxels,
+            )
+
+            # Shift triangle into box-centered coordinates.
+            v0 = v0_local - center
+            v1 = v1_local - center
+            v2 = v2_local - center
+
+            # 1. Test overlap along box x/y/z axes.
+            min_x = _min3(v0[0], v1[0], v2[0])
+            max_x = _max3(v0[0], v1[0], v2[0])
+            if min_x > half[0] + eps or max_x < -half[0] - eps:
+                return False
+
+            min_y = _min3(v0[1], v1[1], v2[1])
+            max_y = _max3(v0[1], v1[1], v2[1])
+            if min_y > half[1] + eps or max_y < -half[1] - eps:
+                return False
+
+            min_z = _min3(v0[2], v1[2], v2[2])
+            max_z = _max3(v0[2], v1[2], v2[2])
+            if min_z > half[2] + eps or max_z < -half[2] - eps:
+                return False
+
+            # Triangle edges.
+            e0 = v1 - v0
+            e1 = v2 - v1
+            e2 = v0 - v2
+
+            # 2. Test triangle plane axis.
+            # Orientation does not matter because the plane test is symmetric.
+            normal = wp.cross(e0, v2 - v0)
+            normal_len2 = wp.dot(normal, normal)
+
+            if normal_len2 <= wp.float32(1.0e-20):
+                # Degenerate triangle. Conservatively ignore it rather than
+                # letting zero-area geometry thicken the solid mask.
+                return False
+
+            plane_dist = wp.dot(normal, v0)
+            plane_radius = (
+                half[0] * wp.abs(normal[0])
+                + half[1] * wp.abs(normal[1])
+                + half[2] * wp.abs(normal[2])
+            )
+
+            if plane_dist > plane_radius + eps:
+                return False
+
+            if plane_dist < -plane_radius - eps:
+                return False
+
+            # 3. Test the 9 cross-product axes: edge x box-axis.
+            # For edge e = (ex, ey, ez):
+            #   e x X = (0, ez, -ey)
+            #   e x Y = (-ez, 0, ex)
+            #   e x Z = (ey, -ex, 0)
+
+            axis = wp.vec3f(0.0, e0[2], -e0[1])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(-e0[2], 0.0, e0[0])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(e0[1], -e0[0], 0.0)
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(0.0, e1[2], -e1[1])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(-e1[2], 0.0, e1[0])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(e1[1], -e1[0], 0.0)
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(0.0, e2[2], -e2[1])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(-e2[2], 0.0, e2[0])
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            axis = wp.vec3f(e2[1], -e2[0], 0.0)
+            if not _sat_axis_overlap(axis, v0, v1, v2, half, eps):
+                return False
+
+            return True
 
         # Check whether the unit voxel at position low intersects the warp mesh, assumes mesh has valid normals
         #  inputs: mesh_id: mesh id, low: position of the voxel
         #  outputs: True if intersection, False otherwise
         @wp.func
         def mesh_voxel_intersect(mesh_id: wp.uint64, low: wp.vec3):
-            query = wp.mesh_query_aabb(mesh_id, low, low + wp.vec3f(1.0, 1.0, 1.0))
+            """
+            Conservative surface-band voxelization.
+
+            A voxel is solid if the triangle overlaps the voxel cube expanded by
+            SURFACE_BAND_VOXELS.
+
+            This intentionally does not ask which side of the surface is solid.
+            Therefore, if a triangle lies on or very near a voxel face, both
+            adjacent voxels will be tagged solid.
+            """
+            # In voxel units.
+            #
+            # Start with 1e-3. This means the surface gets a 0.001-voxel
+            # conservative band. If your STL/grid alignment noise is larger,
+            # increase to 1e-2. If you only want exact face ties, reduce to 1e-4.
+            SURFACE_BAND_VOXELS = wp.float32(5.0e-3)
+
+            band_vec = wp.vec3f(
+                SURFACE_BAND_VOXELS,
+                SURFACE_BAND_VOXELS,
+                SURFACE_BAND_VOXELS,
+            )
+
+            high = low + wp.vec3f(1.0, 1.0, 1.0)
+
+            # Broad phase: query the same expanded box used by the narrow phase.
+            # This prevents triangles on the voxel face from being dropped before
+            # the actual overlap test.
+            query = wp.mesh_query_aabb(
+                mesh_id,
+                low - band_vec,
+                high + band_vec,
+            )
 
             for f in query:
-                v0 = wp.mesh_eval_position(mesh_id, f, 1.0, 0.0)
-                v1 = wp.mesh_eval_position(mesh_id, f, 0.0, 1.0)
-                v2 = wp.mesh_eval_position(mesh_id, f, 0.0, 0.0)
-                normal = wp.mesh_eval_face_normal(mesh_id, f)
+                v0_global = wp.mesh_eval_position(mesh_id, f, 1.0, 0.0)
+                v1_global = wp.mesh_eval_position(mesh_id, f, 0.0, 1.0)
+                v2_global = wp.mesh_eval_position(mesh_id, f, 0.0, 0.0)
 
-                v = wp.transpose(wp.mat33f(v0, v1, v2))
+                # Shift triangle into local voxel coordinates.
+                # The voxel cube is now [0, 1]^3.
+                v0_local = v0_global - low
+                v1_local = v1_global - low
+                v2_local = v2_global - low
 
-                # TODO: run this on triangles in advance
-                dist1, dist2, normal_edge0, normal_edge1, dist_edge = pre_compute(verts=v, normal=normal)
-
-                if triangle_box_intersect(
-                    low=low, normal=normal, dist1=dist1, dist2=dist2, normal_edge0=normal_edge0, normal_edge1=normal_edge1, dist_edge=dist_edge
+                if _triangle_overlaps_expanded_unit_cube(
+                    v0_local,
+                    v1_local,
+                    v2_local,
+                    SURFACE_BAND_VOXELS,
                 ):
                     return True
 
             return False
-
+        
         @wp.kernel
         def resolve_out_of_bound_kernel(
             id_number: wp.int32,

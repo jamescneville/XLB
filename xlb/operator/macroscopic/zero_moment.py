@@ -18,25 +18,26 @@ class ZeroMoment(Operator):
 
     def _construct_warp(self):
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
+        _n_groups = self.velocity_set.q // 4
+        _tail_start = 4 * _n_groups
 
-        @wp.func
-        def neumaier_sum(f: _f_vec):
-            total = self.compute_dtype(0.0)
-            compensation = self.compute_dtype(0.0)
-            for l in range(self.velocity_set.q):
-                x = f[l]
-                t = total + x
-                # Using wp.abs to compute absolute value
-                if wp.abs(total) >= wp.abs(x):
-                    compensation = compensation + ((total - t) + x)
-                else:
-                    compensation = compensation + ((x - t) + total)
-                total = t
-            return total + compensation
+  
 
         @wp.func
         def functional(f: _f_vec):
-            return neumaier_sum(f)
+            # Four interleaved accumulators.  
+            a0 = self.compute_dtype(0.0)
+            a1 = self.compute_dtype(0.0)
+            a2 = self.compute_dtype(0.0)
+            a3 = self.compute_dtype(0.0)
+            for g in range(_n_groups):
+                a0 += f[4 * g + 0]
+                a1 += f[4 * g + 1]
+                a2 += f[4 * g + 2]
+                a3 += f[4 * g + 3]
+            for l in range(_tail_start, self.velocity_set.q):
+                a0 += f[l]
+            return (a0 + a1) + (a2 + a3)
 
         @wp.kernel
         def kernel(

@@ -63,18 +63,55 @@ class SecondMoment(Operator):
             _pi_dim,
             dtype=self.compute_dtype,
         )
+        _n_groups = self.velocity_set.q // 4
+        _tail_start = 4 * _n_groups
+
+        @wp.func
+        def split_sum_component(d: int, fneq: _f_vec):
+            # Four interleaved accumulators
+            a0 = self.compute_dtype(0.0)
+            a1 = self.compute_dtype(0.0)
+            a2 = self.compute_dtype(0.0)
+            a3 = self.compute_dtype(0.0)
+
+            for g in range(_n_groups):
+                if _cc[4 * g + 0, d] == 1:
+                    a0 += fneq[4 * g + 0]
+                elif _cc[4 * g + 0, d] == -1:
+                    a0 -= fneq[4 * g + 0]
+
+                if _cc[4 * g + 1, d] == 1:
+                    a1 += fneq[4 * g + 1]
+                elif _cc[4 * g + 1, d] == -1:
+                    a1 -= fneq[4 * g + 1]
+
+                if _cc[4 * g + 2, d] == 1:
+                    a2 += fneq[4 * g + 2]
+                elif _cc[4 * g + 2, d] == -1:
+                    a2 -= fneq[4 * g + 2]
+
+                if _cc[4 * g + 3, d] == 1:
+                    a3 += fneq[4 * g + 3]
+                elif _cc[4 * g + 3, d] == -1:
+                    a3 -= fneq[4 * g + 3]
+
+            for q in range(_tail_start, self.velocity_set.q):
+                if _cc[q, d] == 1:
+                    a0 += fneq[q]
+                elif _cc[q, d] == -1:
+                    a0 -= fneq[q]
+
+            return (a0 + a1) + (a2 + a3)
 
         # Construct functional for computing second moment
         @wp.func
         def functional(
-            fneq: Any,
+            fneq: _f_vec,
         ):
-            # Get second order moment (a symmetric tensore shaped into a vector)
+            # Get second order moment (a symmetric tensor shaped into a vector).
             pi = _pi_vec()
             for d in range(_pi_dim):
-                pi[d] = self.compute_dtype(0.0)
-                for q in range(self.velocity_set.q):
-                    pi[d] += _cc[q, d] * fneq[q]
+                pi[d] = split_sum_component(d, fneq)
             return pi
 
         # Construct the kernel
