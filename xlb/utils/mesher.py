@@ -3547,6 +3547,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        solid_buffer_radius=None,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
 
@@ -3593,6 +3594,18 @@ class MultiresIO(object):
         after marching cubes. This is useful for CpTotalLoss iso-surfaces where
         voxel-scale noise can create small speckle components away from the main
         structure.
+
+        ``solid_buffer_radius``, when given, guards against thin solid features
+        (e.g. a double-panel body skin) narrower than the resample ``pitch``:
+        a grid point is forced to count as "inside the body" whenever it is
+        within this distance of ANY solid cell, even if a fluid cell on the far
+        side of the wall happens to be nominally closer. Without this, a resample
+        point sitting inside a solid slab thinner than ``pitch`` can have its
+        nearest-neighbour cell be fluid on the far side of the wall, letting real
+        (non-ambient) field data leak through and poke the iso-surface out through
+        the body skin. Since solids in this mesh only ever occur at the finest
+        mesh level, a single constant (the finest level's voxel size) is a safe
+        value - no per-cell/per-level lookup is needed.
 
         Returns the trimesh.Trimesh, or None if the iso-value is outside the
         sampled range (no surface).
@@ -3657,10 +3670,15 @@ class MultiresIO(object):
             fluid_scalar = cell_scalar[fluid]
             fluid_tree = cKDTree(centroids[fluid])
             solid_tree = self.kd_tree  # all cells, for inside-body detection
+            solid_only_tree = None
+            if solid_buffer_radius is not None and float(solid_buffer_radius) > 0.0:
+                solid_only_tree = cKDTree(centroids[solid_mask])
+                print(f"\tThin-solid buffer ON: solid_buffer_radius={float(solid_buffer_radius):.6g}")
         else:
             fluid_scalar = cell_scalar
             fluid_tree = self.kd_tree
             solid_tree = None
+            solid_only_tree = None
 
         use_idw = str(interpolation).lower() == "idw" and fluid_scalar.shape[0] > 1
         kk = max(1, min(int(k), fluid_scalar.shape[0])) if use_idw else 1
@@ -3668,6 +3686,7 @@ class MultiresIO(object):
         # Sample plane-by-plane along x to keep transient memory low.
         vol = np.empty((nx, ny, nz), dtype=np.float32)
         compute_mask = np.ones((nx, ny, nz), dtype=bool) if solid_tree is not None else None
+        n_buffer_caught = 0
         Y, Z = np.meshgrid(ys, zs, indexing="ij")
         Yf = Y.ravel()
         Zf = Z.ravel()
@@ -3676,21 +3695,45 @@ class MultiresIO(object):
         plane_pts[:, 2] = Zf
         for ix in range(nx):
             plane_pts[:, 0] = xs[ix]
+            nearest_fluid_dist = None
             if use_idw:
                 dist, idx = fluid_tree.query(plane_pts, k=kk, workers=-1)
                 if kk == 1:
                     dist = dist[:, None]
                     idx = idx[:, None]
+                nearest_fluid_dist = dist[:, 0]
                 w = 1.0 / np.maximum(dist, 1e-12) ** float(power)
                 v = np.sum(w * fluid_scalar[idx], axis=1) / np.sum(w, axis=1)
             else:
-                _, idx1 = fluid_tree.query(plane_pts, k=1, workers=-1)
+                dist1, idx1 = fluid_tree.query(plane_pts, k=1, workers=-1)
+                nearest_fluid_dist = dist1
                 v = fluid_scalar[idx1]
             vol[ix] = v.reshape(ny, nz).astype(np.float32)
             if solid_tree is not None:
-                _, idx_all = solid_tree.query(plane_pts, k=1, workers=-1)
-                # mask OUT (False) grid points whose nearest cell is solid
-                compute_mask[ix] = (~solid_mask[idx_all]).reshape(ny, nz)
+                if solid_only_tree is not None:
+                    # Reuse the nearest-fluid distance already computed above
+                    # instead of re-querying the all-cells tree: "nearest cell
+                    # is solid" <=> the nearest solid cell is closer than the
+                    # nearest fluid cell. This keeps the added query count at
+                    # one (solid-only tree) instead of two.
+                    dist_solid, _ = solid_only_tree.query(plane_pts, k=1, workers=-1)
+                    is_fluid = dist_solid >= nearest_fluid_dist
+                    # Guard against thin solid features narrower than pitch: a
+                    # point within solid_buffer_radius of ANY solid cell counts
+                    # as body interior, even if a fluid cell on the far side of
+                    # the wall is nominally closer.
+                    buffer_hit = is_fluid & (dist_solid <= float(solid_buffer_radius))
+                    n_buffer_caught += int(np.count_nonzero(buffer_hit))
+                    is_fluid &= ~buffer_hit
+                else:
+                    _, idx_all = solid_tree.query(plane_pts, k=1, workers=-1)
+                    # mask OUT (False) grid points whose nearest cell is solid
+                    is_fluid = ~solid_mask[idx_all]
+                compute_mask[ix] = is_fluid.reshape(ny, nz)
+
+        if solid_only_tree is not None:
+            print(f"\tThin-solid buffer: reclassified {n_buffer_caught:,} grid points as body interior "
+                  f"(nearest cell was fluid but within {float(solid_buffer_radius):.6g} of a solid cell)")
 
         np.nan_to_num(vol, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -3842,6 +3885,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        solid_buffer_radius=None,
     ):
         """Export an iso-surface of any base or derived scalar as an STL file.
 
@@ -3917,6 +3961,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
+            solid_buffer_radius=solid_buffer_radius,
         )
 
     def to_isosurface_stl_time_average(
@@ -3944,6 +3989,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        solid_buffer_radius=None,
     ):
         """Export a time-averaged iso-surface of any accumulated base/derived scalar.
 
@@ -3992,6 +4038,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
+            solid_buffer_radius=solid_buffer_radius,
         )
 
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
