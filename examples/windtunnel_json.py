@@ -1870,7 +1870,7 @@ def iso_region_bounds(jsonfile, partSize, shift, grid_shape_zip, voxel_size):
     hi = np.minimum(np.array([x1, y1, z1], dtype=float), domain_max)
     return (tuple(lo), tuple(hi))
 
-def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize):
+def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size, jsonfile, partSize, bc_mask=None):
     """
     Generate slice images for each configured output slice group.
 
@@ -1891,6 +1891,11 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     default_num_slices = max(1, default_num_slices)
 
     grid_res = int(sliceSettings.get("grid_res", 1000))
+
+    # Near-wall softening (voxels). Blur is feathered in only within wallBlend
+    # voxels of the body; set wallBlend to 0 for fully sharp slices.
+    wall_blend_voxels = float(sliceSettings.get("wallBlend", 2.0))
+    wall_blur_sigma_voxels = float(sliceSettings.get("wallBlurSigma", 1.0))
 
     def slice_enabled(key, default=False):
         return bool(sliceSettings.get(key, default))
@@ -2077,6 +2082,14 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
     # -------------------------------------------------------------------------
     avg_fields = h5exporter.finalize_time_average(keep_state=True)
 
+    # Solid cells must not feed the interpolation (they carry invalid data) and
+    # pixels inside the body are written transparent.
+    solid_mask = None
+    if bc_mask is not None:
+        solid_mask = h5exporter._solid_mask_from_fields_data(
+            h5exporter.get_fields_data({"bc_mask": bc_mask})
+        )
+
     # -------------------------------------------------------------------------
     # Force lazy h5exporter geometry caches before threading.
     #
@@ -2202,6 +2215,12 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                 # Data is already normalized to [0, 1].
                 # normalize=2.0 preserves your existing renderer behavior for pre-normalized fields.
                 "normalize": 2.0,
+                # Body pixels: None extends the nearest fluid value (no black wall
+                # voxels, since nipy_spectral maps 0 to black). Set
+                # slices.velocitySolidFill to a normalised value to force one.
+                "solid_fill": sliceSettings.get("velocitySolidFill", None),
+                # With solid_fill unset, body pixels = scale * nearest fluid velocity.
+                "solid_scale": float(sliceSettings.get("velocitySolidScale", 0.5)),
             }
         )
 
@@ -2470,6 +2489,8 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
             ) = slice_info
 
             try:
+                # Triangulation/pixel weights are shared by all fields on this plane.
+                plane_cache = {}
                 for field_spec in render_fields:
                     field_name = field_spec["field"]
                     field_data = field_spec["cell_data"]
@@ -2493,6 +2514,12 @@ def save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, v
                         width_vec=width_vec,
                         height_vec=height_vec,
                         workers=2,
+                        solid_mask=solid_mask,
+                        plane_cache=plane_cache,
+                        solid_fill=field_spec.get("solid_fill"),
+                        solid_scale=field_spec.get("solid_scale", 1.0),
+                        wall_blend=wall_blend_voxels,
+                        wall_blur_sigma=wall_blur_sigma_voxels,
                     )
 
                 return idx, True, None
@@ -2744,7 +2771,7 @@ def solve(
                 fd.write(f"Error Drag Coefficient (Cd): {((avg_cd-target_cd)/target_cd)*100:.2f}%\n")
                 fd.write(f"Error Lift Coefficient (Cl): {((avg_cl-target_cl)/target_cl)*100:.2f}%\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
-        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize) 
+        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize, bc_mask=sim.bc_mask) 
         
             
         filename = os.path.join(output_dir, f"{jsonfile['outputName']}_average")
@@ -2864,7 +2891,8 @@ def solve(
                     keep_state=True,
                     bounds=iso_region,
                     pitch=voxel_size,
-                    lengthScale=jsonfile['settings']['isoScale']
+                    lengthScale=jsonfile['settings']['isoScale'],
+                    decimate_reduction=float(jsonfile['settings'].get('isoDecimate', 0.0))
                 )
             scm_results_available() 
         scm_progress(95)
@@ -3067,7 +3095,8 @@ def solve(
                     keep_state=True,
                     bounds=iso_region,
                     pitch=voxel_size,
-                    lengthScale=jsonfile['settings']['isoScale']
+                    lengthScale=jsonfile['settings']['isoScale'],
+                    decimate_reduction=float(jsonfile['settings'].get('isoDecimate', 0.0))
                 )
             scm_results_available() 
         scm_progress(95)
@@ -3116,7 +3145,7 @@ def solve(
                 fd.write(f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical / 746:.4f}\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
 
-        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize)  
+        save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize, bc_mask=sim.bc_mask)  
         jsonfile['results'] ={}
         jsonfile['results']['cd'] = avg_cd
         jsonfile['results']['cl'] = avg_cl

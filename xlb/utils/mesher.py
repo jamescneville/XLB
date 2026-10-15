@@ -1694,6 +1694,220 @@ class MultiresIO(object):
         )
         print(f"\tSlice image for field {field_name} saved as {output_filename}.png")
 
+    def _build_slice_sampler(
+        self,
+        plane_point,
+        plane_normal,
+        slice_thickness,
+        bounds,
+        grid_res,
+        width,
+        height,
+        width_vec,
+        height_vec,
+        solid_mask,
+        workers,
+        wall_blend=0.0,
+    ):
+        """
+        Field-independent part of a slice render: pick the cells, triangulate them
+        and precompute, per pixel, which cells to blend and with what weights.
+
+        - One layer of cells per refinement level: the layer that contains the plane
+          (half-open |sdf| window of one cell), so no layer is double counted.
+        - Only fluid cells are data sources; solid cells just flag which pixels lie
+          inside the body (those come out as NaN).
+        - Pixels are interpolated linearly (barycentric) on a 2D Delaunay
+          triangulation of the cell centres, which adapts to multires spacing.
+          Pixels outside the hull or in triangles that bridge a gap (edge much
+          longer than the local cell) fall back to the nearest fluid cell.
+        - Body pixels get a fill value at render time, and ``wall_blend`` (in
+          units of slice_thickness) sets how far from the body a feather weight
+          reaches, so a blur can be mixed in only near the wall.
+        """
+        from scipy.spatial import cKDTree, Delaunay
+
+        fixed_extent = (
+            width is not None
+            and height is not None
+            and width_vec is not None
+            and height_vec is not None
+        )
+
+        plane_normal = np.asarray(plane_normal, dtype=np.float64)
+        n = plane_normal / np.linalg.norm(plane_normal)
+
+        plane_point = np.asarray(plane_point, dtype=np.float64).copy()
+        sdf = np.dot(self.centroids - plane_point, n)
+
+        # Select the single layer of cells (per level) that contains the plane.
+        if getattr(self, "level_id_field", None) is not None:
+            cell_size_all = float(slice_thickness) * (2.0 ** self.level_id_field.astype(np.float32))
+            half = 0.5 * cell_size_all
+            mask = (sdf >= -half) & (sdf < half)
+        else:
+            cell_size_all = None
+            half = 0.5 * float(slice_thickness)
+            mask = (sdf >= -half) & (sdf < half)
+        if not np.any(mask):
+            raise ValueError("No cells intersect the plane within thickness.")
+
+        sel = np.flatnonzero(mask)
+        cell_size = (
+            cell_size_all[sel].astype(np.float64)
+            if cell_size_all is not None
+            else np.full(sel.shape[0], float(slice_thickness))
+        )
+        proj = self.centroids[sel] - np.outer(sdf[sel], n)
+
+        # In-plane basis
+        if fixed_extent:
+            u1 = np.asarray(width_vec, dtype=np.float64)
+            u1 = u1 / np.linalg.norm(u1)
+            u2 = np.asarray(height_vec, dtype=np.float64)
+            u2 = u2 / np.linalg.norm(u2)
+        else:
+            if np.allclose(n, [1, 0, 0]):
+                u1 = np.array([0, 1, 0])
+            else:
+                u1 = np.array([1, 0, 0])
+            u2 = np.abs(np.cross(n, u1))
+
+        local_x = np.dot(proj - plane_point, u1)
+        local_y = np.dot(proj - plane_point, u2)
+
+        if fixed_extent:
+            # Pin grid to the published slice rectangle so every slice in a
+            # sweep uses an identical pixel grid (no inter-slice shift).
+            bx0, bx1 = 0.0, float(width)
+            by0, by1 = 0.0, float(height)
+            # Keep cells up to one cell beyond the rectangle so edge pixels
+            # still have triangles around them.
+            keep = (
+                (bx0 - cell_size <= local_x) & (local_x <= bx1 + cell_size)
+                & (by0 - cell_size <= local_y) & (local_y <= by1 + cell_size)
+            )
+        else:
+            xmin, xmax, ymin, ymax = local_x.min(), local_x.max(), local_y.min(), local_y.max()
+            Lx = xmax - xmin
+            Ly = ymax - ymin
+            extent = np.array([xmin + bounds[0] * Lx, xmin + bounds[1] * Lx, ymin + bounds[2] * Ly, ymin + bounds[3] * Ly])
+            keep = (extent[0] <= local_x) & (local_x <= extent[1]) & (extent[2] <= local_y) & (local_y <= extent[3])
+            bx0, bx1 = local_x[keep].min(), local_x[keep].max()
+            by0, by1 = local_y[keep].min(), local_y[keep].max()
+
+        aspect_ratio = (by1 - by0) / max(bx1 - bx0, 1e-20)
+        grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
+
+        if not np.any(keep):
+            raise ValueError("No cells inside the slice window.")
+
+        pts = np.column_stack((local_x[keep], local_y[keep]))
+        cell_global = sel[keep]
+        cs = cell_size[keep]
+        if solid_mask is not None:
+            solid_k = np.asarray(solid_mask, dtype=bool)[cell_global]
+        else:
+            solid_k = np.zeros(cell_global.shape[0], dtype=bool)
+
+        fluid = ~solid_k
+        if not np.any(fluid):
+            raise ValueError("No fluid cells intersect the plane within the slice window.")
+        fluid_pts = pts[fluid]
+        fluid_cs = cs[fluid]
+        src_idx = cell_global[fluid]
+
+        # Pixel grid
+        grid_x = np.linspace(bx0, bx1, grid_res)
+        grid_y = np.linspace(by0, by1, grid_resY)
+        xv, yv = np.meshgrid(grid_x, grid_y, indexing="xy")
+        q = np.column_stack((xv.ravel(), yv.ravel()))
+        npix = q.shape[0]
+
+        # Pixels whose nearest cell is solid lie inside the body.
+        if np.any(solid_k):
+            _, i_all = cKDTree(pts).query(q, workers=workers)
+            solid_pix = np.flatnonzero(solid_k[i_all])
+        else:
+            solid_pix = np.empty(0, dtype=np.int64)
+        is_solid = np.zeros(npix, dtype=bool)
+        is_solid[solid_pix] = True
+
+        # Linear interpolation on a Delaunay triangulation of the fluid centres.
+        ok = np.zeros(npix, dtype=bool)
+        lin_pix = np.empty(0, dtype=np.int64)
+        lin_verts = np.empty((0, 3), dtype=np.int64)
+        lin_bary = np.empty((0, 3), dtype=np.float64)
+        if fluid_pts.shape[0] >= 3:
+            try:
+                tri = Delaunay(fluid_pts)
+            except Exception:
+                tri = None
+            if tri is not None:
+                simp = tri.find_simplex(q)
+                S = tri.simplices
+                P = fluid_pts[S]
+                e01 = np.linalg.norm(P[:, 0] - P[:, 1], axis=1)
+                e12 = np.linalg.norm(P[:, 1] - P[:, 2], axis=1)
+                e20 = np.linalg.norm(P[:, 2] - P[:, 0], axis=1)
+                # Longest edge vs. coarsest vertex cell: bridging a gap (body,
+                # missing cells) produces edges well beyond a couple of cells.
+                good_simplex = np.maximum(np.maximum(e01, e12), e20) <= 2.5 * fluid_cs[S].max(axis=1)
+                ok = (simp >= 0) & good_simplex[np.maximum(simp, 0)]
+                cand = np.flatnonzero(ok)
+                T = tri.transform[simp[cand]]
+                d = q[cand] - T[:, 2, :]
+                b01 = np.einsum("mij,mj->mi", T[:, :2, :], d)
+                bary = np.column_stack((b01, 1.0 - b01.sum(axis=1)))
+                finite = np.isfinite(bary).all(axis=1)
+                ok[cand[~finite]] = False
+                lin_pix = cand[finite]
+                lin_bary = np.clip(bary[finite], 0.0, 1.0)
+                lin_bary /= np.maximum(lin_bary.sum(axis=1, keepdims=True), 1e-20)
+                lin_verts = S[simp[lin_pix]]
+
+        # Nearest-fluid-cell fallback for every pixel without a linear solution
+        # (body pixels included, so they can be filled by extending the fluid).
+        nn_pix = np.flatnonzero(~ok)
+        if nn_pix.size:
+            _, nn_idx = cKDTree(fluid_pts).query(q[nn_pix], workers=workers)
+        else:
+            nn_idx = np.empty(0, dtype=np.int64)
+
+        # Nearest fluid cell for each body pixel (fill source, optionally scaled).
+        if solid_pix.size:
+            _, solid_nn = cKDTree(fluid_pts).query(q[solid_pix], workers=workers)
+        else:
+            solid_nn = np.empty(0, dtype=np.int64)
+
+        # Feather weight: 1 on the body, falling smoothly to 0 at wall_blend voxels.
+        pixel_size = (bx1 - bx0) / max(grid_res - 1, 1)
+        wall_w = None
+        if wall_blend > 0 and solid_pix.size:
+            from scipy import ndimage
+
+            dist_px = ndimage.distance_transform_edt(~is_solid.reshape(grid_resY, grid_res))
+            band_px = max(wall_blend * float(slice_thickness) / max(pixel_size, 1e-20), 1e-6)
+            t = np.clip(1.0 - dist_px / band_px, 0.0, 1.0)
+            wall_w = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+        return {
+            "wall_w": wall_w,
+            "pixel_size": pixel_size,
+            "src_idx": src_idx,
+            "lin_pix": lin_pix,
+            "lin_verts": lin_verts,
+            "lin_bary": lin_bary,
+            "nn_pix": nn_pix,
+            "nn_idx": nn_idx,
+            "solid_pix": solid_pix,
+            "solid_nn": solid_nn,
+            "npix": npix,
+            "grid_res": grid_res,
+            "grid_resY": grid_resY,
+            "extent": (bx0, bx1, by0, by1),
+        }
+
     def _to_slice_image_single_field(
         self,
         output_filename,
@@ -1712,6 +1926,12 @@ class MultiresIO(object):
         width_vec,
         height_vec,
         workers=-1,
+        solid_mask=None,
+        plane_cache=None,
+        solid_fill=None,
+        solid_scale=1.0,
+        wall_blend=2.0,
+        wall_blur_sigma=1.0,
         **kwargs,
     ):
         """
@@ -1720,140 +1940,81 @@ class MultiresIO(object):
         If width, height, width_vec, and height_vec are all provided, the image
         extent is pinned to the rectangle [plane_point, plane_point + width*width_vec + height*height_vec]
         so consecutive slices in a sweep share an identical pixel grid (no shift).
+
+        solid_mask : bool array aligned with the cell centroids (True == solid), optional.
+            Solid cells never contribute data. Pixels inside the body are filled
+            (see solid_fill) so no transparent/black voxel staircase shows at the wall.
+        solid_fill : float or None
+            Value written inside the body, in the same (normalised) units as the
+            field. Use 0.0 for velocity (no-slip wall); None extends the nearest
+            fluid value (zero-gradient), right for pressure/Cp.
+        solid_scale : float
+            When solid_fill is None, body pixels get solid_scale * nearest fluid
+            value. 1.0 = plain extension; <1 darkens the wall region (e.g. 0.5
+            for a hint of boundary-layer slowdown on velocity).
+        wall_blend : float
+            Voxels from the body over which a blur is feathered in (0 disables).
+            Fluid further out keeps the sharp linear interpolation.
+        wall_blur_sigma : float
+            Gaussian sigma of that near-wall blur, in voxels.
+        plane_cache : dict, optional
+            Pass the same dict for every field rendered on the SAME plane to reuse
+            the triangulation and pixel weights. Never share one across planes or threads.
         """
         from matplotlib import cm
         import numpy as np
         import matplotlib.pyplot as plt
-        from scipy.spatial import cKDTree
 
-        # field data are associated with the cells centers
-        cell_values = field_data
-
-        fixed_extent = (
-            width is not None
-            and height is not None
-            and width_vec is not None
-            and height_vec is not None
-        )
-
-        # get the normalized plane normal (preserve sign)
-        plane_normal = np.asarray(plane_normal, dtype=np.float64)
-        n = plane_normal / np.linalg.norm(plane_normal)
-
-        # Compute signed distances of each cell center to the plane.
-        # Copy plane_point so concurrent slice renders cannot corrupt a shared array.
-        plane_point = np.asarray(plane_point, dtype=np.float64).copy()
-        sdf = np.dot(self.centroids - plane_point, n)
-
-        # Filter: cells with centroid near plane.
-        # On multires grids, scale the slab thickness per cell by its refinement level
-        # so each level contributes ~one intersecting layer instead of many fine layers.
-        if getattr(self, "level_id_field", None) is not None:
-            local_thickness = float(slice_thickness) * (
-                2.0 ** self.level_id_field.astype(np.float32)
+        sampler = plane_cache.get("sampler") if plane_cache is not None else None
+        if sampler is None:
+            sampler = self._build_slice_sampler(
+                plane_point,
+                plane_normal,
+                slice_thickness,
+                bounds,
+                grid_res,
+                width,
+                height,
+                width_vec,
+                height_vec,
+                solid_mask,
+                workers,
+                wall_blend=wall_blend,
             )
-            mask = np.abs(sdf) <= 0.55 * local_thickness
-        else:
-            mask = np.abs(sdf) <= slice_thickness / 2
-        if not np.any(mask):
-            raise ValueError("No cells intersect the plane within thickness.")
-
-        # Project centroids to plane
-        centroids_slice = self.centroids[mask]
-        sdf_slice = sdf[mask]
-        proj = centroids_slice - np.outer(sdf_slice, n)
-
-        values = cell_values[mask]
-
-        # Build in-plane basis
-        if fixed_extent:
-            u1 = np.asarray(width_vec, dtype=np.float64)
-            u1 = u1 / np.linalg.norm(u1)
-            u2 = np.asarray(height_vec, dtype=np.float64)
-            u2 = u2 / np.linalg.norm(u2)
-        else:
-            if np.allclose(n, [1, 0, 0]):
-                u1 = np.array([0, 1, 0])
-            else:
-                u1 = np.array([1, 0, 0])
-            u2 = np.abs(np.cross(n, u1))
-
-        local_x = np.dot(proj - plane_point, u1)
-        local_y = np.dot(proj - plane_point, u2)
+            if plane_cache is not None:
+                plane_cache["sampler"] = sampler
 
         if cmap is None:
             cmap = cm.nipy_spectral
 
-        if fixed_extent:
-            # Pin grid to the published slice rectangle so every slice in a
-            # sweep uses an identical pixel grid (no inter-slice shift).
-            bounded_x_min = 0.0
-            bounded_x_max = float(width)
-            bounded_y_min = 0.0
-            bounded_y_max = float(height)
-            mask_bounds = (
-                (bounded_x_min <= local_x) & (local_x <= bounded_x_max)
-                & (bounded_y_min <= local_y) & (local_y <= bounded_y_max)
-            )
-            aspect_ratio = (bounded_y_max - bounded_y_min) / max(bounded_x_max - bounded_x_min, 1e-20)
-            grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
-        else:
-            # Legacy: derive the extent from whichever cells fell into the slab.
-            xmin, xmax, ymin, ymax = local_x.min(), local_x.max(), local_y.min(), local_y.max()
-            Lx = xmax - xmin
-            Ly = ymax - ymin
-            extent = np.array([xmin + bounds[0] * Lx, xmin + bounds[1] * Lx, ymin + bounds[2] * Ly, ymin + bounds[3] * Ly])
-            mask_bounds = (extent[0] <= local_x) & (local_x <= extent[1]) & (extent[2] <= local_y) & (local_y <= extent[3])
+        grid_resY = sampler["grid_resY"]
+        bounded_x_min, bounded_x_max, bounded_y_min, bounded_y_max = sampler["extent"]
 
-            bounded_x_min = local_x[mask_bounds].min()
-            bounded_x_max = local_x[mask_bounds].max()
-            bounded_y_min = local_y[mask_bounds].min()
-            bounded_y_max = local_y[mask_bounds].max()
-            aspect_ratio = (bounded_y_max - bounded_y_min) / max(bounded_x_max - bounded_x_min, 1e-20)
-            grid_resY = max(1, int(np.round(grid_res * aspect_ratio)))
+        # Evaluate the field on the pixel grid.
+        v = np.asarray(field_data)[sampler["src_idx"]].astype(np.float64)
+        out = np.full(sampler["npix"], np.nan, dtype=np.float64)
+        lp = sampler["lin_pix"]
+        if lp.size:
+            out[lp] = (v[sampler["lin_verts"]] * sampler["lin_bary"]).sum(axis=1)
+        npx = sampler["nn_pix"]
+        if npx.size:
+            out[npx] = v[sampler["nn_idx"]]
+        if sampler["solid_pix"].size:
+            if solid_fill is not None:
+                out[sampler["solid_pix"]] = float(solid_fill)
+            else:
+                out[sampler["solid_pix"]] = float(solid_scale) * v[sampler["solid_nn"]]
+        grid_field = out.reshape(grid_resY, grid_res).astype(np.float32)
 
-        # Create grid
-        grid_x = np.linspace(bounded_x_min, bounded_x_max, grid_res)
-        grid_y = np.linspace(bounded_y_min, bounded_y_max, grid_resY)
-        xv, yv = np.meshgrid(grid_x, grid_y, indexing="xy")
+        # Near-wall blend only: blur the whole image, mix it in by the feather
+        # weight (1 at the body, 0 beyond wall_blend voxels).
+        wall_w = sampler["wall_w"]
+        if wall_w is not None and wall_blur_sigma > 0:
+            from scipy import ndimage
 
-        # Fast KDTree-based interpolation
-        points = np.column_stack((local_x[mask_bounds], local_y[mask_bounds]))
-        tree = cKDTree(points)
-
-        # Query points
-        query_points = np.column_stack((xv.ravel(), yv.ravel()))
-
-        # Find k nearest neighbors for smoother interpolation
-        k = min(4, len(points))
-        distances, indices = tree.query(query_points, k=k, workers=workers)
-
-        if k == 1:
-            distances = distances[:, None]
-            indices = indices[:, None]
-
-        # Gaussian-weighted interpolation with an adaptive per-query bandwidth.
-        # h scales with the actual neighbor spacing at each pixel, so coarse-grid
-        # regions widen the kernel automatically and weights don't underflow to
-        # zero between cell centers (which paints a dot grid).
-        pixel_dx = (bounded_x_max - bounded_x_min) / max(grid_res - 1, 1)
-        pixel_dy = (bounded_y_max - bounded_y_min) / max(grid_resY - 1, 1)
-        floor_h = max(2.0 * float(slice_thickness), 2.0 * pixel_dx, 2.0 * pixel_dy, 1e-12)
-
-        # Use the farthest of the k neighbors as the local scale: the closest
-        # neighbor lands near exp(-0.5) instead of underflowing in coarse zones.
-        if k > 1:
-            local_h = distances[:, -1:]
-        else:
-            local_h = np.full((distances.shape[0], 1), floor_h)
-        h = np.maximum(local_h, floor_h)
-
-        weights = np.exp(-0.5 * (distances / h) ** 2)
-        weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-20)
-
-        # Interpolate values
-        neighbor_values = values[mask_bounds][indices]
-        grid_field = (neighbor_values * weights).sum(axis=1).reshape(grid_resY, grid_res)
+            sigma_px = wall_blur_sigma * float(slice_thickness) / max(sampler["pixel_size"], 1e-20)
+            blurred = ndimage.gaussian_filter(grid_field, sigma=sigma_px, mode="nearest")
+            grid_field = grid_field + wall_w * (blurred - grid_field)
 
         # Plot
         if show_colorbar or show_axes:
@@ -3534,6 +3695,45 @@ class MultiresIO(object):
             keep[s:s + chunk] = ok & near[b[:, 0], b[:, 1], b[:, 2]]
         return keep
 
+    @staticmethod
+    def _decimate_iso_mesh(mesh, reduction, pitch):
+        """Quadric-decimate ``mesh`` by a constant fraction of its triangles.
+
+        Logs the resulting surface deviation from the input in units of ``pitch``.
+        If open3d is unavailable the mesh is returned unchanged, so an optional
+        size optimisation can never cost the iso result.
+        """
+        if not 0.0 < reduction < 1.0:
+            raise ValueError(f"decimate_reduction must be in [0, 1), got {reduction!r}")
+        try:
+            import open3d as o3d
+        except ImportError:
+            print("\tDecimation skipped: open3d is not installed.")
+            return mesh
+
+        n0 = len(mesh.faces)
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
+        m = m.simplify_quadric_decimation(max(4, int(n0 * (1.0 - reduction))))
+        m.remove_degenerate_triangles()
+        m.remove_unreferenced_vertices()
+        out = trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False)
+
+        try:
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(
+                o3d.core.Tensor(verts.astype(np.float32)), o3d.core.Tensor(faces.astype(np.uint32))
+            )
+            dev = scene.compute_distance(
+                o3d.core.Tensor(np.asarray(out.vertices, dtype=np.float32))
+            ).numpy() / float(pitch)
+            dev_msg = f"; deviation/pitch p99 {np.percentile(dev, 99):.3f}, max {dev.max():.3f}"
+        except Exception:
+            dev_msg = ""
+        print(f"\tDecimation: {n0:,} -> {len(out.faces):,} tris (-{100.0 * (1 - len(out.faces) / n0):.0f}%){dev_msg}")
+        return out
+
     def _remove_small_mesh_components(
         self,
         mesh,
@@ -3638,6 +3838,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        decimate_reduction=0.0,
         resample_threads=None,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
@@ -3694,6 +3895,12 @@ class MultiresIO(object):
         body skins leak interior flow through the cap. On cell centres the
         classification and the IDW lookup are exact. Skipped (with a log line) if
         ``pitch`` does not match the solid-cell lattice.
+
+        ``decimate_reduction`` (0 = off) removes that fraction of the triangles
+        with quadric decimation after smoothing, e.g. 0.8 keeps 20%. A constant
+        fraction shrinks every iso by the same factor; the logged surface
+        deviation (in units of ``pitch``) shows what it cost. Marching-cubes
+        triangles are uniform, so most of them carry little shape.
 
         Far-field skip: the expensive resample is skipped in regions that cannot
         contain the iso-surface. The grid is split into blocks, and a
@@ -4006,6 +4213,11 @@ class MultiresIO(object):
                 print(f"\tTaubin smoothing skipped: {_e}")
         print(f"\t[timing] smoothing: {time.perf_counter() - t_stage:.1f} s")
 
+        if decimate_reduction and float(decimate_reduction) > 0.0:
+            t_stage = time.perf_counter()
+            mesh = self._decimate_iso_mesh(mesh, float(decimate_reduction), pitch)
+            print(f"\t[timing] decimation: {time.perf_counter() - t_stage:.1f} s")
+
         if lengthScale != 1.0:
             mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * lengthScale
             print(f"	Applied STL lengthScale={lengthScale:.6g} about the global origin")
@@ -4043,6 +4255,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        decimate_reduction=0.0,
     ):
         """Export an iso-surface of any base or derived scalar as an STL file.
 
@@ -4118,6 +4331,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
+            decimate_reduction=decimate_reduction,
         )
 
     def to_isosurface_stl_time_average(
@@ -4145,6 +4359,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
+        decimate_reduction=0.0,
     ):
         """Export a time-averaged iso-surface of any accumulated base/derived scalar.
 
@@ -4193,6 +4408,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
+            decimate_reduction=decimate_reduction,
         )
 
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
