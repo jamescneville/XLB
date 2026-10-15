@@ -2863,9 +2863,8 @@ def solve(
                     bc_mask_neon=sim.bc_mask,
                     keep_state=True,
                     bounds=iso_region,
-                    grid_resolution=jsonfile['settings']['isoGrid'],
-                    lengthScale=jsonfile['settings']['isoScale'],
-                    solid_buffer_radius=float(jsonfile['settings'].get('isoSolidBuffer', 0.0)) * voxel_size,
+                    pitch=voxel_size,
+                    lengthScale=jsonfile['settings']['isoScale']
                 )
             scm_results_available() 
         scm_progress(95)
@@ -3067,9 +3066,8 @@ def solve(
                     bc_mask_neon=sim.bc_mask,
                     keep_state=True,
                     bounds=iso_region,
-                    grid_resolution=jsonfile['settings']['isoGrid'],
-                    lengthScale=jsonfile['settings']['isoScale'],
-                    solid_buffer_radius=float(jsonfile['settings'].get('isoSolidBuffer', 0.0)) * voxel_size,
+                    pitch=voxel_size,
+                    lengthScale=jsonfile['settings']['isoScale']
                 )
             scm_results_available() 
         scm_progress(95)

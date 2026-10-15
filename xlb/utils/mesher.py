@@ -1,7 +1,9 @@
 import numpy as np
 import trimesh
 from typing import Any, Optional, Dict
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import neon
 import warp as wp
 from xlb.utils.utils import UnitConvertor
@@ -3450,6 +3452,88 @@ class MultiresIO(object):
         structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
         return ndimage.binary_propagation(seed, mask=fluid_mask, structure=structure)
 
+    @staticmethod
+    def _iso_active_blocks(fluid_xyz, fluid_val, solid_xyz, gmin, pitch, dims, iso_value, block, halo,
+                           solid_halo):
+        """Find resample-grid blocks that may contain the iso-surface.
+
+        Returns ``(active, const)`` over a lattice of ``block``^3-point blocks.
+        A block is inactive (skippable) only if, within ``halo`` blocks around it,
+        there are fluid cells and all fluid values lie on one side of
+        ``iso_value``, and within ``solid_halo`` blocks there is no solid cell or
+        NaN. ``const`` holds a value on that same side for inactive blocks, so
+        marching cubes cannot create a surface there.
+        """
+        from scipy import ndimage
+
+        nb = np.ceil(np.asarray(dims) / float(block)).astype(np.int64)
+        bsz = float(block) * float(pitch)
+        gmin = np.asarray(gmin, dtype=np.float64)
+        bmin = np.full(tuple(nb), np.inf, dtype=np.float32)
+        bmax = np.full(tuple(nb), -np.inf, dtype=np.float32)
+        force = np.zeros(tuple(nb), dtype=bool)  # solid or NaN present
+        chunk = 4_000_000
+
+        def flat_index(xyz):
+            b = np.floor((np.asarray(xyz, dtype=np.float64) - gmin) / bsz).astype(np.int64)
+            ok = np.all((b >= -halo) & (b < nb + halo), axis=1)
+            b = np.clip(b[ok], 0, nb - 1)
+            return ok, (b[:, 0] * nb[1] + b[:, 1]) * nb[2] + b[:, 2]
+
+        for s in range(0, fluid_xyz.shape[0], chunk):
+            ok, flat = flat_index(fluid_xyz[s:s + chunk])
+            if flat.size == 0:
+                continue
+            val = np.asarray(fluid_val[s:s + chunk], dtype=np.float32)[ok]
+            nan = np.isnan(val)
+            if nan.any():
+                force.flat[flat[nan]] = True
+            order = np.argsort(flat, kind="stable")
+            flat_s = flat[order]
+            val_s = val[order]
+            uniq, start = np.unique(flat_s, return_index=True)
+            bmin.flat[uniq] = np.fmin(bmin.flat[uniq], np.fmin.reduceat(val_s, start))
+            bmax.flat[uniq] = np.fmax(bmax.flat[uniq], np.fmax.reduceat(val_s, start))
+
+        if solid_xyz is not None:
+            for s in range(0, solid_xyz.shape[0], chunk):
+                _, flat = flat_index(solid_xyz[s:s + chunk])
+                force.flat[flat] = True
+
+        size = 2 * halo + 1
+        nmax = ndimage.maximum_filter(bmax, size=size, mode="nearest")
+        nmin = ndimage.minimum_filter(bmin, size=size, mode="nearest")
+        near_force = ndimage.maximum_filter(force.astype(np.uint8), size=2 * solid_halo + 1, mode="nearest") > 0
+
+        empty = ~np.isfinite(nmax)
+        below = nmax < iso_value
+        above = nmin >= iso_value
+        uniform = (below | above) & ~near_force & ~empty
+        const = np.where(below, nmax, nmin).astype(np.float32)
+        return ~uniform, const
+
+    @staticmethod
+    def _iso_cells_near_active(xyz, active, gmin, pitch, block, halo):
+        """Boolean mask of cells within ``halo`` blocks of any active block.
+
+        Cells farther than that cannot be among the nearest neighbours of an
+        evaluated grid point, so they can be left out of the KD-tree.
+        """
+        from scipy import ndimage
+
+        nb = np.asarray(active.shape, dtype=np.int64)
+        bsz = float(block) * float(pitch)
+        gmin = np.asarray(gmin, dtype=np.float64)
+        near = ndimage.maximum_filter(active.astype(np.uint8), size=2 * halo + 1, mode="nearest") > 0
+        keep = np.zeros(xyz.shape[0], dtype=bool)
+        chunk = 4_000_000
+        for s in range(0, xyz.shape[0], chunk):
+            b = np.floor((np.asarray(xyz[s:s + chunk], dtype=np.float64) - gmin) / bsz).astype(np.int64)
+            ok = np.all((b >= -halo) & (b < nb + halo), axis=1)
+            b = np.clip(b, 0, nb - 1)
+            keep[s:s + chunk] = ok & near[b[:, 0], b[:, 1], b[:, 2]]
+        return keep
+
     def _remove_small_mesh_components(
         self,
         mesh,
@@ -3474,26 +3558,32 @@ class MultiresIO(object):
         if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
             return mesh
 
+        # Label faces by edge-connected component with array ops (no per-component
+        # Trimesh objects, which is very slow when there are thousands of islands).
         try:
-            components = mesh.split(only_watertight=False)
+            n_faces = len(mesh.faces)
+            comps = trimesh.graph.connected_components(
+                mesh.face_adjacency, nodes=np.arange(n_faces), min_len=1
+            )
+            n_comp = len(comps)
+            if n_comp <= 1:
+                return mesh
+            labels = np.empty(n_faces, dtype=np.int64)
+            for i, c in enumerate(comps):
+                labels[c] = i
+            areas = np.bincount(labels, weights=np.asarray(mesh.area_faces, dtype=np.float64), minlength=n_comp)
+            faces = np.bincount(labels, minlength=n_comp)
         except Exception as exc:
             print(f"\tConnected-component cleanup skipped: {exc}")
             return mesh
 
-        if len(components) <= 1:
-            return mesh
-
-        components = list(components)
-        areas = np.asarray([float(getattr(c, "area", 0.0)) for c in components], dtype=np.float64)
-        faces = np.asarray([len(c.faces) for c in components], dtype=np.int64)
-
         if keep_largest_component:
-            keep = np.zeros(len(components), dtype=bool)
+            keep = np.zeros(n_comp, dtype=bool)
             keep[int(np.argmax(areas))] = True
         else:
             total_area = float(max(mesh.area, 1e-30))
             min_area = min_component_area_fraction * total_area
-            keep = np.ones(len(components), dtype=bool)
+            keep = np.ones(n_comp, dtype=bool)
             if min_component_faces > 0:
                 keep &= faces >= min_component_faces
             if min_component_area_fraction > 0.0:
@@ -3510,8 +3600,9 @@ class MultiresIO(object):
         if n_removed == 0:
             return mesh
 
-        kept_meshes = [components[i] for i in np.flatnonzero(keep)]
-        cleaned = trimesh.util.concatenate(kept_meshes)
+        cleaned = trimesh.Trimesh(
+            vertices=mesh.vertices, faces=mesh.faces[keep[labels]], process=False
+        )
         try:
             cleaned.remove_unreferenced_vertices()
         except Exception:
@@ -3519,7 +3610,7 @@ class MultiresIO(object):
 
         print(
             f"\tConnected-component cleanup: removed {n_removed} small component(s); "
-            f"kept {len(kept_meshes)} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
+            f"kept {n_comp - n_removed} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
         )
         return cleaned
 
@@ -3547,7 +3638,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        solid_buffer_radius=None,
+        resample_threads=None,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
 
@@ -3595,17 +3686,24 @@ class MultiresIO(object):
         voxel-scale noise can create small speckle components away from the main
         structure.
 
-        ``solid_buffer_radius``, when given, guards against thin solid features
-        (e.g. a double-panel body skin) narrower than the resample ``pitch``:
-        a grid point is forced to count as "inside the body" whenever it is
-        within this distance of ANY solid cell, even if a fluid cell on the far
-        side of the wall happens to be nominally closer. Without this, a resample
-        point sitting inside a solid slab thinner than ``pitch`` can have its
-        nearest-neighbour cell be fluid on the far side of the wall, letting real
-        (non-ambient) field data leak through and poke the iso-surface out through
-        the body skin. Since solids in this mesh only ever occur at the finest
-        mesh level, a single constant (the finest level's voxel size) is a safe
-        value - no per-cell/per-level lookup is needed.
+        Grid alignment: when ``pitch`` equals the finest cell size (the case when
+        the caller passes ``pitch=voxel_size``), the grid origin is shifted by less
+        than one pitch so every node lands on a finest-level cell centre. With an
+        arbitrary origin each node sits near a voxel face or corner, equidistant
+        from several cells, so solid-vs-fluid is decided by tiny offsets and thin
+        body skins leak interior flow through the cap. On cell centres the
+        classification and the IDW lookup are exact. Skipped (with a log line) if
+        ``pitch`` does not match the solid-cell lattice.
+
+        Far-field skip: the expensive resample is skipped in regions that cannot
+        contain the iso-surface. The grid is split into blocks, and a
+        block is skipped only if no solid cell or NaN is nearby and every nearby
+        fluid value lies on the same side of ``iso_value``. Skipped blocks get a
+        same-side constant, so marching cubes produces nothing there; blocks near
+        the body are always evaluated, so capping and flood-fill are unaffected.
+        The KD-tree is built only from cells near evaluated blocks.
+        ``resample_threads`` sets the per-plane thread count (None = up to 16 /
+        available cores, 1 = serial).
 
         Returns the trimesh.Trimesh, or None if the iso-value is outside the
         sampled range (no surface).
@@ -3656,48 +3754,110 @@ class MultiresIO(object):
             f"(pitch={pitch:.6g}, ~{total * 4 / 1e6:.0f} MB)"
         )
 
+        # Snap the grid origin onto the finest-level cell centres (see docstring).
+        if solid_mask is not None and bool(solid_mask.any()):
+            sample_xyz = np.asarray(centroids[np.flatnonzero(solid_mask)[:200000]], dtype=np.float64)
+            lattice = np.exp(2j * np.pi * (((sample_xyz - gmin) / pitch) % 1.0)).mean(axis=0)
+            if np.abs(lattice).min() >= 0.9:  # solid lattice period matches pitch
+                shift = ((np.angle(lattice) / (2 * np.pi)) % 1.0) * pitch
+                gmin = gmin + shift
+                print(f"\tGrid aligned to cell lattice: origin shifted by "
+                      f"({shift[0]:.3g}, {shift[1]:.3g}, {shift[2]:.3g})")
+            else:
+                print(f"\tGrid alignment skipped: pitch does not match the solid lattice "
+                      f"(concentration {np.abs(lattice).min():.2f})")
+            del sample_xyz
+
         xs = gmin[0] + np.arange(nx) * pitch
         ys = gmin[1] + np.arange(ny) * pitch
         zs = gmin[2] + np.arange(nz) * pitch
 
         # Interpolation source = fluid cells only, so solid (bc_mask==255) data
-        # (invalid) never contributes. A separate all-cells nearest lookup flags
-        # grid points sitting inside a solid voxel, which are masked out of
-        # marching cubes (open hole at the body).
+        # (invalid) never contributes. A separate solid-only lookup flags grid
+        # points whose nearest cell is solid (inside the body).
         has_solid = solid_mask is not None and bool(solid_mask.any())
         if has_solid:
             fluid = ~solid_mask
             fluid_scalar = cell_scalar[fluid]
-            fluid_tree = cKDTree(centroids[fluid])
-            solid_tree = self.kd_tree  # all cells, for inside-body detection
-            solid_only_tree = None
-            if solid_buffer_radius is not None and float(solid_buffer_radius) > 0.0:
-                solid_only_tree = cKDTree(centroids[solid_mask])
-                print(f"\tThin-solid buffer ON: solid_buffer_radius={float(solid_buffer_radius):.6g}")
+            fluid_xyz = centroids[fluid]
+            solid_xyz = centroids[solid_mask]
         else:
             fluid_scalar = cell_scalar
-            fluid_tree = self.kd_tree
-            solid_tree = None
-            solid_only_tree = None
+            fluid_xyz = centroids
+            solid_xyz = None
+
+        # Far-field skip: find blocks of grid points that cannot contain the
+        # iso-surface and fill them with a constant instead of resampling. Cells
+        # far from every evaluated block can never be a nearest neighbour of an
+        # evaluated point, so they are also left out of the KD-tree.
+        block = 16  # grid points per block edge
+        halo = 2  # blocks of context for the value-range test and KD-tree cell selection
+        solid_halo = 1  # blocks around a solid cell / NaN that are always evaluated
+        t_stage = time.perf_counter()
+        active, const = self._iso_active_blocks(
+            fluid_xyz, fluid_scalar, solid_xyz, gmin, pitch, (nx, ny, nz),
+            float(iso_value), block, halo, solid_halo,
+        )
+        print(
+            f"\tFar-field skip: evaluating {int(active.sum()):,}/{active.size:,} blocks "
+            f"({100.0 * active.mean():.1f}%) [{time.perf_counter() - t_stage:.1f} s]"
+        )
+        keep = self._iso_cells_near_active(fluid_xyz, active, gmin, pitch, block, halo)
+        n_before = fluid_xyz.shape[0]
+        if not keep.all():
+            fluid_xyz = fluid_xyz[keep]
+            fluid_scalar = fluid_scalar[keep]
+        print(f"\tFar-field skip: KD-tree built from {fluid_xyz.shape[0]:,}/{n_before:,} fluid cells")
+
+        t_stage = time.perf_counter()
+        fluid_tree = cKDTree(fluid_xyz)
+        solid_only_tree = cKDTree(solid_xyz) if has_solid else None
+        print(f"\t[timing] trees: {time.perf_counter() - t_stage:.1f} s")
+        del fluid_xyz, solid_xyz
 
         use_idw = str(interpolation).lower() == "idw" and fluid_scalar.shape[0] > 1
         kk = max(1, min(int(k), fluid_scalar.shape[0])) if use_idw else 1
 
         # Sample plane-by-plane along x to keep transient memory low.
+        t_stage = time.perf_counter()
         vol = np.empty((nx, ny, nz), dtype=np.float32)
-        compute_mask = np.ones((nx, ny, nz), dtype=bool) if solid_tree is not None else None
-        n_buffer_caught = 0
+        compute_mask = np.ones((nx, ny, nz), dtype=bool) if has_solid else None
         Y, Z = np.meshgrid(ys, zs, indexing="ij")
         Yf = Y.ravel()
         Zf = Z.ravel()
-        plane_pts = np.empty((Yf.size, 3), dtype=np.float64)
-        plane_pts[:, 1] = Yf
-        plane_pts[:, 2] = Zf
-        for ix in range(nx):
-            plane_pts[:, 0] = xs[ix]
-            nearest_fluid_dist = None
+        del Y, Z
+
+        # Default is capped: each in-flight plane holds ~100 MB of temporaries, and
+        # os.cpu_count() reports host cores (not the container quota). Pass
+        # resample_threads explicitly to override.
+        if resample_threads:
+            n_threads = int(resample_threads)
+        else:
+            try:
+                n_cpu = len(os.sched_getaffinity(0))
+            except AttributeError:
+                n_cpu = os.cpu_count() or 1
+            n_threads = min(n_cpu, 16)
+        n_threads = max(1, min(n_threads, nx))
+        # With one worker thread the KDTree parallelizes internally; with a
+        # thread pool each query runs single-threaded and planes run in parallel.
+        qw = -1 if n_threads == 1 else 1
+
+        def resample_plane(ix):
+            bx = ix // block
+            arow = active[bx]
+            # Skipped blocks take their same-side constant; active points are overwritten below.
+            vol[ix] = np.repeat(np.repeat(const[bx], block, axis=0), block, axis=1)[:ny, :nz]
+            if not arow.any():
+                return
+            sel = np.flatnonzero(np.repeat(np.repeat(arow, block, axis=0), block, axis=1)[:ny, :nz].ravel())
+            pts = np.empty((sel.size, 3), dtype=np.float64)
+            pts[:, 0] = xs[ix]
+            pts[:, 1] = Yf[sel]
+            pts[:, 2] = Zf[sel]
+
             if use_idw:
-                dist, idx = fluid_tree.query(plane_pts, k=kk, workers=-1)
+                dist, idx = fluid_tree.query(pts, k=kk, workers=qw)
                 if kk == 1:
                     dist = dist[:, None]
                     idx = idx[:, None]
@@ -3705,35 +3865,24 @@ class MultiresIO(object):
                 w = 1.0 / np.maximum(dist, 1e-12) ** float(power)
                 v = np.sum(w * fluid_scalar[idx], axis=1) / np.sum(w, axis=1)
             else:
-                dist1, idx1 = fluid_tree.query(plane_pts, k=1, workers=-1)
-                nearest_fluid_dist = dist1
+                nearest_fluid_dist, idx1 = fluid_tree.query(pts, k=1, workers=qw)
                 v = fluid_scalar[idx1]
-            vol[ix] = v.reshape(ny, nz).astype(np.float32)
-            if solid_tree is not None:
-                if solid_only_tree is not None:
-                    # Reuse the nearest-fluid distance already computed above
-                    # instead of re-querying the all-cells tree: "nearest cell
-                    # is solid" <=> the nearest solid cell is closer than the
-                    # nearest fluid cell. This keeps the added query count at
-                    # one (solid-only tree) instead of two.
-                    dist_solid, _ = solid_only_tree.query(plane_pts, k=1, workers=-1)
-                    is_fluid = dist_solid >= nearest_fluid_dist
-                    # Guard against thin solid features narrower than pitch: a
-                    # point within solid_buffer_radius of ANY solid cell counts
-                    # as body interior, even if a fluid cell on the far side of
-                    # the wall is nominally closer.
-                    buffer_hit = is_fluid & (dist_solid <= float(solid_buffer_radius))
-                    n_buffer_caught += int(np.count_nonzero(buffer_hit))
-                    is_fluid &= ~buffer_hit
-                else:
-                    _, idx_all = solid_tree.query(plane_pts, k=1, workers=-1)
-                    # mask OUT (False) grid points whose nearest cell is solid
-                    is_fluid = ~solid_mask[idx_all]
-                compute_mask[ix] = is_fluid.reshape(ny, nz)
+            vol[ix].reshape(-1)[sel] = v.astype(np.float32)
 
-        if solid_only_tree is not None:
-            print(f"\tThin-solid buffer: reclassified {n_buffer_caught:,} grid points as body interior "
-                  f"(nearest cell was fluid but within {float(solid_buffer_radius):.6g} of a solid cell)")
+            if has_solid:
+                # "Nearest cell is solid" <=> the nearest solid cell is closer than
+                # the nearest fluid cell. Reusing the fluid distance from the value
+                # query avoids a third big-tree lookup.
+                dist_solid, _ = solid_only_tree.query(pts, k=1, workers=qw)
+                compute_mask[ix].reshape(-1)[sel] = dist_solid >= nearest_fluid_dist
+
+        if n_threads == 1:
+            for ix in range(nx):
+                resample_plane(ix)
+        else:
+            with ThreadPoolExecutor(max_workers=n_threads) as pool:
+                list(pool.map(resample_plane, range(nx)))  # list() surfaces worker exceptions
+        print(f"\t[timing] resample ({n_threads} thread(s)): {time.perf_counter() - t_stage:.1f} s")
 
         np.nan_to_num(vol, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -3756,8 +3905,10 @@ class MultiresIO(object):
         # closed iso "balloons". ``keep_mask`` is the exterior-connected fluid;
         # ``~keep_mask`` is body interior + trapped fluid.
         keep_mask = compute_mask
+        t_stage = time.perf_counter()
         if compute_mask is not None and remove_trapped_fluid:
             exterior = self._exterior_connected_fluid_mask(compute_mask)
+            print(f"\t[timing] flood fill: {time.perf_counter() - t_stage:.1f} s")
             n_fluid = int(compute_mask.sum())
             n_trapped = int(np.count_nonzero(compute_mask & ~exterior))
             if not exterior.any() and n_fluid:
@@ -3805,6 +3956,7 @@ class MultiresIO(object):
             )
             return None
 
+        t_stage = time.perf_counter()
         mc_kwargs = dict(
             level=float(iso_value),
             spacing=(pitch, pitch, pitch),
@@ -3820,6 +3972,9 @@ class MultiresIO(object):
         else:
             verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
 
+        print(f"\t[timing] marching cubes: {time.perf_counter() - t_stage:.1f} s ({len(faces):,} tris)")
+        t_stage = time.perf_counter()
+
         # marching_cubes returns vertices in index*spacing coordinates; shift to physical.
         verts = verts + gmin.astype(verts.dtype)
 
@@ -3832,6 +3987,8 @@ class MultiresIO(object):
                 min_component_area_fraction=min_component_area_fraction,
                 keep_largest_component=keep_largest_component,
             )
+        print(f"\t[timing] component cleanup: {time.perf_counter() - t_stage:.1f} s")
+        t_stage = time.perf_counter()
 
         # Taubin smoothing: removes residual marching-cubes faceting without the
         # volumetric shrinkage of plain Laplacian smoothing.
@@ -3847,6 +4004,7 @@ class MultiresIO(object):
                 )
             except Exception as _e:
                 print(f"\tTaubin smoothing skipped: {_e}")
+        print(f"\t[timing] smoothing: {time.perf_counter() - t_stage:.1f} s")
 
         if lengthScale != 1.0:
             mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * lengthScale
@@ -3885,7 +4043,6 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        solid_buffer_radius=None,
     ):
         """Export an iso-surface of any base or derived scalar as an STL file.
 
@@ -3961,7 +4118,6 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
-            solid_buffer_radius=solid_buffer_radius,
         )
 
     def to_isosurface_stl_time_average(
@@ -3989,7 +4145,6 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        solid_buffer_radius=None,
     ):
         """Export a time-averaged iso-surface of any accumulated base/derived scalar.
 
@@ -4038,7 +4193,6 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
-            solid_buffer_radius=solid_buffer_radius,
         )
 
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
