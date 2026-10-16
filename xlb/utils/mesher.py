@@ -3535,16 +3535,23 @@ class MultiresIO(object):
         return keep
 
     @staticmethod
-    def _decimate_iso_mesh(mesh, fraction, pitch):
+    def _decimate_iso_mesh(mesh, fraction, pitch, min_faces=1_000_000, max_faces=2_000_000):
         """Quadric-decimate ``mesh`` down to ``fraction`` of its triangles.
 
-        Logs the resulting surface deviation from the input in units of ``pitch``.
-        If open3d is unavailable the mesh is returned unchanged, so an optional
-        size optimisation can never cost the iso result.
+        The result is kept within [``min_faces``, ``max_faces``] triangles, and a
+        mesh already at or below ``min_faces`` is left alone, so a small iso is
+        never over-decimated and a very large one stays bounded. Logs the
+        resulting surface deviation from the input in units of ``pitch``. If
+        open3d is unavailable the mesh is returned unchanged, so an optional size
+        optimisation can never cost the iso result.
         """
         if not 0.0 < fraction <= 1.0:
             raise ValueError(f"triangle_fraction must be in (0, 1], got {fraction!r}")
         if fraction == 1.0:
+            return mesh
+        n0 = len(mesh.faces)
+        if n0 <= min_faces:
+            print(f"\tDecimation skipped: {n0:,} tris is at or below the {min_faces:,} floor")
             return mesh
         try:
             import open3d as o3d
@@ -3552,11 +3559,11 @@ class MultiresIO(object):
             print("\tDecimation skipped: open3d is not installed.")
             return mesh
 
-        n0 = len(mesh.faces)
+        target = int(min(max(n0 * fraction, min_faces), max_faces))
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         faces = np.asarray(mesh.faces, dtype=np.int32)
         m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
-        m = m.simplify_quadric_decimation(max(4, int(n0 * fraction)))
+        m = m.simplify_quadric_decimation(target)
         m.remove_degenerate_triangles()
         m.remove_unreferenced_vertices()
         out = trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False)
@@ -3599,32 +3606,26 @@ class MultiresIO(object):
         if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
             return mesh
 
-        # Label faces by edge-connected component with array ops (no per-component
-        # Trimesh objects, which is very slow when there are thousands of islands).
         try:
-            n_faces = len(mesh.faces)
-            comps = trimesh.graph.connected_components(
-                mesh.face_adjacency, nodes=np.arange(n_faces), min_len=1
-            )
-            n_comp = len(comps)
-            if n_comp <= 1:
-                return mesh
-            labels = np.empty(n_faces, dtype=np.int64)
-            for i, c in enumerate(comps):
-                labels[c] = i
-            areas = np.bincount(labels, weights=np.asarray(mesh.area_faces, dtype=np.float64), minlength=n_comp)
-            faces = np.bincount(labels, minlength=n_comp)
+            components = mesh.split(only_watertight=False)
         except Exception as exc:
             print(f"\tConnected-component cleanup skipped: {exc}")
             return mesh
 
+        if len(components) <= 1:
+            return mesh
+
+        components = list(components)
+        areas = np.asarray([float(getattr(c, "area", 0.0)) for c in components], dtype=np.float64)
+        faces = np.asarray([len(c.faces) for c in components], dtype=np.int64)
+
         if keep_largest_component:
-            keep = np.zeros(n_comp, dtype=bool)
+            keep = np.zeros(len(components), dtype=bool)
             keep[int(np.argmax(areas))] = True
         else:
             total_area = float(max(mesh.area, 1e-30))
             min_area = min_component_area_fraction * total_area
-            keep = np.ones(n_comp, dtype=bool)
+            keep = np.ones(len(components), dtype=bool)
             if min_component_faces > 0:
                 keep &= faces >= min_component_faces
             if min_component_area_fraction > 0.0:
@@ -3641,9 +3642,8 @@ class MultiresIO(object):
         if n_removed == 0:
             return mesh
 
-        cleaned = trimesh.Trimesh(
-            vertices=mesh.vertices, faces=mesh.faces[keep[labels]], process=False
-        )
+        kept_meshes = [components[i] for i in np.flatnonzero(keep)]
+        cleaned = trimesh.util.concatenate(kept_meshes)
         try:
             cleaned.remove_unreferenced_vertices()
         except Exception:
@@ -3651,7 +3651,7 @@ class MultiresIO(object):
 
         print(
             f"\tConnected-component cleanup: removed {n_removed} small component(s); "
-            f"kept {n_comp - n_removed} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
+            f"kept {len(kept_meshes)} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
         )
         return cleaned
 
@@ -3742,6 +3742,8 @@ class MultiresIO(object):
         mesh 4x. A constant fraction shrinks every iso by the same factor; the
         logged surface deviation (in units of ``pitch``) shows what it cost.
         Marching-cubes triangles are uniform, so most of them carry little shape.
+        The result is kept between 1M and 2M triangles, and meshes of 1M or fewer
+        are not decimated (see ``_decimate_iso_mesh``).
 
         Far-field skip: the expensive resample is skipped in regions that cannot
         contain the iso-surface. The grid is split into blocks, and a
@@ -3955,10 +3957,8 @@ class MultiresIO(object):
         # closed iso "balloons". ``keep_mask`` is the exterior-connected fluid;
         # ``~keep_mask`` is body interior + trapped fluid.
         keep_mask = compute_mask
-        t_stage = time.perf_counter()
         if compute_mask is not None and remove_trapped_fluid:
             exterior = self._exterior_connected_fluid_mask(compute_mask)
-            print(f"\t[timing] flood fill: {time.perf_counter() - t_stage:.1f} s")
             n_fluid = int(compute_mask.sum())
             n_trapped = int(np.count_nonzero(compute_mask & ~exterior))
             if not exterior.any() and n_fluid:
@@ -4006,7 +4006,6 @@ class MultiresIO(object):
             )
             return None
 
-        t_stage = time.perf_counter()
         mc_kwargs = dict(
             level=float(iso_value),
             spacing=(pitch, pitch, pitch),
@@ -4022,9 +4021,6 @@ class MultiresIO(object):
         else:
             verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
 
-        print(f"\t[timing] marching cubes: {time.perf_counter() - t_stage:.1f} s ({len(faces):,} tris)")
-        t_stage = time.perf_counter()
-
         # marching_cubes returns vertices in index*spacing coordinates; shift to physical.
         verts = verts + gmin.astype(verts.dtype)
 
@@ -4037,8 +4033,6 @@ class MultiresIO(object):
                 min_component_area_fraction=min_component_area_fraction,
                 keep_largest_component=keep_largest_component,
             )
-        print(f"\t[timing] component cleanup: {time.perf_counter() - t_stage:.1f} s")
-        t_stage = time.perf_counter()
 
         # Taubin smoothing: removes residual marching-cubes faceting without the
         # volumetric shrinkage of plain Laplacian smoothing.
@@ -4054,7 +4048,6 @@ class MultiresIO(object):
                 )
             except Exception as _e:
                 print(f"\tTaubin smoothing skipped: {_e}")
-        print(f"\t[timing] smoothing: {time.perf_counter() - t_stage:.1f} s")
 
         if triangle_fraction is not None and float(triangle_fraction) < 1.0:
             t_stage = time.perf_counter()
