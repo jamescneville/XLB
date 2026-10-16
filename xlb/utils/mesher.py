@@ -3696,15 +3696,17 @@ class MultiresIO(object):
         return keep
 
     @staticmethod
-    def _decimate_iso_mesh(mesh, reduction, pitch):
-        """Quadric-decimate ``mesh`` by a constant fraction of its triangles.
+    def _decimate_iso_mesh(mesh, fraction, pitch):
+        """Quadric-decimate ``mesh`` down to ``fraction`` of its triangles.
 
         Logs the resulting surface deviation from the input in units of ``pitch``.
         If open3d is unavailable the mesh is returned unchanged, so an optional
         size optimisation can never cost the iso result.
         """
-        if not 0.0 < reduction < 1.0:
-            raise ValueError(f"decimate_reduction must be in [0, 1), got {reduction!r}")
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"triangle_fraction must be in (0, 1], got {fraction!r}")
+        if fraction == 1.0:
+            return mesh
         try:
             import open3d as o3d
         except ImportError:
@@ -3715,7 +3717,7 @@ class MultiresIO(object):
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         faces = np.asarray(mesh.faces, dtype=np.int32)
         m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
-        m = m.simplify_quadric_decimation(max(4, int(n0 * (1.0 - reduction))))
+        m = m.simplify_quadric_decimation(max(4, int(n0 * fraction)))
         m.remove_degenerate_triangles()
         m.remove_unreferenced_vertices()
         out = trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False)
@@ -3838,7 +3840,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        decimate_reduction=0.0,
+        triangle_fraction=1.0,
         resample_threads=None,
     ):
         """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
@@ -3896,11 +3898,11 @@ class MultiresIO(object):
         classification and the IDW lookup are exact. Skipped (with a log line) if
         ``pitch`` does not match the solid-cell lattice.
 
-        ``decimate_reduction`` (0 = off) removes that fraction of the triangles
-        with quadric decimation after smoothing, e.g. 0.8 keeps 20%. A constant
-        fraction shrinks every iso by the same factor; the logged surface
-        deviation (in units of ``pitch``) shows what it cost. Marching-cubes
-        triangles are uniform, so most of them carry little shape.
+        ``triangle_fraction`` (1.0 = off) is the fraction of triangles kept by
+        quadric decimation after smoothing: 0.8 removes 20%, 0.25 shrinks the
+        mesh 4x. A constant fraction shrinks every iso by the same factor; the
+        logged surface deviation (in units of ``pitch``) shows what it cost.
+        Marching-cubes triangles are uniform, so most of them carry little shape.
 
         Far-field skip: the expensive resample is skipped in regions that cannot
         contain the iso-surface. The grid is split into blocks, and a
@@ -3928,6 +3930,8 @@ class MultiresIO(object):
         lengthScale = float(lengthScale)
         if not np.isfinite(lengthScale) or lengthScale <= 0.0:
             raise ValueError(f"lengthScale must be a positive finite value, got {lengthScale!r}")
+        if triangle_fraction is not None and not 0.0 < float(triangle_fraction) <= 1.0:
+            raise ValueError(f"triangle_fraction must be in (0, 1], got {triangle_fraction!r}")
 
         cell_scalar = np.asarray(cell_scalar, dtype=np.float32)
         centroids = self.centroids
@@ -4213,9 +4217,9 @@ class MultiresIO(object):
                 print(f"\tTaubin smoothing skipped: {_e}")
         print(f"\t[timing] smoothing: {time.perf_counter() - t_stage:.1f} s")
 
-        if decimate_reduction and float(decimate_reduction) > 0.0:
+        if triangle_fraction is not None and float(triangle_fraction) < 1.0:
             t_stage = time.perf_counter()
-            mesh = self._decimate_iso_mesh(mesh, float(decimate_reduction), pitch)
+            mesh = self._decimate_iso_mesh(mesh, float(triangle_fraction), pitch)
             print(f"\t[timing] decimation: {time.perf_counter() - t_stage:.1f} s")
 
         if lengthScale != 1.0:
@@ -4255,7 +4259,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        decimate_reduction=0.0,
+        triangle_fraction=1.0,
     ):
         """Export an iso-surface of any base or derived scalar as an STL file.
 
@@ -4331,7 +4335,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
-            decimate_reduction=decimate_reduction,
+            triangle_fraction=triangle_fraction,
         )
 
     def to_isosurface_stl_time_average(
@@ -4359,7 +4363,7 @@ class MultiresIO(object):
         min_component_faces=64,
         min_component_area_fraction=1e-6,
         keep_largest_component=False,
-        decimate_reduction=0.0,
+        triangle_fraction=1.0,
     ):
         """Export a time-averaged iso-surface of any accumulated base/derived scalar.
 
@@ -4408,7 +4412,7 @@ class MultiresIO(object):
             min_component_faces=min_component_faces,
             min_component_area_fraction=min_component_area_fraction,
             keep_largest_component=keep_largest_component,
-            decimate_reduction=decimate_reduction,
+            triangle_fraction=triangle_fraction,
         )
 
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):

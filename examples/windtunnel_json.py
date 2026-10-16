@@ -2892,7 +2892,7 @@ def solve(
                     bounds=iso_region,
                     pitch=voxel_size,
                     lengthScale=jsonfile['settings']['isoScale'],
-                    decimate_reduction=float(jsonfile['settings'].get('isoDecimate', 0.0))
+                    triangle_fraction=float(jsonfile['settings'].get('isoTriangleFraction', 1.0))
                 )
             scm_results_available() 
         scm_progress(95)
@@ -3096,7 +3096,7 @@ def solve(
                     bounds=iso_region,
                     pitch=voxel_size,
                     lengthScale=jsonfile['settings']['isoScale'],
-                    decimate_reduction=float(jsonfile['settings'].get('isoDecimate', 0.0))
+                    triangle_fraction=float(jsonfile['settings'].get('isoTriangleFraction', 1.0))
                 )
             scm_results_available() 
         scm_progress(95)
