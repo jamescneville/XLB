@@ -3294,6 +3294,8 @@ def solve(
     scm_progress(20)
     print(f"Progress 20%")
     # Calculate print and file output intervals
+    solutionPrintFreq = jsonfile["settings"].get("solutionPrintFreq", 1)
+    solution_print_interval = max(1, int(num_steps * (solutionPrintFreq / 100.0)))
     forcePrintFreq = jsonfile["settings"].get("forcePrintFreq", jsonfile["settings"].get("solutionPrintFreq"))
     avgPrintFreq = jsonfile["settings"].get("avgPrintFreq", jsonfile["settings"].get("solutionPrintFreq"))
 
@@ -3317,7 +3319,7 @@ def solve(
             steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
             #scm_progress(np.floor(percent_complete))
-            if step % int(num_steps / 100) == 0:
+            if step % solution_print_interval == 0:
                 scm_progress(np.floor(percent_complete))
                 print(f"Percent Complete {percent_complete}") 
                 print(f"Step {step} completed out of {num_steps}") 
@@ -3600,8 +3602,17 @@ def solve(
         avgPrint_interval = max(1, int((num_steps-crossover_step) * (avgPrintFreq / 100.0)))    
         forcePrint_interval = max(1, int((num_steps-crossover_step) * (forcePrintFreq / 100.0)))   
               
+        # MLUPS without per-step syncs (sim.step() is an async Neon dispatch): time is
+        # accumulated over an interval and synced once per progress print. Force/average
+        # I/O blocks bank the compute time before them and restart the clock after, so
+        # output time is never charged against MLUPS.
+        steps_since_last_print = 0
+        interval_compute_time = 0.0
+        interval_start = time.time()
+        MLUPS = 0.0
         for step in range(num_steps):
             sim.step()
+            steps_since_last_print += 1
             percent_complete = 0.7 * ((step + 1) / num_steps * 100) + 20
             
             end_time = time.time()
@@ -3609,24 +3620,38 @@ def solve(
             if elapsed/60 >= jsonfile['settings']['limit']:
                 time_out = True               
                 
-            if step % int(num_steps / 100) == 0:
+            if step % solution_print_interval == 0:
                 scm_progress(np.floor(percent_complete))
                 print(f"Percent Complete {percent_complete:.2f}") 
                 print(f"Step {step} completed out of {num_steps}") 
+                wp.synchronize()
+                interval_compute_time += time.time() - interval_start
+                if steps_since_last_print > 0 and interval_compute_time > 0:
+                    MLUPS = (total_lattice_updates_per_step * steps_since_last_print) / interval_compute_time / 1e6
+                    print(f"  MLUPS: {MLUPS:.1f}")
+                steps_since_last_print = 0
+                interval_compute_time = 0.0
+                interval_start = time.time()
 
             if (step >= crossover_step and (step % forcePrint_interval == 0 or step == num_steps - 1)) or time_out:
                     print(f"Force AccumulateStep {step} completed out of {num_steps}")
+                    wp.synchronize()
+                    interval_compute_time += time.time() - interval_start
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                    
                     cd, cl, drag, cl_f, cl_r = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center, rear_center)                    
                     wp.synchronize()
                     scm_results_available() 
+                    interval_start = time.time()
 
             if (step >= crossover_step and (step % avgPrint_interval == 0 or step == num_steps - 1)) or time_out:
                     print(f"Time Accumulate Step {step} completed out of {num_steps}")
+                    wp.synchronize()
+                    interval_compute_time += time.time() - interval_start
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)     
                     h5exporter.accumulate_time_average({"velocity": sim.u, "density": sim.rho}, weight=1.0, derived=["pressure", "Cp", "CpTotal", "CpTotalLoss"])
                     wp.synchronize()
                     scm_results_available() 
+                    interval_start = time.time()
 
             if time_out:
                 with open(os.path.join(output_dir, "project.log"),'a') as fd:
