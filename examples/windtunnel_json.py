@@ -790,6 +790,8 @@ def prep_inputs(input_file):
         #mres_perf_opt = xlb.MresPerfOptimizationType.FUSION_AT_FINEST_254_ALL
     else:
         mres_perf_opt = xlb.MresPerfOptimizationType.FUSION_AT_FINEST
+    # Opt-in bit-reproducible accumulation (fine->coarse halo deposits and force/moment sums)
+    deterministic_accumulation = bool(jsonfile['settings'].get('deterministicAccumulation', False))
     # Initialize simulation   
     sim = xlb.helper.MultiresSimulationManager(
         omega_finest=omega,
@@ -800,7 +802,7 @@ def prep_inputs(input_file):
         initializer=initializer,
         mres_perf_opt=mres_perf_opt,
         smagorinsky_constant=jsonfile['settings']['sgs'],
-        deterministic_accumulation=bool(jsonfile['settings'].get('deterministicAccumulation', False)),
+        deterministic_accumulation=deterministic_accumulation,
     )
     wheel_ids = []
     if wheel_vertices is not None:
@@ -842,6 +844,7 @@ def prep_inputs(input_file):
         mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
         compute_backend=compute_backend,
         moment_reference_point=moment_reference_point,
+        deterministic=deterministic_accumulation,
     )
     wheel_momentum = None
     if wheel_vertices is not None:
@@ -852,6 +855,7 @@ def prep_inputs(input_file):
                 mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
                 compute_backend=compute_backend,
                 moment_reference_point=moment_reference_point,
+                deterministic=deterministic_accumulation,
             )
             wheel_momentum.append(mt)
 

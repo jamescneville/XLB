@@ -156,7 +156,21 @@ class MomentumTransfer(Operator):
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
         moment_reference_point=None,
+        deterministic=False,
+        force_scale=float(2**12),
+        moment_scale=float(2**8),
     ):
+        # Deterministic (order-independent) force/moment accumulation.  Float atomicAdd rounds differently depending
+        # on thread order, so the summed force differs run to run.  With deterministic=True every per-voxel
+        # contribution is converted to an int32 fixed-point value (value * scale, rounded) and summed with integer
+        # atomics; integer addition is associative (and wraps harmlessly), so the result is bit-reproducible.
+        # The FINAL sum must satisfy |sum| * scale < 2^31 (intermediate overflow is harmless).  Defaults: force
+        # range +-5e5 at ~2.4e-4 resolution, moment range +-8e6 at ~4e-3 resolution (lattice units).
+        # These are set before super().__init__() because the Operator constructor builds the kernels eagerly.
+        self._deterministic = bool(deterministic)
+        self._force_scale = float(force_scale)
+        self._moment_scale = float(moment_scale)
+
         # Assign the no-slip boundary condition instance
         self.no_slip_bc_instance = no_slip_bc_instance
         self.operation_sequence = operation_sequence
@@ -189,9 +203,37 @@ class MomentumTransfer(Operator):
 
         if self.compute_backend != ComputeBackend.JAX:
             # Allocate the force vector (the total integral value will be computed)
-            _u_vec = wp.types.vector(self.velocity_set.d, dtype=self.compute_dtype)
-            self.force = wp.zeros((1), dtype=_u_vec)
-            self.moment = wp.zeros((1), dtype=_u_vec)
+            if self._deterministic:
+                # int32 fixed-point accumulators, one word per component
+                self.force = wp.zeros(self.velocity_set.d, dtype=wp.int32)
+                self.moment = wp.zeros(3, dtype=wp.int32)
+            else:
+                _u_vec = wp.types.vector(self.velocity_set.d, dtype=self.compute_dtype)
+                self.force = wp.zeros((1), dtype=_u_vec)
+                self.moment = wp.zeros((1), dtype=_u_vec)
+
+    def _zero_accumulators(self):
+        self.force.zero_()
+        if self.moment_reference_point is not None:
+            self.moment.zero_()
+
+    def _decode_fixed(self, arr, scale, name):
+        import warnings
+        import numpy as np
+
+        raw = arr.numpy().astype(np.int64)
+        if np.any(np.abs(raw) >= 2**30):
+            warnings.warn(
+                f"MomentumTransfer(deterministic=True): {name} accumulator is above half the int32 range; "
+                f"it may have overflowed. Lower {name}_scale (currently {scale:g}).",
+                RuntimeWarning,
+            )
+        return raw.astype(np.float64) / scale
+
+    def _read_force(self):
+        if self._deterministic:
+            return self._decode_fixed(self.force, self._force_scale, "force")
+        return self.force.numpy()[0]
 
     def get_moment(self):
         """Return the accumulated moment about ``moment_reference_point``.
@@ -203,6 +245,8 @@ class MomentumTransfer(Operator):
             return None
         if self.compute_backend == ComputeBackend.JAX:
             raise NotImplementedError("Moment accumulation is not implemented for the JAX backend.")
+        if self._deterministic:
+            return self._decode_fixed(self.moment, self._moment_scale, "moment")
         return self.moment.numpy()[0]
 
 
@@ -266,6 +310,9 @@ class MomentumTransfer(Operator):
             _moment_ref = _u_vec()
 
         _is_neon_backend = self.compute_backend == ComputeBackend.NEON
+        _deterministic = self._deterministic
+        _fscale = self.compute_dtype(self._force_scale)
+        _mscale = self.compute_dtype(self._moment_scale)
 
 
         # Find velocity index for (0, 0, 0)
@@ -323,7 +370,11 @@ class MomentumTransfer(Operator):
                             elif _c[d, _opp_indices[l]] == -1:
                                 m[d] -= phi
                 # Atomic sum to get the total force vector
-                wp.atomic_add(force, 0, m)
+                if wp.static(_deterministic):
+                    for d in range(self.velocity_set.d):
+                        wp.atomic_add(force, d, wp.int32(wp.round(m[d] * _fscale)))
+                else:
+                    wp.atomic_add(force, 0, m)
 
                 if _compute_moment:
                         pos = _boundary_position(bc_mask, index)
@@ -331,7 +382,12 @@ class MomentumTransfer(Operator):
                         r[0] = self.compute_dtype(pos[0]) - _moment_ref[0]
                         r[1] = self.compute_dtype(pos[1]) - _moment_ref[1]
                         r[2] = self.compute_dtype(pos[2]) - _moment_ref[2]
-                        wp.atomic_add(moment, 0, wp.cross(r, m))
+                        if wp.static(_deterministic):
+                            cm = wp.cross(r, m)
+                            for d in range(3):
+                                wp.atomic_add(moment, d, wp.int32(wp.round(cm[d] * _mscale)))
+                        else:
+                            wp.atomic_add(moment, 0, wp.cross(r, m))
 
         # Construct the warp kernel
         @wp.kernel
@@ -363,9 +419,7 @@ class MomentumTransfer(Operator):
     @Operator.register_backend(ComputeBackend.WARP)
     def warp_implementation(self, f_0, f_1, bc_mask, missing_mask):
         # Ensure the force is initialized to zero
-        self.force *= self.compute_dtype(0.0)
-        if self.moment_reference_point is not None:
-            self.moment *= self.compute_dtype(0.0)
+        self._zero_accumulators()
 
         # Define the warp functionals needed for this operation
         self.fetcher_functional = self.fetcher.warp_functional
@@ -376,7 +430,7 @@ class MomentumTransfer(Operator):
             inputs=[f_0, f_1, bc_mask, missing_mask, self.force, self.moment],
             dim=f_0.shape[1:],
         )
-        return self.force.numpy()[0]
+        return self._read_force()
 
     def _construct_neon(self):
         import neon

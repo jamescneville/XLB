@@ -45,6 +45,9 @@ class MultiresMomentumTransfer(MomentumTransfer):
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
         moment_reference_point=None,
+        deterministic=False,
+        force_scale=float(2**12),
+        moment_scale=float(2**8),
     ):
         from xlb.operator.force.momentum_transfer import LBMOperationSequence
 
@@ -80,6 +83,9 @@ class MultiresMomentumTransfer(MomentumTransfer):
             precision_policy,
             compute_backend,
             moment_reference_point=moment_reference_point,
+            deterministic=deterministic,
+            force_scale=force_scale,
+            moment_scale=moment_scale,
         )
 
     def _construct_neon(self):
@@ -156,9 +162,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         if _rho is None or _u is None:
             raise TypeError("rho and u must be provided: momentum_transfer(f_0, f_1, bc_mask, missing_mask, rho, u)")
 
-        self.force *= self.compute_dtype(0.0)
-        if self.moment_reference_point is not None:
-            self.moment *= self.compute_dtype(0.0)
+        self._zero_accumulators()
         self.fetcher_functional = self.fetcher.neon_functional
 
         grid = bc_mask.get_grid()
@@ -179,4 +183,4 @@ class MultiresMomentumTransfer(MomentumTransfer):
             )
             c.run(stream, container_runtime=neon.Container.ContainerRuntime.neon)
 
-        return self.force.numpy()[0]
+        return self._read_force()
