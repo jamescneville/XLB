@@ -542,7 +542,8 @@ def obj_to_binary_stl_stream(
 
 ####################
 
-wp.clear_kernel_cache()
+if not os.environ.get('XLB_KEEP_KERNEL_CACHE'):  # set by examples/wm_phase_sweep.py to avoid recompiling every run
+    wp.clear_kernel_cache()
 wp.config.quiet = True
 wp.config.enable_backward = False
 wp.config.line_directives= False
@@ -673,6 +674,8 @@ def prep_inputs(input_file):
     print(f"Progress 2%")
     remeshed = False
     try:
+        if jsonfile.get("settings", {}).get("forceOnly", False):
+            raise StopIteration  # TEST ONLY: force-only runs skip the export surface remesh
         if jsonfile.get("settings", {}).get("surfaceRemesh", {}).get("curvatureAdaptive", {}).get("enabled", True):
             adaptive_min_edge=jsonfile.get("settings", {}).get("surfaceRemesh", {}).get("curvatureAdaptive", {}).get("minEdge", 0.004)
             adaptive_max_edge=jsonfile.get("settings", {}).get("surfaceRemesh", {}).get("curvatureAdaptive", {}).get("maxEdge", 0.008)
@@ -703,6 +706,8 @@ def prep_inputs(input_file):
             # closed shell with outward winding: safe for the outward-only surface-field sampling
             surface_mesh_for_vtk.metadata["outward_normals"] = True
         remeshed = True
+    except StopIteration:
+        pass
     except Exception as e:  # don't lose a run over a cosmetic export mesh
      
         print(f" WARNING: surfaceRemesh failed ({e}); using the original surface mesh. ")
@@ -943,6 +948,29 @@ def prep_inputs(input_file):
 
 # Mesh Generation Functions
 # =========================
+def wall_model_kwargs(jsonfile):
+    """
+    Wall-model phase-invariance options from settings (all optional; default = original behaviour).
+
+      settings.wallModelFix           0 | 1 | 2  (or "off" | "imposed" | "imposed_sample")
+                                      1: evaluate the imposed wall velocity at a fixed height instead of the node height
+                                      2: 1 plus sample u_F at a fixed height between the boundary node and its neighbour
+      settings.wallModelRefHeight     explicit height in finest voxels for mode >= 1 (default: |n|_1 of the wall normal)
+      settings.wallModelRefScale      multiplier on that height (default 1.0)
+      settings.wallModelSampleHeight  sample height in voxels for mode 2 (default 1.5)
+    """
+    st = jsonfile.get('settings', {})
+    mode = st.get('wallModelFix', 0)
+    if isinstance(mode, str):
+        mode = {'off': 0, 'imposed': 1, 'imposed_sample': 2}[mode.lower()]
+    return dict(
+        wm_fix_mode=int(mode),
+        wm_ref_height=st.get('wallModelRefHeight', None),
+        wm_ref_scale=float(st.get('wallModelRefScale', 1.0)),
+        wm_sample_height=float(st.get('wallModelSampleHeight', 1.5)),
+    )
+
+
 def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfile):
     
     # Compute bounds on full car
@@ -1084,6 +1112,19 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
             file_path = os.path.join(output_dir, filename)
             os.remove(file_path)
     
+    # TEST ONLY: sub-voxel translation of the geometry relative to the grid, applied after meshing so the grid and
+    # refinement regions are identical for every offset. Units are finest voxels, e.g. [0.25, 0.5, 0.0].
+    # Prefer x/y; a z offset also moves the ground-contact phase and the trim plane reference.
+    phase_offset = jsonfile['settings'].get('testPhaseOffset', None)
+    if phase_offset is not None and any(float(v) != 0.0 for v in phase_offset):
+        off = np.asarray(phase_offset, dtype=float)
+        body_vertices = body_vertices + off.astype(body_vertices.dtype)
+        if wheel_vertices is not None:
+            wheel_vertices = [wv + off.astype(wv.dtype) for wv in wheel_vertices]
+            wheel_centers = [(np.asarray(wc, dtype=float) + off, dia) for wc, dia in wheel_centers]
+        shift = shift + off * float(voxel_size)
+        print(f" TEST phase offset applied: {off.tolist()} voxels")
+
     return level_data, body_vertices, wheel_vertices, wheel_centers, grid_shape_finest, partSize, actual_num_levels, shift, sparsity_pattern, level_origins
 
 # Boundary Conditions Setup
@@ -1186,6 +1227,7 @@ def setup_boundary_conditions_DoNothing(grid, level_data, body_vertices, wheel_v
             use_mesh_distance=True,      
             use_wall_model=True,
             kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )
     elif jsonfile['BCtypes']['car'] == "bounceback_regularized":
         bc_body = HybridBC(
@@ -1194,7 +1236,8 @@ def setup_boundary_conditions_DoNothing(grid, level_data, body_vertices, wheel_v
             voxelization_method=CarvoxelizationMethod,
             use_mesh_distance=True,     
             use_wall_model=True,
-            kinematic_viscosity=lbm_visc
+            kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )    
     elif jsonfile['BCtypes']['car'] == "bounceback_grads":
         bc_body = HybridBC(
@@ -1203,7 +1246,8 @@ def setup_boundary_conditions_DoNothing(grid, level_data, body_vertices, wheel_v
             voxelization_method=CarvoxelizationMethod,
             use_mesh_distance=True,     
             use_wall_model=True,
-            kinematic_viscosity=lbm_visc
+            kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )
     else:
         bc_body = FullwayBounceBackBC(            
@@ -1381,6 +1425,7 @@ def setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vert
             use_mesh_distance=True,      
             use_wall_model=True,
             kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )
     elif jsonfile['BCtypes']['car'] == "bounceback_regularized":
         bc_body = HybridBC(
@@ -1389,7 +1434,8 @@ def setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vert
             voxelization_method=CarvoxelizationMethod,
             use_mesh_distance=True,     
             use_wall_model=True,
-            kinematic_viscosity=lbm_visc
+            kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )    
     elif jsonfile['BCtypes']['car'] == "bounceback_grads":
         bc_body = HybridBC(
@@ -1398,7 +1444,8 @@ def setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vert
             voxelization_method=CarvoxelizationMethod,
             use_mesh_distance=True,     
             use_wall_model=True,
-            kinematic_viscosity=lbm_visc
+            kinematic_viscosity=lbm_visc,
+            **wall_model_kwargs(jsonfile),
         )
     else:
         bc_body = FullwayBounceBackBC(            
@@ -1479,9 +1526,11 @@ def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference
     print(f"Momentum Force Time after wheels {time.time()-start:.4f} seconds") 
     drag = boundary_force[0] + wheel_force[0]
     lift = boundary_force[2] + wheel_force[2]
+    side = boundary_force[1] + wheel_force[1]
     scale = 2.0 / (ulb**2 * reference_area)
     cd = scale * drag
     cl = scale * lift
+    cy = scale * side
     if np.isnan(cd) or np.isnan(cl):
         raise ValueError(f"NaN detected in coefficients at step {step}: Cd={cd}, Cl={cl}")
    
@@ -1515,9 +1564,9 @@ def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference
 
             cl_f = scale * front_lift
             cl_r = scale * rear_lift
-            drag_values.append([step, cd, cl, cl_f, cl_r])   
+            drag_values.append([step, cd, cl, cl_f, cl_r, cy])
     else:
-        drag_values.append([step, cd, cl, None, None])
+        drag_values.append([step, cd, cl, None, None, cy])
 
 
 
@@ -3257,6 +3306,20 @@ def save_slices0(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, 
 
     print(f"\nTime to save all images {time.time() - tic} seconds.")
 
+def write_force_only_results(jsonfile, output_dir, avg_cd, avg_cl, avg_cl_f, avg_cl_r, avg_cy, reference_area_physical, prescribed_velocity_phys):
+    """TEST ONLY (settings.forceOnly): write Results.json and skip all field/surface/slice/iso post-processing."""
+    rho = jsonfile['fluid']['density']
+    jsonfile['results'] = {
+        'cd': avg_cd, 'cl': avg_cl, 'cl_f': avg_cl_f, 'cl_r': avg_cl_r, 'cy': avg_cy,
+        'cda': avg_cd * reference_area_physical, 'cla': avg_cl * reference_area_physical,
+        'aero_power_kW': 0.5 * rho * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000,
+        'aero_power_hp': 0.5 * rho * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 746,
+    }
+    with open(os.path.join(output_dir, "Results.json"), 'w') as file:
+        json.dump({"results": jsonfile['results'], "outputName": jsonfile['outputName'], "outputSlices": jsonfile.get('outputSlices', [])}, file, indent=4)
+    print("forceOnly: Results.json written, skipping post-processing.")
+
+
 def solve(
         sim, 
         ulb,
@@ -3408,9 +3471,9 @@ def solve(
         # Save drag and lift data to CSV
         if len(drag_values) > 0:
             with open(os.path.join(output_dir, "drag_lift.csv"), 'w') as fd:
-                fd.write("Step,Cd,Cl,Cl_f,Cl_r\n")
-                for step, cd, cl, cl_f, cl_r in drag_values:
-                    fd.write(f"{step},{cd},{cl},{cl_f},{cl_r}\n")
+                fd.write("Step,Cd,Cl,Cl_f,Cl_r,Cy\n")
+                for step, cd, cl, cl_f, cl_r, cy in drag_values:
+                    fd.write(f"{step},{cd},{cl},{cl_f},{cl_r},{cy}\n")
 
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
 
@@ -3425,6 +3488,7 @@ def solve(
             avg_cl = np.mean(post_crossover[:, 2])
             avg_cl_f = np.mean(post_crossover[:, 3])
             avg_cl_r = np.mean(post_crossover[:, 4])
+            avg_cy = np.mean(post_crossover[:, 5])
             target_cd = jsonfile.get("vehicle", {}).get("targets", {}).get("cd", 0.3)
             target_cl = jsonfile.get("vehicle", {}).get("targets", {}).get("cl", -0.1)
             print(f"\nExperimental Drag Coefficient (Cd): {target_cd}\n" 
@@ -3456,6 +3520,9 @@ def solve(
                 fd.write(f"Error Drag Coefficient (Cd): {((avg_cd-target_cd)/target_cd)*100:.2f}%\n")
                 fd.write(f"Error Lift Coefficient (Cl): {((avg_cl-target_cl)/target_cl)*100:.2f}%\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
+        if jsonfile['settings'].get('forceOnly', False):
+            write_force_only_results(jsonfile, output_dir, avg_cd, avg_cl, avg_cl_f, avg_cl_r, avg_cy, reference_area_physical, prescribed_velocity_phys)
+            return
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse, voxel_size,jsonfile, partSize,bc_mask=sim.bc_mask) 
         
             
@@ -3587,6 +3654,7 @@ def solve(
         jsonfile['results']['cl'] = avg_cl
         jsonfile['results']['cl_f'] = avg_cl_f
         jsonfile['results']['cl_r'] = avg_cl_r
+        jsonfile['results']['cy'] = avg_cy
         jsonfile['results']['cda'] = avg_cd * reference_area_physical
         jsonfile['results']['cla'] = avg_cl * reference_area_physical
         jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000
@@ -3789,9 +3857,9 @@ def solve(
         # Save drag and lift data to CSV
         if len(drag_values) > 0:
             with open(os.path.join(output_dir, "drag_lift.csv"), 'w') as fd:
-                fd.write("Step,Cd,Cl,Cl_f,Cl_r\n")
-                for step, cd, cl, cl_f, cl_r in drag_values:
-                    fd.write(f"{step},{cd},{cl},{cl_f},{cl_r}\n")
+                fd.write("Step,Cd,Cl,Cl_f,Cl_r,Cy\n")
+                for step, cd, cl, cl_f, cl_r, cy in drag_values:
+                    fd.write(f"{step},{cd},{cl},{cl_f},{cl_r},{cy}\n")
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
 
             # Calculate and print average Cd and Cl after crossover step
@@ -3805,6 +3873,7 @@ def solve(
             avg_cl = np.mean(post_crossover[:, 2])
             avg_cl_f = np.mean(post_crossover[:, 3])
             avg_cl_r = np.mean(post_crossover[:, 4])
+            avg_cy = np.mean(post_crossover[:, 5])
             print(f"\nAverages over last {100-jsonfile['settings']['crossover']}% of run:\n"
                 f"Cd: {avg_cd:.4f}\n"
                 f"Cl: {avg_cl:.4f}\n"
@@ -3830,12 +3899,16 @@ def solve(
                 fd.write(f"Aero Power (hp): {0.5*jsonfile['fluid']['density'] * (prescribed_velocity_phys*prescribed_velocity_phys*prescribed_velocity_phys)*avg_cd*reference_area_physical / 746:.4f}\n")
                 fd.write(f'Total Solution Time:     {(time.time()-solve_start)/60:.3f} min\n')
 
+        if jsonfile['settings'].get('forceOnly', False):
+            write_force_only_results(jsonfile, output_dir, avg_cd, avg_cl, avg_cl_f, avg_cl_r, avg_cy, reference_area_physical, prescribed_velocity_phys)
+            return
         save_slices(output_dir, grid_shape_zip, shift, h5exporter, delta_x_coarse,voxel_size, jsonfile, partSize,bc_mask=sim.bc_mask)   
         jsonfile['results'] ={}
         jsonfile['results']['cd'] = avg_cd
         jsonfile['results']['cl'] = avg_cl
         jsonfile['results']['cl_f'] = avg_cl_f
         jsonfile['results']['cl_r'] = avg_cl_r
+        jsonfile['results']['cy'] = avg_cy
         jsonfile['results']['cda'] = avg_cd * reference_area_physical
         jsonfile['results']['cla'] = avg_cl * reference_area_physical
         jsonfile['results']['aero_power_kW'] = 0.5 * jsonfile['fluid']['density'] * (prescribed_velocity_phys**3) * avg_cd * reference_area_physical / 1000

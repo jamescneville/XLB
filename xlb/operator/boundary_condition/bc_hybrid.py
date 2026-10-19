@@ -60,6 +60,10 @@ class HybridBC(BoundaryCondition):
         use_mesh_distance=False,
         use_wall_model=False,
         kinematic_viscosity=None,
+        wm_fix_mode=0,
+        wm_ref_height=None,
+        wm_ref_scale=1.0,
+        wm_sample_height=1.5,
     ):
         """
         Parameters
@@ -85,6 +89,17 @@ class HybridBC(BoundaryCondition):
         use_mesh_distance : bool
             If ``True``, fractional distances to the mesh surface are
             computed and stored for interpolated boundary schemes.
+        wm_fix_mode : int
+            Wall-model phase-invariance option (only used with ``use_wall_model``).
+            0 = off, 1 = evaluate the imposed wall velocity at a fixed height,
+            2 = mode 1 plus sample u_F at a fixed height.
+        wm_ref_height : float, optional
+            Explicit fixed height (finest-level voxels) for the imposed velocity.
+            ``None`` uses ``|n|_1`` of the wall normal.
+        wm_ref_scale : float
+            Multiplier on the fixed reference height.
+        wm_sample_height : float
+            Height above the wall (voxels) at which u is sampled in mode 2.
         """
         assert bc_method in [
             "bounceback_regularized",
@@ -98,6 +113,10 @@ class HybridBC(BoundaryCondition):
             assert kinematic_viscosity is not None, "kinematic_viscosity must be provided when use_wall_model=True"
             assert use_mesh_distance, "use_mesh_distance must be True when using wall model"
         self.kinematic_viscosity = kinematic_viscosity if kinematic_viscosity is not None else 0.0
+        self.wm_fix_mode = int(wm_fix_mode) if self.use_wall_model else 0
+        self.wm_ref_height = wm_ref_height
+        self.wm_ref_scale = wm_ref_scale
+        self.wm_sample_height = wm_sample_height
 
         # Call the parent constructor
         super().__init__(
@@ -128,6 +147,10 @@ class HybridBC(BoundaryCondition):
             precision_policy=self.precision_policy,
             compute_backend=ComputeBackend.WARP,
             distance_decoder_function=self._construct_distance_decoder_function(),
+            wm_fix_mode=self.wm_fix_mode,
+            wm_ref_height=self.wm_ref_height,
+            wm_ref_scale=self.wm_ref_scale,
+            wm_sample_height=self.wm_sample_height,
         )
 
         # A flag to enable moving wall treatment when either "prescribed_value" or "profile" are provided.
@@ -138,6 +161,13 @@ class HybridBC(BoundaryCondition):
 
         if self.use_wall_model is True:
             print(f"Wall Model enabled for BC type = {self.__class__.__name__}_{self.bc_method}!")
+            if self.wm_fix_mode > 0:
+                ref = "|n|_1" if self.wm_ref_height is None else f"{self.wm_ref_height}"
+                print(
+                    f"  Wall-model fixed height: mode {self.wm_fix_mode} (imposed-U height = {ref} x {self.wm_ref_scale}"
+                    + (f", u sampled at {self.wm_sample_height} voxels" if self.wm_fix_mode >= 2 else "")
+                    + ")"
+                )
             self.needs_moving_wall_treatment = True
 
         # Handle no-slip BCs if neither prescribed_value or profile are provided.

@@ -38,7 +38,17 @@ class HelperFunctionsBC(object):
         Function to decode wall-distance data for interpolated BCs.
     """
 
-    def __init__(self, velocity_set=None, precision_policy=None, compute_backend=None, distance_decoder_function=None):
+    def __init__(
+        self,
+        velocity_set=None,
+        precision_policy=None,
+        compute_backend=None,
+        distance_decoder_function=None,
+        wm_fix_mode=0,
+        wm_ref_height=None,
+        wm_ref_scale=1.0,
+        wm_sample_height=1.5,
+    ):
         if compute_backend == ComputeBackend.JAX:
             raise ValueError("This helper class contains helper functions only for the WARP implementation of some BCs not JAX!")
 
@@ -47,6 +57,19 @@ class HelperFunctionsBC(object):
         self.precision_policy = precision_policy or DefaultConfig.default_precision_policy
         self.compute_backend = compute_backend or DefaultConfig.default_backend
         self.distance_decoder_function = distance_decoder_function
+
+        # Wall-model phase-invariance options (all in finest-level voxel units).
+        #   wm_fix_mode 0: off (original behaviour, bit-identical code path)
+        #   wm_fix_mode 1: evaluate the imposed wall velocity at a fixed height instead of the node height y_b
+        #   wm_fix_mode 2: mode 1, plus sample u_F at a fixed height (interpolating between nodes B and F)
+        # wm_ref_height: explicit height for the imposed velocity; None -> |n|_1 (phase-mean of y_b for AABB_CLOSE).
+        # wm_ref_scale: multiplier applied to the reference height.
+        # wm_sample_height: height above the wall at which u is sampled in mode 2.
+        assert wm_fix_mode in (0, 1, 2), "wm_fix_mode must be 0, 1 or 2"
+        self.wm_fix_mode = int(wm_fix_mode)
+        _wm_fix_imposed = self.wm_fix_mode >= 1
+        _wm_fix_sample = self.wm_fix_mode >= 2
+        _wm_auto_height = wm_ref_height is None
 
         # Set the compute and Store dtypes
         compute_dtype = self.precision_policy.compute_precision.wp_dtype
@@ -83,6 +106,10 @@ class HelperFunctionsBC(object):
 
         # Define the operator needed for computing the momentum flux
         momentum_flux = MomentumFlux(velocity_set, precision_policy, compute_backend)
+
+        _wm_ref_h = compute_dtype(float(wm_ref_height) if wm_ref_height is not None else 1.0)
+        _wm_ref_scale = compute_dtype(float(wm_ref_scale))
+        _wm_sample_h = compute_dtype(float(wm_sample_height))
 
         @wp.func
         def get_bc_thread_data(
@@ -751,6 +778,14 @@ class HelperFunctionsBC(object):
             # =================================================================
             y_f = y_b + neighbor_dist
 
+            # Optional: sample u at a fixed height above the wall by interpolating between the
+            # boundary node B (height y_b) and the lattice neighbour F (height y_b + neighbor_dist).
+            # The clamp keeps the sample between B and F; y_f always holds the actual sample height.
+            if wp.static(_wm_fix_sample):
+                lam_s = wp.clamp((_wm_sample_h - y_b) / wp.max(neighbor_dist, _epsilon), zero, one)
+                u_f = u_B + (u_f - u_B) * lam_s
+                y_f = y_b + lam_s * neighbor_dist
+
             u_f_rel = u_f - u_wall
             u_f_mag = wp.length(u_f_rel)
 
@@ -779,7 +814,16 @@ class HelperFunctionsBC(object):
             u_tau = u_f_par_mag / wp.max(u_plus_F, _epsilon)
             u_tau_zpg = wp.max(u_tau, _epsilon)
 
-            y_plus_B = y_b * u_tau_zpg / nu
+            # Height at which the wall-model velocity is evaluated. Default is the node height y_b, which
+            # sawtooths with grid phase; the fixed option uses a phase-invariant height instead.
+            y_eval = y_b
+            if wp.static(_wm_fix_imposed):
+                if wp.static(_wm_auto_height):
+                    n_l1 = wp.abs(normal[0]) + wp.abs(normal[1]) + wp.abs(normal[2])
+                    y_eval = wp.max(n_l1, one) * _wm_ref_scale
+                else:
+                    y_eval = _wm_ref_h * _wm_ref_scale
+            y_plus_B = y_eval * u_tau_zpg / nu
             u_plus_B = reichardt_profile(y_plus_B)
             U_wm_B_zpg = u_tau_zpg * u_plus_B
 
