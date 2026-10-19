@@ -57,10 +57,62 @@ def _warp_init_and_select_cuda_device():
             pass
 
 
-def _maybe_enable_fast_math():
-    """Force ``fast_math`` on for every Warp module when ``XLB_FAST_MATH`` is set.
+def init(velocity_set, default_backend, default_precision_policy, fast_math=False):
+    """Initialize the global XLB configuration.
 
-    Warp offers no global switch for this.  ``warp.config`` has no ``fast_math``
+    Must be called before creating any grid, operator, or field.
+
+    Parameters
+    ----------
+    velocity_set : VelocitySet
+        Lattice velocity set (e.g. ``D3Q19``).
+    default_backend : ComputeBackend
+        Compute backend to use (JAX, WARP, or NEON).
+    default_precision_policy : PrecisionPolicy
+        Precision policy for compute and storage dtypes.
+    fast_math : bool, optional
+        Enable Warp CUDA fast math for newly created modules.
+        Applies to WARP and NEON. Defaults to False.
+    """
+    if not isinstance(fast_math, bool):
+        raise TypeError("fast_math must be a Python bool (True or False)")
+    if default_backend == ComputeBackend.JAX and fast_math:
+        raise ValueError(
+            "fast_math=True is only supported for WARP and NEON backends"
+        )
+    DefaultConfig.velocity_set = velocity_set
+    DefaultConfig.default_backend = default_backend
+    DefaultConfig.default_precision_policy = default_precision_policy
+
+    if default_backend == ComputeBackend.WARP:
+        _configure_warp_fast_math(fast_math)
+        _warp_init_and_select_cuda_device()
+    elif default_backend == ComputeBackend.NEON:
+        import warp as wp
+        _configure_warp_fast_math(fast_math)
+        import neon
+
+        # wp.config.mode = "release"
+        # wp.config.llvm_cuda = False
+        # wp.config.verbose = True
+        # wp.verbose_warnings = True
+
+        _warp_init_and_select_cuda_device()
+
+        # It's a good idea to always clear the kernel cache when developing new native or codegen features
+        wp.build.clear_kernel_cache()
+
+        # !!! DO THIS BEFORE DEFINING/USING ANY KERNELS WITH CUSTOM TYPES
+        neon.init()
+
+    elif default_backend == ComputeBackend.JAX:
+        check_backend_support()
+    else:
+        raise ValueError(f"Unsupported compute backend: {default_backend}")
+
+
+def _configure_warp_fast_math(enabled: bool):
+    """ Warp offers no global switch for this.  ``warp.config`` has no ``fast_math``
     field at all, and :class:`warp.context.Module` hardcodes
     ``options["fast_math"] = False`` when it builds its option dict, so setting
     ``wp.config.fast_math = True`` silently does nothing.  The documented
@@ -80,80 +132,35 @@ def _maybe_enable_fast_math():
 
     It is a real numerical change, so it is opt-in and off by default.  Validate
     against a reference case, not just MLUPS.
-
-    Returns
-    -------
-    bool
-        ``True`` if fast math was enabled.
     """
-    if os.environ.get("XLB_FAST_MATH", "0").strip().lower() not in ("1", "true", "yes", "on"):
-        return False
-
     try:
-        from warp import Module  # newer warp (no warp.context module)
+        from warp import Module
     except ImportError:
         from warp.context import Module
 
-    if not getattr(Module, "_xlb_fast_math_patched", False):
-        _original_init = Module.__init__
+    if enabled:
+        if not getattr(Module, "_xlb_fast_math_patched", False):
+            original_init = Module.__init__
 
-        def _init_with_fast_math(self, *args, **kwargs):
-            _original_init(self, *args, **kwargs)
-            self.options["fast_math"] = True
+            def _init_with_fast_math(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                self.options["fast_math"] = True
 
-        Module.__init__ = _init_with_fast_math
-        Module._xlb_fast_math_patched = True
+            #Module._xlb_original_init = original_init
+            Module.__init__ = _init_with_fast_math
+            Module._xlb_fast_math_patched = True
 
-    print("XLB: fast_math ENABLED for all Warp modules (XLB_FAST_MATH is set)")
-    return True
+        print("XLB: Warp fast_math ENABLED")
 
-
-def init(velocity_set, default_backend, default_precision_policy):
-    """Initialize the global XLB configuration.
-
-    Must be called before creating any grid, operator, or field.
-
-    Parameters
-    ----------
-    velocity_set : VelocitySet
-        Lattice velocity set (e.g. ``D3Q19``).
-    default_backend : ComputeBackend
-        Compute backend to use (JAX, WARP, or NEON).
-    default_precision_policy : PrecisionPolicy
-        Precision policy for compute and storage dtypes.
-    """
-    DefaultConfig.velocity_set = velocity_set
-    DefaultConfig.default_backend = default_backend
-    DefaultConfig.default_precision_policy = default_precision_policy
-
-    if default_backend == ComputeBackend.WARP:
-        _warp_init_and_select_cuda_device()
-        _maybe_enable_fast_math()
-    elif default_backend == ComputeBackend.NEON:
-        import warp as wp
-        import neon
-
-        # wp.config.mode = "release"
-        # wp.config.llvm_cuda = False
-        # wp.config.verbose = True
-        # wp.verbose_warnings = True
-
-        _warp_init_and_select_cuda_device()
-
-        # Must precede any kernel definition: it changes the codegen options that
-        # every Warp module is constructed with.
-        _maybe_enable_fast_math()
-
-        # It's a good idea to always clear the kernel cache when developing new native or codegen features
-        wp.build.clear_kernel_cache()
-
-        # !!! DO THIS BEFORE DEFINING/USING ANY KERNELS WITH CUSTOM TYPES
-        neon.init()
-
-    elif default_backend == ComputeBackend.JAX:
-        check_backend_support()
-    else:
-        raise ValueError(f"Unsupported compute backend: {default_backend}")
+    elif getattr(Module, "_xlb_fast_math_patched", False):
+        if not hasattr(Module, "_xlb_original_init"):
+            raise RuntimeError(
+                "An older XLB fast_math patch is active; restart Python "
+                "to switch fast_math modes."
+            )
+        Module.__init__ = Module._xlb_original_init
+        del Module._xlb_original_init
+        del Module._xlb_fast_math_patched
 
 
 def default_backend() -> ComputeBackend:

@@ -60,6 +60,7 @@
 	},
 "settings": {	
 	"debug": false,
+	"fastMath": true,
 	"doublePrecision": false,
 	"iterations": 100,
 	"solutionPrintFreq": 1,
@@ -78,6 +79,7 @@
 	"isoQuantity":"CpTotalLoss",
 	"isoValue":0.85,
 	"isoGrid": 1024,
+	"isoTriangleFraction": 0.75,
 	"isoScale": 1000,
 	"surfaceField": "Cp",
 	"surfaceFieldMin": -0.75,

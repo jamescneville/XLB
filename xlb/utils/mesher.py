@@ -1,13 +1,12 @@
 import numpy as np
 import trimesh
 from typing import Any, Optional, Dict
-import os
-import time
-from concurrent.futures import ThreadPoolExecutor
+import time, os
 import neon
 import warp as wp
 from xlb.utils.utils import UnitConvertor
 from scipy.spatial import cKDTree
+from concurrent.futures import ThreadPoolExecutor
 
 
 def adjust_bbox(cuboid_max, cuboid_min, voxel_size_up):
@@ -1740,15 +1739,65 @@ class MultiresIO(object):
         plane_point = np.asarray(plane_point, dtype=np.float64).copy()
         sdf = np.dot(self.centroids - plane_point, n)
 
-        # Select the single layer of cells (per level) that contains the plane.
+        # Select exactly one cell layer per refinement level.
+        # The default half-open interval chooses the voxel BELOW an exact
+        # internal face. A tiny bias makes float32 centroid rounding stable.
+        # At the LOWEST face of each refinement level, there is no voxel below:
+        # reverse the bias only for that level so we choose the voxel ABOVE.
+        dx = float(slice_thickness)
+        tol = max(
+            1e-12,
+            min(1e-3 * dx,
+                4.0 * np.finfo(np.float32).eps *
+                max(1.0, float(np.max(np.abs(plane_point))))),
+        )
+
         if getattr(self, "level_id_field", None) is not None:
-            cell_size_all = float(slice_thickness) * (2.0 ** self.level_id_field.astype(np.float32))
+            cell_size_all = dx * (2.0 ** self.level_id_field.astype(np.float32))
             half = 0.5 * cell_size_all
-            mask = (sdf >= -half) & (sdf < half)
+            mask = (sdf >= -half - tol) & (sdf < half - tol)
+
+            # save_slices uses axis-aligned positive X/Y/Z normals. The exported
+            # centroids are grouped by level, with boundaries in _level_cell_offsets.
+            # Cache the lower face once per axis/spacing rather than scanning
+            # tens of millions of centroids again for every slice plane.
+            axis = int(np.argmax(np.abs(n)))
+            axis_aligned = np.isclose(np.abs(n[axis]), 1.0, atol=1e-10)
+            offsets = getattr(self, "_level_cell_offsets", None)
+            if axis_aligned and offsets is not None:
+                cache = self.__dict__.setdefault("_slice_lower_faces_cache", {})
+                cache_key = (axis, dx, bool(n[axis] > 0.0))
+                lower_faces = cache.get(cache_key)
+                if lower_faces is None:
+                    lower_faces = []
+                    for a, b in zip(offsets[:-1], offsets[1:]):
+                        a, b = int(a), int(b)
+                        if a == b:
+                            continue
+                        level = int(self.level_id_field[a])
+                        half_level = 0.5 * dx * (2.0 ** level)
+                        coord = self.centroids[a:b, axis]
+                        # Face at the minimum plane coordinate along +n.
+                        face = (float(coord.min()) - half_level) if n[axis] > 0 else (float(coord.max()) + half_level)
+                        lower_faces.append((a, b, face))
+                    cache[cache_key] = lower_faces
+
+                plane_coord = float(plane_point[axis])
+                for a, b, lower_face in lower_faces:
+                    if abs(plane_coord - lower_face) <= tol:
+                        mask[a:b] = (
+                            (sdf[a:b] >= -half[a:b] + tol)
+                            & (sdf[a:b] < half[a:b] + tol)
+                        )
         else:
             cell_size_all = None
-            half = 0.5 * float(slice_thickness)
-            mask = (sdf >= -half) & (sdf < half)
+            half = 0.5 * dx
+            mask = (sdf >= -half - tol) & (sdf < half - tol)
+
+        # Also support a nonstandard/manual slice exactly on a lower face when
+        # the per-level metadata is absent: retry the opposite half-open side.
+        if not np.any(mask):
+            mask = (sdf >= -half + tol) & (sdf < half + tol)
         if not np.any(mask):
             raise ValueError("No cells intersect the plane within thickness.")
 
@@ -1908,136 +1957,137 @@ class MultiresIO(object):
             "extent": (bx0, bx1, by0, by1),
         }
 
+
     def _to_slice_image_single_field(
-        self,
-        output_filename,
-        field_data,
-        plane_point,
-        plane_normal,
-        slice_thickness,
-        bounds,
-        grid_res,
-        cmap,
-        show_axes,
-        show_colorbar,
-        normalize,
-        width,
-        height,
-        width_vec,
-        height_vec,
-        workers=-1,
-        solid_mask=None,
-        plane_cache=None,
-        solid_fill=None,
-        solid_scale=1.0,
-        wall_blend=2.0,
-        wall_blur_sigma=1.0,
-        **kwargs,
-    ):
-        """
-        Helper function to create a slice image for a single field.
+            self,
+            output_filename,
+            field_data,
+            plane_point,
+            plane_normal,
+            slice_thickness,
+            bounds,
+            grid_res,
+            cmap,
+            show_axes,
+            show_colorbar,
+            normalize,
+            width,
+            height,
+            width_vec,
+            height_vec,
+            workers=-1,
+            solid_mask=None,
+            plane_cache=None,
+            solid_fill=None,
+            solid_scale=1.0,
+            wall_blend=2.0,
+            wall_blur_sigma=1.0,
+            **kwargs,
+        ):
+            """
+            Helper function to create a slice image for a single field.
 
-        If width, height, width_vec, and height_vec are all provided, the image
-        extent is pinned to the rectangle [plane_point, plane_point + width*width_vec + height*height_vec]
-        so consecutive slices in a sweep share an identical pixel grid (no shift).
+            If width, height, width_vec, and height_vec are all provided, the image
+            extent is pinned to the rectangle [plane_point, plane_point + width*width_vec + height*height_vec]
+            so consecutive slices in a sweep share an identical pixel grid (no shift).
 
-        solid_mask : bool array aligned with the cell centroids (True == solid), optional.
-            Solid cells never contribute data. Pixels inside the body are filled
-            (see solid_fill) so no transparent/black voxel staircase shows at the wall.
-        solid_fill : float or None
-            Value written inside the body, in the same (normalised) units as the
-            field. Use 0.0 for velocity (no-slip wall); None extends the nearest
-            fluid value (zero-gradient), right for pressure/Cp.
-        solid_scale : float
-            When solid_fill is None, body pixels get solid_scale * nearest fluid
-            value. 1.0 = plain extension; <1 darkens the wall region (e.g. 0.5
-            for a hint of boundary-layer slowdown on velocity).
-        wall_blend : float
-            Voxels from the body over which a blur is feathered in (0 disables).
-            Fluid further out keeps the sharp linear interpolation.
-        wall_blur_sigma : float
-            Gaussian sigma of that near-wall blur, in voxels.
-        plane_cache : dict, optional
-            Pass the same dict for every field rendered on the SAME plane to reuse
-            the triangulation and pixel weights. Never share one across planes or threads.
-        """
-        from matplotlib import cm
-        import numpy as np
-        import matplotlib.pyplot as plt
+            solid_mask : bool array aligned with the cell centroids (True == solid), optional.
+                Solid cells never contribute data. Pixels inside the body are filled
+                (see solid_fill) so no transparent/black voxel staircase shows at the wall.
+            solid_fill : float or None
+                Value written inside the body, in the same (normalised) units as the
+                field. Use 0.0 for velocity (no-slip wall); None extends the nearest
+                fluid value (zero-gradient), right for pressure/Cp.
+            solid_scale : float
+                When solid_fill is None, body pixels get solid_scale * nearest fluid
+                value. 1.0 = plain extension; <1 darkens the wall region (e.g. 0.5
+                for a hint of boundary-layer slowdown on velocity).
+            wall_blend : float
+                Voxels from the body over which a blur is feathered in (0 disables).
+                Fluid further out keeps the sharp linear interpolation.
+            wall_blur_sigma : float
+                Gaussian sigma of that near-wall blur, in voxels.
+            plane_cache : dict, optional
+                Pass the same dict for every field rendered on the SAME plane to reuse
+                the triangulation and pixel weights. Never share one across planes or threads.
+            """
+            from matplotlib import cm
+            import numpy as np
+            import matplotlib.pyplot as plt
 
-        sampler = plane_cache.get("sampler") if plane_cache is not None else None
-        if sampler is None:
-            sampler = self._build_slice_sampler(
-                plane_point,
-                plane_normal,
-                slice_thickness,
-                bounds,
-                grid_res,
-                width,
-                height,
-                width_vec,
-                height_vec,
-                solid_mask,
-                workers,
-                wall_blend=wall_blend,
-            )
-            if plane_cache is not None:
-                plane_cache["sampler"] = sampler
+            sampler = plane_cache.get("sampler") if plane_cache is not None else None
+            if sampler is None:
+                sampler = self._build_slice_sampler(
+                    plane_point,
+                    plane_normal,
+                    slice_thickness,
+                    bounds,
+                    grid_res,
+                    width,
+                    height,
+                    width_vec,
+                    height_vec,
+                    solid_mask,
+                    workers,
+                    wall_blend=wall_blend,
+                )
+                if plane_cache is not None:
+                    plane_cache["sampler"] = sampler
 
-        if cmap is None:
-            cmap = cm.nipy_spectral
+            if cmap is None:
+                cmap = cm.nipy_spectral
 
-        grid_resY = sampler["grid_resY"]
-        bounded_x_min, bounded_x_max, bounded_y_min, bounded_y_max = sampler["extent"]
+            grid_resY = sampler["grid_resY"]
+            bounded_x_min, bounded_x_max, bounded_y_min, bounded_y_max = sampler["extent"]
 
-        # Evaluate the field on the pixel grid.
-        v = np.asarray(field_data)[sampler["src_idx"]].astype(np.float64)
-        out = np.full(sampler["npix"], np.nan, dtype=np.float64)
-        lp = sampler["lin_pix"]
-        if lp.size:
-            out[lp] = (v[sampler["lin_verts"]] * sampler["lin_bary"]).sum(axis=1)
-        npx = sampler["nn_pix"]
-        if npx.size:
-            out[npx] = v[sampler["nn_idx"]]
-        if sampler["solid_pix"].size:
-            if solid_fill is not None:
-                out[sampler["solid_pix"]] = float(solid_fill)
+            # Evaluate the field on the pixel grid.
+            v = np.asarray(field_data)[sampler["src_idx"]].astype(np.float64)
+            out = np.full(sampler["npix"], np.nan, dtype=np.float64)
+            lp = sampler["lin_pix"]
+            if lp.size:
+                out[lp] = (v[sampler["lin_verts"]] * sampler["lin_bary"]).sum(axis=1)
+            npx = sampler["nn_pix"]
+            if npx.size:
+                out[npx] = v[sampler["nn_idx"]]
+            if sampler["solid_pix"].size:
+                if solid_fill is not None:
+                    out[sampler["solid_pix"]] = float(solid_fill)
+                else:
+                    out[sampler["solid_pix"]] = float(solid_scale) * v[sampler["solid_nn"]]
+            grid_field = out.reshape(grid_resY, grid_res).astype(np.float32)
+
+            # Near-wall blend only: blur the whole image, mix it in by the feather
+            # weight (1 at the body, 0 beyond wall_blend voxels).
+            wall_w = sampler["wall_w"]
+            if wall_w is not None and wall_blur_sigma > 0:
+                from scipy import ndimage
+
+                sigma_px = wall_blur_sigma * float(slice_thickness) / max(sampler["pixel_size"], 1e-20)
+                blurred = ndimage.gaussian_filter(grid_field, sigma=sigma_px, mode="nearest")
+                grid_field = grid_field + wall_w * (blurred - grid_field)
+
+            # Plot
+            if show_colorbar or show_axes:
+                dpi = 300
+                plt.imshow(
+                    grid_field,
+                    extent=[bounded_x_min, bounded_x_max, bounded_y_min, bounded_y_max],
+                    cmap=cmap,
+                    origin="lower",
+                    aspect="equal",
+                    **kwargs,
+                )
+                if show_colorbar:
+                    plt.colorbar()
+                if not show_axes:
+                    plt.axis("off")
+                plt.savefig(output_filename + ".png", dpi=dpi, bbox_inches="tight", pad_inches=0)
+                plt.close()
             else:
-                out[sampler["solid_pix"]] = float(solid_scale) * v[sampler["solid_nn"]]
-        grid_field = out.reshape(grid_resY, grid_res).astype(np.float32)
-
-        # Near-wall blend only: blur the whole image, mix it in by the feather
-        # weight (1 at the body, 0 beyond wall_blend voxels).
-        wall_w = sampler["wall_w"]
-        if wall_w is not None and wall_blur_sigma > 0:
-            from scipy import ndimage
-
-            sigma_px = wall_blur_sigma * float(slice_thickness) / max(sampler["pixel_size"], 1e-20)
-            blurred = ndimage.gaussian_filter(grid_field, sigma=sigma_px, mode="nearest")
-            grid_field = grid_field + wall_w * (blurred - grid_field)
-
-        # Plot
-        if show_colorbar or show_axes:
-            dpi = 300
-            plt.imshow(
-                grid_field,
-                extent=[bounded_x_min, bounded_x_max, bounded_y_min, bounded_y_max],
-                cmap=cmap,
-                origin="lower",
-                aspect="equal",
-                **kwargs,
-            )
-            if show_colorbar:
-                plt.colorbar()
-            if not show_axes:
-                plt.axis("off")
-            plt.savefig(output_filename + ".png", dpi=dpi, bbox_inches="tight", pad_inches=0)
-            plt.close()
-        else:
-            if normalize != 1.0:
-                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower", vmin=0, vmax=1)
-            else:
-                plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
+                if normalize != 1.0:
+                    plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower", vmin=0, vmax=1)
+                else:
+                    plt.imsave(output_filename + ".png", grid_field, cmap=cmap, origin="lower")
 
     def to_line(
         self,
@@ -3053,6 +3103,14 @@ class MultiresIO(object):
         arr = np.asarray(arr).ravel()
         return ", ".join(np.char.mod(fmt, arr).tolist())
     
+    @staticmethod
+    def _usd_output_filename(output_filename):
+        """New outputs default to .usdc; explicit .usda remains supported."""
+        import os
+
+        path = os.fspath(output_filename)
+        return path if os.path.splitext(path)[1].lower() in (".usdc", ".usda") else path + ".usdc"
+
     def _write_polydata_usd(
         self,
         usd_filename,
@@ -3070,191 +3128,303 @@ class MultiresIO(object):
         double_sided=False,
         emissive=0.0,
         append=False,
+        additional_meshes=None,
     ):
-        """Write a triangle mesh + scalar fields to an OpenUSD ASCII (.usda) file.
+        """Write an OpenUSD stage directly to binary .usdc (or requested .usda).
 
-        With ``uniform_color`` (and no ``color_field``) the mesh also gets a constant-colour
-        ``UsdPreviewSurface`` material (``emissive`` is the fraction of the colour added as
-        emission), since VRED/Alias ignore ``displayColor``. ``double_sided`` marks the mesh
-        two-sided (thin ribbons / tubes). ``append=True`` adds this mesh as another top-level prim
-        to an existing file (no header) instead of overwriting it.
+        Preserves the original triangle topology, primvars, vertex-colour
+        fallback, st UVs, UsdPreviewSurface and relative PNG texture reference.
+        By default a <stem>_cmap.png is written adjacent to the USD file.
 
-        Mirrors :meth:`_write_polydata_vtk` but emits USD that Autodesk VRED (and
-        other USD-aware tools) imports natively. Every entry in ``point_data`` /
-        ``cell_data`` is written as a primvar (``vertex`` / ``uniform``
-        interpolation respectively). ``color_field`` names a 1-D scalar in
-        ``point_data`` that is additionally baked into a per-vertex
-        ``primvars:displayColor`` via ``cmap`` so the result renders in colour
-        immediately without a shader network. For Autodesk VRED, which ignores
-        ``displayColor`` vertex primvars on import, the field is also baked into a
-        colormap texture sampled through a ``UsdPreviewSurface`` material via
-        per-vertex UV (``st``) coordinates.
+        Multiple meshes (tufts + tape) should use additional_meshes so the
+        crate file is saved ONCE, rather than opened and rewritten per mesh.
+        append=True is retained for callers that append to an existing stage.
+
+        Requires Pixar OpenUSD Python bindings, e.g. `pip install usd-core`.
         """
-        import io
         import os
         import re
+        import tempfile
+        import time
+        from pathlib import Path
 
-        vertices = np.asarray(vertices, dtype=np.float32)
-        faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
-        point_data = point_data or {}
-        cell_data = cell_data or {}
+        started = time.perf_counter()
 
-        n_verts = len(vertices)
-        n_faces = len(faces)
+        try:
+            from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
+        except ImportError as exc:
+            raise ImportError(
+                "Binary USD output requires the OpenUSD Python 'pxr' bindings. "
+                "Install 'usd-core' in the Python environment running mesher.py."
+            ) from exc
 
-        usd_filename = usd_filename if usd_filename.endswith((".usda", ".usd")) else usd_filename + ".usda"
+        usd_filename = self._usd_output_filename(usd_filename)
+        final_path = Path(usd_filename)
+        usd_suffix = final_path.suffix.lower()
+        cmap_name = final_path.stem + "_cmap.png"
+        cmap_path = final_path.with_name(cmap_name)
 
         def sanitize(name):
             s = re.sub(r"[^0-9a-zA-Z_]", "_", str(name))
             return ("_" + s) if (not s or s[0].isdigit()) else s
 
-        buf = io.StringIO()
-        if append:
-            buf.write("\n")
-        else:
-            buf.write("#usda 1.0\n")
-            buf.write("(\n")
-            buf.write(f'    defaultPrim = "{prim_name}"\n')
-            buf.write(f"    metersPerUnit = {float(meters_per_unit)}\n")
-            buf.write(f'    upAxis = "{up_axis}"\n')
-            buf.write(")\n\n")
+        def as_vt_vectors(array, width, label):
+            arr = np.ascontiguousarray(array, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != width:
+                raise ValueError(f"{label} must be shaped (N, {width}), got {arr.shape}")
+            converter = {2: Vt.Vec2fArray, 3: Vt.Vec3fArray}[width]
+            return converter.FromNumpy(arr)
 
-        buf.write(f'def Mesh "{prim_name}"\n')
-        buf.write("{\n")
+        def as_vt_float(array):
+            return Vt.FloatArray.FromNumpy(
+                np.ascontiguousarray(np.asarray(array, dtype=np.float32).reshape(-1))
+            )
 
-        # Topology
-        buf.write(f"    int[] faceVertexCounts = [{self._usd_scalar_array(np.full(n_faces, 3, dtype=np.int32), fmt='%d')}]\n")
-        buf.write(f"    int[] faceVertexIndices = [{self._usd_scalar_array(faces.ravel(), fmt='%d')}]\n")
-        buf.write(f"    point3f[] points = [{self._usd_vec_array(vertices, 3)}]\n")
-        buf.write('    uniform token subdivisionScheme = "none"\n')
-        if double_sided:
-            buf.write("    uniform bool doubleSided = true\n")
+        def make_constant_png(color):
+            # Uniform-colour outputs previously had no PNG. The Alias loader
+            # expects one, so supply an adjacent constant-colour texture.
+            import matplotlib.image as mpimg
 
-        # Colour from the chosen scalar field, baked as a colormap texture +
-        # per-vertex UVs + a UsdPreviewSurface material (what VRED renders), plus
-        # displayColor as a fallback for viewers that honour vertex colours.
-        texture_field = color_field is not None and color_field in point_data
-        if texture_field:
-            field = np.asarray(point_data[color_field], dtype=np.float32)
-            if field.ndim == 2 and field.shape[1] == 3:
-                # Vector field -> colour by magnitude.
-                field = np.linalg.norm(field, axis=1)
-            field = field.ravel()
+            rgb = np.asarray(color, dtype=np.float32)
+            if rgb.shape != (3,) or not np.isfinite(rgb).all():
+                raise ValueError("uniform_color must have three finite components")
+            rgb = np.clip(rgb, 0.0, 1.0)
+            image = np.broadcast_to(rgb, (8, 256, 3)).copy()
+            mpimg.imsave(str(cmap_path), image)
 
-            finite = np.isfinite(field)
-            if clim is not None:
-                vmin, vmax = float(clim[0]), float(clim[1])
-            elif finite.any():
-                vmin, vmax = float(np.min(field[finite])), float(np.max(field[finite]))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-                vmax = vmin + 1.0
+        def author_mesh(stage, *, vertices, faces, point_data, cell_data,
+                        color_field, uniform_color, prim_name, double_sided,
+                        emissive, write_adjacent_png):
+            pts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+            triangles = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+            n_verts, n_faces = len(pts), len(triangles)
+            points = point_data or {}
+            cells = cell_data or {}
 
-            # UV: u = normalized value -> column in the ramp, v = mid-row.
-            # Inset the clamp to [0.005, 0.99] so clamped extremes never land exactly
-            # on the 0.0/1.0 texture edge; renderers that don't honor wrapS="clamp"
-            # (or use half-texel bilinear sampling) otherwise read u=0.0 across the
-            # wrap boundary and pick up the opposite ramp end (low-clip -> max color).
-            u = np.clip((field - vmin) / (vmax - vmin), 0.005, 0.995)
-            u[~finite] = 0.01
-            st = np.column_stack([u, np.full_like(u, 0.5)])
+            name = sanitize(prim_name)
+            mesh_path = "/" + name
+            if stage.GetPrimAtPath(mesh_path):
+                raise ValueError(f"USD stage already contains a prim at {mesh_path}")
 
-            # Write the colormap ramp PNG next to the USD file.
-            tex_name = os.path.splitext(os.path.basename(usd_filename))[0] + "_cmap.png"
-            tex_path = os.path.join(os.path.dirname(usd_filename), tex_name)
-            self._write_colormap_texture(tex_path, cmap=cmap)
+            mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+            mesh.CreateFaceVertexCountsAttr().Set(
+                Vt.IntArray.FromNumpy(np.full(n_faces, 3, dtype=np.int32))
+            )
+            mesh.CreateFaceVertexIndicesAttr().Set(
+                Vt.IntArray.FromNumpy(np.ascontiguousarray(triangles.ravel()))
+            )
+            mesh.CreatePointsAttr().Set(as_vt_vectors(pts, 3, "points"))
+            mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+            if double_sided:
+                mesh.CreateDoubleSidedAttr().Set(True)
 
-            # displayColor fallback for displayColor-aware viewers.
-            rgb, _ = self._scalar_to_rgb(field, cmap=cmap, clim=(vmin, vmax))
-            buf.write(f"    color3f[] primvars:displayColor = [{self._usd_vec_array(rgb, 3)}] (\n")
-            buf.write('        interpolation = "vertex"\n')
-            buf.write("    )\n")
+            primvars = UsdGeom.PrimvarsAPI(mesh)
+            textured = color_field is not None and color_field in points
+            texture_name = None
 
-            buf.write(f"    texCoord2f[] primvars:st = [{self._usd_vec_array(st, 2)}] (\n")
-            buf.write('        interpolation = "vertex"\n')
-            buf.write("    )\n")
-            buf.write(f"    rel material:binding = </{prim_name}/Material>\n")
+            if textured:
+                field = np.asarray(points[color_field], dtype=np.float32)
+                if field.ndim == 2 and field.shape[1] == 3:
+                    field = np.linalg.norm(field, axis=1)
+                field = field.ravel()
+                if len(field) != n_verts:
+                    raise ValueError(f"Color field {color_field!r} has {len(field)} values for {n_verts} vertices")
 
-            print(f"\tUSD field '{color_field}' textured via {tex_name} (cmap={cmap}, range=[{vmin:.4g}, {vmax:.4g}])")
-        elif uniform_color is not None:
-            r, g, b = (float(c) for c in uniform_color)
-            buf.write(f"    color3f[] primvars:displayColor = [({r:.6g}, {g:.6g}, {b:.6g})] (\n")
-            buf.write('        interpolation = "constant"\n')
-            buf.write("    )\n")
-            buf.write(f"    rel material:binding = </{prim_name}/Material>\n")
-
-        # Raw scalar/vector primvars (point data -> vertex, cell data -> uniform).
-        for interp, data, expected in (("vertex", point_data, n_verts), ("uniform", cell_data, n_faces)):
-            for name, arr in data.items():
-                arr = np.asarray(arr, dtype=np.float32)
-                pv = sanitize(name)
-                if arr.ndim == 1:
-                    buf.write(f"    float[] primvars:{pv} = [{self._usd_scalar_array(arr)}] (\n")
-                elif arr.ndim == 2 and arr.shape[1] == 3:
-                    buf.write(f"    float3[] primvars:{pv} = [{self._usd_vec_array(arr, 3)}] (\n")
+                finite = np.isfinite(field)
+                if clim is not None:
+                    vmin, vmax = float(clim[0]), float(clim[1])
+                elif finite.any():
+                    vmin, vmax = float(field[finite].min()), float(field[finite].max())
                 else:
-                    raise ValueError(f"Unsupported primvar shape for '{name}': {arr.shape}")
-                buf.write(f'        interpolation = "{interp}"\n')
-                buf.write("    )\n")
+                    vmin, vmax = 0.0, 1.0
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                    vmax = vmin + 1.0
 
-        # UsdPreviewSurface material that samples the colormap texture using the
-        # 'st' primvar. This is the path VRED honours for baked field colours.
-        if texture_field:
-            buf.write(f'    def Material "Material"\n')
-            buf.write("    {\n")
-            buf.write("        token outputs:surface.connect = "
-                      f"</{prim_name}/Material/Shader.outputs:surface>\n")
-            buf.write('        def Shader "Shader"\n')
-            buf.write("        {\n")
-            buf.write('            uniform token info:id = "UsdPreviewSurface"\n')
-            buf.write("            color3f inputs:diffuseColor.connect = "
-                      f"</{prim_name}/Material/Tex.outputs:rgb>\n")
-            buf.write("            float inputs:roughness = 1\n")
-            buf.write("            float inputs:metallic = 0\n")
-            buf.write("            token outputs:surface\n")
-            buf.write("        }\n")
-            buf.write('        def Shader "Tex"\n')
-            buf.write("        {\n")
-            buf.write('            uniform token info:id = "UsdUVTexture"\n')
-            buf.write(f"            asset inputs:file = @./{tex_name}@\n")
-            buf.write("            float2 inputs:st.connect = "
-                      f"</{prim_name}/Material/Reader.outputs:result>\n")
-            buf.write('            token inputs:wrapS = "clamp"\n')
-            buf.write('            token inputs:wrapT = "clamp"\n')
-            buf.write("            float3 outputs:rgb\n")
-            buf.write("        }\n")
-            buf.write('        def Shader "Reader"\n')
-            buf.write("        {\n")
-            buf.write('            uniform token info:id = "UsdPrimvarReader_float2"\n')
-            buf.write('            token inputs:varname = "st"\n')
-            buf.write("            float2 outputs:result\n")
-            buf.write("        }\n")
-            buf.write("    }\n")
-        elif uniform_color is not None:
-            buf.write(f'    def Material "Material"\n')
-            buf.write("    {\n")
-            buf.write("        token outputs:surface.connect = "
-                      f"</{prim_name}/Material/Shader.outputs:surface>\n")
-            buf.write('        def Shader "Shader"\n')
-            buf.write("        {\n")
-            buf.write('            uniform token info:id = "UsdPreviewSurface"\n')
-            buf.write(f"            color3f inputs:diffuseColor = ({r:.6g}, {g:.6g}, {b:.6g})\n")
-            buf.write(f"            color3f inputs:emissiveColor = "
-                      f"({r * emissive:.4g}, {g * emissive:.4g}, {b * emissive:.4g})\n")
-            buf.write("            float inputs:roughness = 0.8\n")
-            buf.write("            float inputs:metallic = 0\n")
-            buf.write("            token outputs:surface\n")
-            buf.write("        }\n")
-            buf.write("    }\n")
+                u = np.clip((field - vmin) / (vmax - vmin), 0.005, 0.995)
+                u[~finite] = 0.01
+                uv = np.empty((n_verts, 2), dtype=np.float32)
+                uv[:, 0] = u
+                uv[:, 1] = 0.5
+                primvars.CreatePrimvar(
+                    "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+                ).Set(as_vt_vectors(uv, 2, "st"))
 
-        buf.write("}\n")
+                rgb, _ = self._scalar_to_rgb(field, cmap=cmap, clim=(vmin, vmax))
+                primvars.CreatePrimvar(
+                    "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+                ).Set(as_vt_vectors(rgb, 3, "displayColor"))
 
-        with open(usd_filename, "a" if append else "w") as f:
-            f.write(buf.getvalue())
+                if write_adjacent_png:
+                    self._write_colormap_texture(str(cmap_path), cmap=cmap)
+                texture_name = cmap_name
+                print(f"\tUSD field '{color_field}' textured via {texture_name} "
+                      f"(cmap={cmap}, range=[{vmin:.4g}, {vmax:.4g}])")
 
-        print(f"\tUSD surface ({n_verts:,} verts, {n_faces:,} tris) written to {usd_filename}")
-        return usd_filename
+            elif uniform_color is not None:
+                rgb = np.asarray(tuple(uniform_color), dtype=np.float32)
+                if rgb.shape != (3,):
+                    raise ValueError("uniform_color must contain exactly three RGB floats")
+                primvars.CreatePrimvar(
+                    "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant
+                ).Set(as_vt_vectors(rgb.reshape(1, 3), 3, "displayColor"))
+
+                if write_adjacent_png:
+                    # Make even constant-color USD results compatible with the
+                    # Alias loader's <stem>_cmap.png naming convention.
+                    make_constant_png(rgb)
+                    uv = np.full((n_verts, 2), 0.5, dtype=np.float32)
+                    primvars.CreatePrimvar(
+                        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+                    ).Set(as_vt_vectors(uv, 2, "st"))
+
+            for interpolation, data, expected in (
+                (UsdGeom.Tokens.vertex, points, n_verts),
+                (UsdGeom.Tokens.uniform, cells, n_faces),
+            ):
+                for field_name, raw in data.items():
+                    arr = np.asarray(raw, dtype=np.float32)
+                    if arr.shape[0] != expected:
+                        raise ValueError(
+                            f"Primvar {field_name!r} has {arr.shape[0]} values; expected {expected}"
+                        )
+                    field_prim_name = sanitize(field_name)
+                    if arr.ndim == 1:
+                        primvars.CreatePrimvar(
+                            field_prim_name, Sdf.ValueTypeNames.FloatArray, interpolation
+                        ).Set(as_vt_float(arr))
+                    elif arr.ndim == 2 and arr.shape[1] == 3:
+                        primvars.CreatePrimvar(
+                            field_prim_name, Sdf.ValueTypeNames.Float3Array, interpolation
+                        ).Set(as_vt_vectors(arr, 3, field_prim_name))
+                    else:
+                        raise ValueError(f"Unsupported primvar shape for {field_name!r}: {arr.shape}")
+
+            if textured or uniform_color is not None:
+                mat_path = mesh_path + "/Material"
+                material = UsdShade.Material.Define(stage, mat_path)
+                shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
+                shader.CreateIdAttr("UsdPreviewSurface")
+                shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+                material.CreateSurfaceOutput().ConnectToSource(shader.GetOutput("surface"))
+
+                if textured:
+                    tex_shader = UsdShade.Shader.Define(stage, mat_path + "/Tex")
+                    tex_shader.CreateIdAttr("UsdUVTexture")
+                    tex_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+                        Sdf.AssetPath("./" + texture_name)
+                    )
+                    tex_shader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
+                    tex_shader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
+                    tex_shader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+                    reader = UsdShade.Shader.Define(stage, mat_path + "/Reader")
+                    reader.CreateIdAttr("UsdPrimvarReader_float2")
+                    reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+                    reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+                    tex_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                        reader.GetOutput("result")
+                    )
+                    shader.CreateInput(
+                        "diffuseColor", Sdf.ValueTypeNames.Color3f
+                    ).ConnectToSource(tex_shader.GetOutput("rgb"))
+                    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
+                    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+                else:
+                    r, g, b = map(float, uniform_color)
+                    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                        Gf.Vec3f(r, g, b)
+                    )
+                    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(
+                        Gf.Vec3f(r * emissive, g * emissive, b * emissive)
+                    )
+                    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)
+                    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+
+                UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+            print(f"\tUSD mesh {name} ({n_verts:,} verts, {n_faces:,} tris) authored")
+            return mesh
+
+        # Stage file is written to a temporary sibling, then replaced once
+        # complete. Its adjacent PNG is authored before the final replacement.
+        temp_path = None
+        if append:
+            if not final_path.is_file():
+                raise FileNotFoundError(f"Cannot append to missing USD stage: {final_path}")
+            stage = Usd.Stage.Open(str(final_path))
+            if stage is None:
+                raise RuntimeError(f"OpenUSD could not open stage for append: {final_path}")
+        else:
+            fd, temp_name = tempfile.mkstemp(
+                prefix=final_path.stem + "_", suffix=usd_suffix,
+                dir=str(final_path.parent or Path(".")),
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+            temp_path.unlink()  # Stage.CreateNew requires the file not to exist.
+            stage = Usd.Stage.CreateNew(str(temp_path))
+            if stage is None:
+                raise RuntimeError(f"OpenUSD could not create stage: {temp_path}")
+            UsdGeom.SetStageUpAxis(
+                stage, UsdGeom.Tokens.z if str(up_axis).upper() == "Z" else UsdGeom.Tokens.y
+            )
+            UsdGeom.SetStageMetersPerUnit(stage, float(meters_per_unit))
+
+        saved = False
+        try:
+            first_mesh = author_mesh(
+                stage, vertices=vertices, faces=faces,
+                point_data=point_data, cell_data=cell_data,
+                color_field=color_field, uniform_color=uniform_color,
+                prim_name=prim_name, double_sided=double_sided,
+                emissive=emissive, write_adjacent_png=not append,
+            )
+            if not append:
+                stage.SetDefaultPrim(first_mesh.GetPrim())
+            del first_mesh
+
+            for extra in additional_meshes or ():
+                author_mesh(
+                    stage,
+                    vertices=extra["vertices"], faces=extra["faces"],
+                    point_data=extra.get("point_data"),
+                    cell_data=extra.get("cell_data"),
+                    color_field=extra.get("color_field"),
+                    uniform_color=extra.get("uniform_color"),
+                    prim_name=extra["prim_name"],
+                    double_sided=extra.get("double_sided", False),
+                    emissive=extra.get("emissive", 0.0),
+                    write_adjacent_png=False,
+                )
+
+            save_started = time.perf_counter()
+            if not stage.GetRootLayer().Save():
+                raise IOError(f"OpenUSD could not save {temp_path or final_path}")
+            save_seconds = time.perf_counter() - save_started
+            saved = True
+        finally:
+            # Release layer and stage handles before Windows' os.replace.
+            del stage
+            if temp_path is not None and not saved:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        if temp_path is not None:
+            try:
+                os.replace(temp_path, final_path)
+            except Exception:
+                # Leave the previous valid stage intact; remove partial output.
+                temp_path.unlink(missing_ok=True)
+                raise
+
+        elapsed = time.perf_counter() - started
+        n_bytes = final_path.stat().st_size
+        print(f"\tUSD written to {final_path} (format={usd_suffix}, "
+              f"size={n_bytes / (1024 * 1024):.2f} MiB, "
+              f"OpenUSD save={save_seconds:.2f}s, total={elapsed:.2f}s)")
+        return str(final_path)
 
     def _fields_data_to_surface_vtk(
         self,
@@ -3367,7 +3537,7 @@ class MultiresIO(object):
             if usd_cmap is None:
                 usd_cmap = "turbo"
 
-            usd_filename = output_filename if output_filename.endswith(".usda") else output_filename + ".usda"
+            usd_filename = self._usd_output_filename(output_filename)
             self._write_polydata_usd(
                 usd_filename,
                 vertices,
@@ -3614,6 +3784,135 @@ class MultiresIO(object):
         return ndimage.binary_propagation(seed, mask=fluid_mask, structure=structure)
 
     @staticmethod
+    def _decimate_iso_mesh(mesh, fraction, pitch, min_faces=1_000_000, max_faces=2_000_000):
+        """Quadric-decimate ``mesh`` down to ``fraction`` of its triangles.
+
+        The result is kept within [``min_faces``, ``max_faces``] triangles, and a
+        mesh already at or below ``min_faces`` is left alone, so a small iso is
+        never over-decimated and a very large one stays bounded. Logs the
+        resulting surface deviation from the input in units of ``pitch``. If
+        open3d is unavailable the mesh is returned unchanged, so an optional size
+        optimisation can never cost the iso result.
+        """
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"triangle_fraction must be in (0, 1], got {fraction!r}")
+        if fraction == 1.0:
+            return mesh
+        n0 = len(mesh.faces)
+        if n0 <= min_faces:
+            print(f"\tDecimation skipped: {n0:,} tris is at or below the {min_faces:,} floor")
+            return mesh
+        try:
+            import open3d as o3d
+        except ImportError:
+            print("\tDecimation skipped: open3d is not installed.")
+            return mesh
+
+        target = int(min(max(n0 * fraction, min_faces), max_faces))
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
+        m = m.simplify_quadric_decimation(target)
+        m.remove_degenerate_triangles()
+        m.remove_unreferenced_vertices()
+        out = trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False)
+
+        try:
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(
+                o3d.core.Tensor(verts.astype(np.float32)), o3d.core.Tensor(faces.astype(np.uint32))
+            )
+            dev = scene.compute_distance(
+                o3d.core.Tensor(np.asarray(out.vertices, dtype=np.float32))
+            ).numpy() / float(pitch)
+            dev_msg = f"; deviation/pitch p99 {np.percentile(dev, 99):.3f}, max {dev.max():.3f}"
+        except Exception:
+            dev_msg = ""
+        print(f"\tDecimation: {n0:,} -> {len(out.faces):,} tris (-{100.0 * (1 - len(out.faces) / n0):.0f}%){dev_msg}")
+        return out
+
+    def _remove_small_mesh_components(
+        self,
+        mesh,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Remove tiny disconnected triangle islands from an extracted iso mesh.
+
+        Marching cubes can create small disconnected components when the sampled
+        scalar contains single-cell/voxel-scale noise. This keeps the main
+        connected components and drops islands whose face count or surface area is
+        tiny relative to the full iso-surface. If filtering would remove
+        everything, the largest component is kept as a safe fallback.
+        """
+        if mesh is None or len(mesh.faces) == 0:
+            return mesh
+
+        min_component_faces = int(min_component_faces or 0)
+        min_component_area_fraction = float(min_component_area_fraction or 0.0)
+
+        if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
+            return mesh
+
+        # Label faces by edge-connected component with array ops (no per-component
+        # Trimesh objects, which is very slow when there are thousands of islands).
+        try:
+            n_faces = len(mesh.faces)
+            comps = trimesh.graph.connected_components(
+                mesh.face_adjacency, nodes=np.arange(n_faces), min_len=1
+            )
+            n_comp = len(comps)
+            if n_comp <= 1:
+                return mesh
+            labels = np.empty(n_faces, dtype=np.int64)
+            for i, c in enumerate(comps):
+                labels[c] = i
+            areas = np.bincount(labels, weights=np.asarray(mesh.area_faces, dtype=np.float64), minlength=n_comp)
+            faces = np.bincount(labels, minlength=n_comp)
+        except Exception as exc:
+            print(f"\tConnected-component cleanup skipped: {exc}")
+            return mesh
+
+        if keep_largest_component:
+            keep = np.zeros(n_comp, dtype=bool)
+            keep[int(np.argmax(areas))] = True
+        else:
+            total_area = float(max(mesh.area, 1e-30))
+            min_area = min_component_area_fraction * total_area
+            keep = np.ones(n_comp, dtype=bool)
+            if min_component_faces > 0:
+                keep &= faces >= min_component_faces
+            if min_component_area_fraction > 0.0:
+                keep &= areas >= min_area
+
+            if not np.any(keep):
+                keep[int(np.argmax(areas))] = True
+                print(
+                    "\tConnected-component cleanup would remove all components; "
+                    "kept the largest component instead."
+                )
+
+        n_removed = int(np.count_nonzero(~keep))
+        if n_removed == 0:
+            return mesh
+
+        cleaned = trimesh.Trimesh(
+            vertices=mesh.vertices, faces=mesh.faces[keep[labels]], process=False
+        )
+        try:
+            cleaned.remove_unreferenced_vertices()
+        except Exception:
+            pass
+
+        print(
+            f"\tConnected-component cleanup: removed {n_removed} small component(s); "
+            f"kept {n_comp - n_removed} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
+        )
+        return cleaned
+
+
+    @staticmethod
     def _iso_active_blocks(fluid_xyz, fluid_val, solid_xyz, gmin, pitch, dims, iso_value, block, halo,
                            solid_halo):
         """Find resample-grid blocks that may contain the iso-surface.
@@ -3694,127 +3993,6 @@ class MultiresIO(object):
             b = np.clip(b, 0, nb - 1)
             keep[s:s + chunk] = ok & near[b[:, 0], b[:, 1], b[:, 2]]
         return keep
-
-    @staticmethod
-    def _decimate_iso_mesh(mesh, fraction, pitch, min_faces=1_000_000, max_faces=2_000_000):
-        """Quadric-decimate ``mesh`` down to ``fraction`` of its triangles.
-
-        The result is kept within [``min_faces``, ``max_faces``] triangles, and a
-        mesh already at or below ``min_faces`` is left alone, so a small iso is
-        never over-decimated and a very large one stays bounded. Logs the
-        resulting surface deviation from the input in units of ``pitch``. If
-        open3d is unavailable the mesh is returned unchanged, so an optional size
-        optimisation can never cost the iso result.
-        """
-        if not 0.0 < fraction <= 1.0:
-            raise ValueError(f"triangle_fraction must be in (0, 1], got {fraction!r}")
-        if fraction == 1.0:
-            return mesh
-        n0 = len(mesh.faces)
-        if n0 <= min_faces:
-            print(f"\tDecimation skipped: {n0:,} tris is at or below the {min_faces:,} floor")
-            return mesh
-        try:
-            import open3d as o3d
-        except ImportError:
-            print("\tDecimation skipped: open3d is not installed.")
-            return mesh
-
-        target = int(min(max(n0 * fraction, min_faces), max_faces))
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-        m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
-        m = m.simplify_quadric_decimation(target)
-        m.remove_degenerate_triangles()
-        m.remove_unreferenced_vertices()
-        out = trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False)
-
-        try:
-            scene = o3d.t.geometry.RaycastingScene()
-            scene.add_triangles(
-                o3d.core.Tensor(verts.astype(np.float32)), o3d.core.Tensor(faces.astype(np.uint32))
-            )
-            dev = scene.compute_distance(
-                o3d.core.Tensor(np.asarray(out.vertices, dtype=np.float32))
-            ).numpy() / float(pitch)
-            dev_msg = f"; deviation/pitch p99 {np.percentile(dev, 99):.3f}, max {dev.max():.3f}"
-        except Exception:
-            dev_msg = ""
-        print(f"\tDecimation: {n0:,} -> {len(out.faces):,} tris (-{100.0 * (1 - len(out.faces) / n0):.0f}%){dev_msg}")
-        return out
-
-    def _remove_small_mesh_components(
-        self,
-        mesh,
-        min_component_faces=64,
-        min_component_area_fraction=1e-6,
-        keep_largest_component=False,
-    ):
-        """Remove tiny disconnected triangle islands from an extracted iso mesh.
-
-        Marching cubes can create small disconnected components when the sampled
-        scalar contains single-cell/voxel-scale noise. This keeps the main
-        connected components and drops islands whose face count or surface area is
-        tiny relative to the full iso-surface. If filtering would remove
-        everything, the largest component is kept as a safe fallback.
-        """
-        if mesh is None or len(mesh.faces) == 0:
-            return mesh
-
-        min_component_faces = int(min_component_faces or 0)
-        min_component_area_fraction = float(min_component_area_fraction or 0.0)
-
-        if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
-            return mesh
-
-        try:
-            components = mesh.split(only_watertight=False)
-        except Exception as exc:
-            print(f"\tConnected-component cleanup skipped: {exc}")
-            return mesh
-
-        if len(components) <= 1:
-            return mesh
-
-        components = list(components)
-        areas = np.asarray([float(getattr(c, "area", 0.0)) for c in components], dtype=np.float64)
-        faces = np.asarray([len(c.faces) for c in components], dtype=np.int64)
-
-        if keep_largest_component:
-            keep = np.zeros(len(components), dtype=bool)
-            keep[int(np.argmax(areas))] = True
-        else:
-            total_area = float(max(mesh.area, 1e-30))
-            min_area = min_component_area_fraction * total_area
-            keep = np.ones(len(components), dtype=bool)
-            if min_component_faces > 0:
-                keep &= faces >= min_component_faces
-            if min_component_area_fraction > 0.0:
-                keep &= areas >= min_area
-
-            if not np.any(keep):
-                keep[int(np.argmax(areas))] = True
-                print(
-                    "\tConnected-component cleanup would remove all components; "
-                    "kept the largest component instead."
-                )
-
-        n_removed = int(np.count_nonzero(~keep))
-        if n_removed == 0:
-            return mesh
-
-        kept_meshes = [components[i] for i in np.flatnonzero(keep)]
-        cleaned = trimesh.util.concatenate(kept_meshes)
-        try:
-            cleaned.remove_unreferenced_vertices()
-        except Exception:
-            pass
-
-        print(
-            f"\tConnected-component cleanup: removed {n_removed} small component(s); "
-            f"kept {len(kept_meshes)} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
-        )
-        return cleaned
 
     def _scalar_to_isosurface_stl(
         self,
@@ -4118,8 +4296,10 @@ class MultiresIO(object):
         # closed iso "balloons". ``keep_mask`` is the exterior-connected fluid;
         # ``~keep_mask`` is body interior + trapped fluid.
         keep_mask = compute_mask
+        t_stage = time.perf_counter()
         if compute_mask is not None and remove_trapped_fluid:
             exterior = self._exterior_connected_fluid_mask(compute_mask)
+            print(f"\t[timing] flood fill: {time.perf_counter() - t_stage:.1f} s")
             n_fluid = int(compute_mask.sum())
             n_trapped = int(np.count_nonzero(compute_mask & ~exterior))
             if not exterior.any() and n_fluid:
@@ -4167,6 +4347,7 @@ class MultiresIO(object):
             )
             return None
 
+        t_stage = time.perf_counter()
         mc_kwargs = dict(
             level=float(iso_value),
             spacing=(pitch, pitch, pitch),
@@ -4182,6 +4363,9 @@ class MultiresIO(object):
         else:
             verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
 
+        print(f"\t[timing] marching cubes: {time.perf_counter() - t_stage:.1f} s ({len(faces):,} tris)")
+        t_stage = time.perf_counter()
+
         # marching_cubes returns vertices in index*spacing coordinates; shift to physical.
         verts = verts + gmin.astype(verts.dtype)
 
@@ -4194,6 +4378,8 @@ class MultiresIO(object):
                 min_component_area_fraction=min_component_area_fraction,
                 keep_largest_component=keep_largest_component,
             )
+        print(f"\t[timing] component cleanup: {time.perf_counter() - t_stage:.1f} s")
+        t_stage = time.perf_counter()
 
         # Taubin smoothing: removes residual marching-cubes faceting without the
         # volumetric shrinkage of plain Laplacian smoothing.
@@ -4209,6 +4395,7 @@ class MultiresIO(object):
                 )
             except Exception as _e:
                 print(f"\tTaubin smoothing skipped: {_e}")
+        print(f"\t[timing] smoothing: {time.perf_counter() - t_stage:.1f} s")
 
         if triangle_fraction is not None and float(triangle_fraction) < 1.0:
             t_stage = time.perf_counter()
@@ -4407,7 +4594,6 @@ class MultiresIO(object):
             keep_largest_component=keep_largest_component,
             triangle_fraction=triangle_fraction,
         )
-
     def _velocity_sampler(self, avg_fields, bc_mask, sample_dx=None, k=8, power=2.0, half_space_tolerance=0.15):
         """
         Returns (sample_velocity, sample_dx). ``sample_velocity(points, base_points, normals) -> (vel (N,3), ok (N,))``
@@ -4545,30 +4731,31 @@ class MultiresIO(object):
 
     def _write_tufts_usd(self, output_filename, verts, faces, speed, color, cmap="turbo", clim=None,
                          tape=None, tape_color=(0.2, 0.55, 1.0), prim_name="tufts"):
-        """Tuft triangles to USD: ``color`` is an RGB triple (constant) or ``"velocity"`` (near-wall speed via ``cmap``/``clim``).
+        """Write tufts and optional constant-colour tape in one USDC stage/save."""
+        usd_filename = self._usd_output_filename(output_filename)
+        extra = []
+        if tape is not None and len(tape[0]):
+            extra.append({
+                "vertices": tape[0], "faces": tape[1],
+                "uniform_color": tape_color,
+                "prim_name": "tape", "double_sided": True,
+            })
 
-        ``tape`` = (verts, faces) adds the root tape patches as a second prim with a constant-colour material.
-        """
-        usd_filename = output_filename if output_filename.endswith(".usda") else output_filename + ".usda"
         if isinstance(color, str):
             if color.strip().lower() != "velocity":
                 raise ValueError(f"surfaceTufts.color must be [r, g, b] or 'velocity', got {color!r}")
-            self._write_polydata_usd(
+            return self._write_polydata_usd(
                 usd_filename, verts, faces,
                 point_data={"velocity_magnitude": speed}, color_field="velocity_magnitude",
                 cmap=cmap, clim=clim, prim_name=prim_name, double_sided=True,
+                additional_meshes=extra,
             )
-        else:
-            self._write_polydata_usd(
-                usd_filename, verts, faces,
-                uniform_color=color, prim_name=prim_name, double_sided=True, emissive=0.15,
-            )
-        if tape is not None and len(tape[0]):
-            self._write_polydata_usd(
-                usd_filename, tape[0], tape[1],
-                uniform_color=tape_color, prim_name="tape", double_sided=True, append=True,
-            )
-        return usd_filename
+
+        return self._write_polydata_usd(
+            usd_filename, verts, faces,
+            uniform_color=color, prim_name=prim_name, double_sided=True, emissive=0.15,
+            additional_meshes=extra,
+        )
 
     def to_surface_streamlines_time_average(
         self,
@@ -4615,7 +4802,7 @@ class MultiresIO(object):
         ``clim=None`` means the same default velocity range as other surface
         USD exports (0 to 1.5*inlet speed, if the unit converter knows it).
 
-        Returns the written .usda path or None when no lines were generated.
+        Returns the written .usdc path or None when no lines were generated.
         """
         from xlb.utils.surface_streamlines import build_wall_streamlines
 

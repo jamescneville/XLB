@@ -245,7 +245,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             def ll_coalescence_count(loader: neon.Loader):
                 loader.set_mres_grid(coalescence_factor.get_grid(), level)
 
-                coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
+                coalescence_factor_pn = loader.get_mres_write_handle(coalescence_factor)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask)
 
                 _c = self.velocity_set.c
@@ -276,7 +276,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             def loading(loader: neon.Loader):
                 loader.set_mres_grid(coalescence_factor.get_grid(), level)
 
-                coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
+                coalescence_factor_pn = loader.get_mres_write_handle(coalescence_factor)
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask)
 
                 _c = self.velocity_set.c
@@ -1086,7 +1086,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 f_0_pn = loader.get_mres_read_handle(f_0_fd)
 
-                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+                bc_mask_pn = loader.get_mres_write_handle(bc_mask_fd)
                 _rho1_pn = loader.get_mres_write_handle(_rho1)
                 _u1_pn = loader.get_mres_write_handle(_u1)
 
