@@ -799,7 +799,8 @@ def prep_inputs(input_file):
         #collision_type="KBC",
         initializer=initializer,
         mres_perf_opt=mres_perf_opt,
-        smagorinsky_constant=jsonfile['settings']['sgs']
+        smagorinsky_constant=jsonfile['settings']['sgs'],
+        deterministic_accumulation=bool(jsonfile['settings'].get('deterministicAccumulation', False)),
     )
     wheel_ids = []
     if wheel_vertices is not None:
