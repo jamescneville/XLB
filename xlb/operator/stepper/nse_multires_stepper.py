@@ -143,6 +143,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         deterministic_accumulation=False,
         deterministic_accumulation_scale=float(2**24),
     ):
+        # NOTE: these must be set BEFORE super().__init__(): the base Operator constructor calls
+        # _construct_neon(), which reads them eagerly.
+        self._det_accum = bool(deterministic_accumulation)
+        self._det_accum_scale = float(deterministic_accumulation_scale)
+
         super().__init__(grid, boundary_conditions)
 
         # Deterministic fine->coarse accumulation (opt-in).  Replaces the float atomicAdd that deposits fine-cell
@@ -151,8 +156,6 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         # The coarse halo receives up to (#children per coarse cell) x (#fine sub-steps) deposits, so the scale must
         # satisfy  max_population * deposits * scale < 2^31.  The default 2^24 gives ~8 population units of headroom
         # at 16 deposits, with a resolution of ~6e-8 (the fp32 epsilon at O(1)).
-        self._det_accum = bool(deterministic_accumulation)
-        self._det_accum_scale = float(deterministic_accumulation_scale)
         if self._det_accum and self.precision_policy.store_precision != Precision.FP32:
             raise ValueError("deterministic_accumulation requires a 32-bit float store precision (FP32 store)")
 
