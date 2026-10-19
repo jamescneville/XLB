@@ -792,6 +792,7 @@ def prep_inputs(input_file):
         mres_perf_opt = xlb.MresPerfOptimizationType.FUSION_AT_FINEST
     # Opt-in bit-reproducible accumulation (fine->coarse halo deposits and force/moment sums)
     deterministic_accumulation = bool(jsonfile['settings'].get('deterministicAccumulation', False))
+    print(f"Deterministic accumulation: {'ON' if deterministic_accumulation else 'OFF'}")
     # Initialize simulation   
     sim = xlb.helper.MultiresSimulationManager(
         omega_finest=omega,
