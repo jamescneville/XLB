@@ -139,9 +139,22 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         collision_type="BGK",
         forcing_scheme="exact_difference",
         force_vector=None,
-        smagorinsky_constant = 0.0
+        smagorinsky_constant = 0.0,
+        deterministic_accumulation=False,
+        deterministic_accumulation_scale=float(2**24),
     ):
         super().__init__(grid, boundary_conditions)
+
+        # Deterministic fine->coarse accumulation (opt-in).  Replaces the float atomicAdd that deposits fine-cell
+        # populations into coarse halo cells (order-dependent rounding) by an int32 fixed-point atomicAdd
+        # (order-independent).  See neon_mres_lbm_store_op_det in Neon.
+        # The coarse halo receives up to (#children per coarse cell) x (#fine sub-steps) deposits, so the scale must
+        # satisfy  max_population * deposits * scale < 2^31.  The default 2^24 gives ~8 population units of headroom
+        # at 16 deposits, with a resolution of ~6e-8 (the fp32 epsilon at O(1)).
+        self._det_accum = bool(deterministic_accumulation)
+        self._det_accum_scale = float(deterministic_accumulation_scale)
+        if self._det_accum and self.precision_policy.store_precision != Precision.FP32:
+            raise ValueError("deterministic_accumulation requires a 32-bit float store precision (FP32 store)")
 
         # Construct the collision operator
         self._collision_requires_macro = wp.bool(False)
@@ -422,6 +435,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         _missing_mask_vec = wp.vec(self.velocity_set.q, dtype=wp.uint8)
         _opp_indices = self.velocity_set.opp_indices
         _c = self.velocity_set.c
+        # Fixed-point scale for deterministic fine->coarse accumulation (only used when self._det_accum)
+        _det_scale = self._det_accum_scale
 
         # Read the list of bc_to_id created upon instantiation
         bc_to_id = boundary_condition_registry.bc_to_id
@@ -616,7 +631,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     for l in range(self.velocity_set.q):
                         push_direction = wp.neon_ngh_idx(wp.int8(_c[0, l]), wp.int8(_c[1, l]), wp.int8(_c[2, l]))
                         if level < num_levels - 1:
-                            wp.neon_mres_lbm_store_op(accumulation_pn, index, l, push_direction, self.store_dtype(_f_post_collision[l]))
+                            if wp.static(self._det_accum):
+                                wp.neon_mres_lbm_store_op_det(
+                                    accumulation_pn, index, l, push_direction, self.store_dtype(_f_post_collision[l]), wp.float32(_det_scale)
+                                )
+                            else:
+                                wp.neon_mres_lbm_store_op(accumulation_pn, index, l, push_direction, self.store_dtype(_f_post_collision[l]))
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_collision[l]))
                 else:
                     for l in range(self.velocity_set.q):
@@ -664,7 +684,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 pull_direction = wp.neon_ngh_idx(wp.int8(-_c[0, l]), wp.int8(-_c[1, l]), wp.int8(-_c[2, l]))
 
                 has_ngh_at_same_level = wp.bool(False)
-                accumulated = self.compute_dtype(wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level))
+                raw_halo = wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level)
+                accumulated = self.compute_dtype(raw_halo)
                 accumulated = wp.max(accumulated, self.compute_dtype(0.0))
 
                 if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
@@ -689,6 +710,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         # Same-level ngh:              YES
                         # -> Coalescence
                         coalescence_factor = self.compute_dtype(wp.neon_read(coalescence_factor_pn, index, l))
+                        if wp.static(self._det_accum):
+                            # The halo word holds int32 fixed-point bits written by neon_mres_lbm_store_op_det.
+                            # This is the only place accumulated halo values are consumed; non-halo reads
+                            # above are plain floats and must not be decoded.
+                            accumulated = wp.max(
+                                self.compute_dtype(wp.neon_mres_lbm_decode_det(raw_halo, wp.float32(_det_scale))), self.compute_dtype(0.0)
+                            )
                         accumulated = accumulated * coalescence_factor
                         _f_post_stream[l] = self.compute_dtype(accumulated)
 
