@@ -53,9 +53,20 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         force_vector=None,
         initializer=None,
         mres_perf_opt: MresPerfOptimizationType = MresPerfOptimizationType.NAIVE_COLLIDE_STREAM,
-        smagorinsky_constant = 0.0
+        smagorinsky_constant = 0.0,
+        deterministic_accumulation=False,
+        deterministic_accumulation_scale=float(2**24),
     ):
-        super().__init__(grid, boundary_conditions, collision_type, forcing_scheme, force_vector, smagorinsky_constant)
+        super().__init__(
+            grid,
+            boundary_conditions,
+            collision_type,
+            forcing_scheme,
+            force_vector,
+            smagorinsky_constant,
+            deterministic_accumulation,
+            deterministic_accumulation_scale,
+        )
 
         self.initializer = initializer
         self.count_levels = grid.count_levels

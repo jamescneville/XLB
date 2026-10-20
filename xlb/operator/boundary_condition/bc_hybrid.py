@@ -304,6 +304,7 @@ class HybridBC(BoundaryCondition):
             _relax:Any,
             _norm_vec:Any,
             _norm_dist:Any,
+            update_wall_state_: bool,
         ):
             # Using regularization technique [1] to represent fpop using macroscopic values derived from interpolated bounceback scheme of [2].
             # missing data in lattice Boltzmann.
@@ -320,7 +321,8 @@ class HybridBC(BoundaryCondition):
                 u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
                     index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
                 )
-                wp.neon_write(_relax, index, 0, store_dtype(relax_new))
+                if update_wall_state_:
+                    wp.neon_write(_relax, index, 0, store_dtype(relax_new))
             else:
                 u_wall_effective = u_wall_physical
 
@@ -359,6 +361,7 @@ class HybridBC(BoundaryCondition):
             _relax:Any,
             _norm_vec:Any,
             _norm_dist:Any,
+            update_wall_state_: bool,
         ):
             # Using Grad's approximation [1] to represent fpop using macroscopic values derived from interpolated bounceback scheme of [2].
             # missing data in lattice Boltzmann.
@@ -375,7 +378,8 @@ class HybridBC(BoundaryCondition):
                 u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
                     index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
                 )
-                wp.neon_write(_relax, index, 0, store_dtype(relax_new))
+                if update_wall_state_:
+                    wp.neon_write(_relax, index, 0, store_dtype(relax_new))
             else:
                 u_wall_effective = u_wall_physical
 
@@ -413,6 +417,7 @@ class HybridBC(BoundaryCondition):
             _relax:Any,
             _norm_vec:Any,
             _norm_dist:Any,
+            update_wall_state_: bool,
         ):
             # This boundary condition uses the method of Tao et al (2018) [1] to get unknown populations on curved boundaries (denoted here by
             # interpolated_nonequilibrium_bounceback method). To further stabilize this BC, we add regularization technique of [2].
@@ -430,7 +435,8 @@ class HybridBC(BoundaryCondition):
                 u_wall_effective, relax_new = self.bc_helper.compute_wall_modeled_velocity(
                     index, _missing_mask, f_1, f_pre, u_wall_physical, nu,_rho, _u, relax, _norm_vec, _norm_dist
                 )
-                wp.neon_write(_relax, index, 0, store_dtype(relax_new))
+                if update_wall_state_:
+                    wp.neon_write(_relax, index, 0, store_dtype(relax_new))
             else:
                 u_wall_effective = u_wall_physical
 

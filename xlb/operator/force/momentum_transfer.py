@@ -92,7 +92,8 @@ class FetchPopulations(Operator):
             # Apply streaming (pull method)
             timestep = 0
             f_post_stream = self.stream_functional(f_0, index)
-            f_post_stream = self.bc_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
+            # update_wall_state=False: force evaluation is read-only and must not overwrite the wall model's relax field
+            f_post_stream = self.bc_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn, wp.bool(False))
             return f_post_collision, f_post_stream
 
         @wp.func

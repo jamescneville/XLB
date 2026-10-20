@@ -795,6 +795,9 @@ def prep_inputs(input_file):
         #mres_perf_opt = xlb.MresPerfOptimizationType.FUSION_AT_FINEST_254_ALL
     else:
         mres_perf_opt = xlb.MresPerfOptimizationType.FUSION_AT_FINEST
+    # Opt-in bit-reproducible fine->coarse accumulation (needs the Neon deterministic builtins)
+    deterministic_accumulation = bool(jsonfile['settings'].get('deterministicAccumulation', False))
+    print(f"Deterministic accumulation: {'ON' if deterministic_accumulation else 'OFF'}")
     # Initialize simulation   
     sim = xlb.helper.MultiresSimulationManager(
         omega_finest=omega,
@@ -804,7 +807,8 @@ def prep_inputs(input_file):
         #collision_type="KBC",
         initializer=initializer,
         mres_perf_opt=mres_perf_opt,
-        smagorinsky_constant=jsonfile['settings']['sgs']
+        smagorinsky_constant=jsonfile['settings']['sgs'],
+        deterministic_accumulation=deterministic_accumulation,
     )
     wheel_ids = []
     if wheel_vertices is not None:
