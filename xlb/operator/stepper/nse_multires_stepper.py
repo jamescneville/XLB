@@ -487,7 +487,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             elif wp.static(self.boundary_conditions[i].id in hybrid_bc_ids):
                                 if _boundary_id == wp.static(self.boundary_conditions[i].id):
                                     f_result = wp.static(self.boundary_conditions[i].neon_functional)(
-                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn, wp.bool(True))
                             else:
                                 if _boundary_id == wp.static(self.boundary_conditions[i].id):
                                     f_result = wp.static(self.boundary_conditions[i].neon_functional)(
