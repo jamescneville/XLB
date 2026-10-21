@@ -104,14 +104,23 @@ def read_force_series(run_dir, crossover_pct):
     return out
 
 
+_TAG = ""
+
+
 def run_id(method, label, k):
-    return f"wmsweep_{method}_{label}_p{k:02d}"
+    return f"wmsweep{'_' + _TAG if _TAG else ''}_{method}_{label}_p{k:02d}"
 
 
 def build_run_json(base, method, vstate, offset, rid, args):
     j = copy.deepcopy(base)
     st = j["settings"]
-    st["forceOnly"] = True
+    st["forceOnly"] = not args.full_output
+    for kv in args.set:
+        k, v = kv.split("=", 1)
+        try:
+            st[k] = json.loads(v)
+        except ValueError:
+            st[k] = v
     st["testPhaseOffset"] = list(offset)
     for k in ("wallModelFix", "wallModelRefHeight", "wallModelRefScale", "wallModelSampleHeight"):
         st.pop(k, None)
@@ -241,6 +250,9 @@ def main():
     ap.add_argument("--iterations", type=int, default=None, help="override settings.iterations (and disable flowPasses)")
     ap.add_argument("--crossover", type=float, default=None, help="override settings.crossover (percent)")
     ap.add_argument("--force-print-freq", type=float, default=0.5, help="settings.forcePrintFreq (percent of run) for the sweep")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="extra settings override applied to every run (JSON value), e.g. --set deterministicAccumulation=true; repeatable")
+    ap.add_argument("--full-output", action="store_true", help="do not use forceOnly: write fields/slices/iso/surface outputs for every run (large; use with few phases)")
+    ap.add_argument("--tag", default="", help="name for this batch; keeps run folders, results and summary separate from other batches (so different settings never get mixed by resume)")
     ap.add_argument("--timeout-min", type=float, default=None)
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--solver", default=os.path.join(REPO_ROOT, "examples", "windtunnel_json.py"))
@@ -250,17 +262,21 @@ def main():
     ap.add_argument("--analyze-only", action="store_true")
     args = ap.parse_args()
 
+    global _TAG
+    _TAG = args.tag.strip()
     proj_json = os.path.abspath(args.ifile)
     proj_dir = os.path.dirname(proj_json)
     with open(proj_json) as fh:
         base = json.load(fh)
-    results_path = os.path.join(proj_dir, "wm_sweep_results.json")
+    sfx = f"_{_TAG}" if _TAG else ""
+    results_path = os.path.join(proj_dir, f"wm_sweep_results{sfx}.json")
+    summary_dir = os.path.join(proj_dir, f"wm_sweep_summary{sfx}")
     results = []
     if os.path.exists(results_path) and not args.no_resume:
         with open(results_path) as fh:
             results = json.load(fh)
     if args.analyze_only:
-        summarize(results, os.path.join(proj_dir, "wm_sweep_summary"))
+        summarize(results, summary_dir)
         return 0
 
     offsets = make_offsets(args.nphase, args.offsets)
@@ -277,7 +293,7 @@ def main():
     for method, label, vstate, k, off in todo:
         print(f"  {run_id(method, label, k)}  offset={tuple(round(o, 3) for o in off)}  {vstate}")
     if args.dry_run or not todo:
-        summarize(results, os.path.join(proj_dir, "wm_sweep_summary")) if not args.dry_run else None
+        summarize(results, summary_dir) if not args.dry_run else None
         return 0
 
     env = os.environ.copy()
@@ -323,7 +339,7 @@ def main():
         if remaining:
             per = (time.time() - t_all) / (n + 1)
             print(f"    ~{per * remaining / 60:.0f} min remaining", flush=True)
-    summarize(results, os.path.join(proj_dir, "wm_sweep_summary"))
+    summarize(results, summary_dir)
     return 0
 
 
