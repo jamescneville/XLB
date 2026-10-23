@@ -633,7 +633,7 @@ def prep_inputs(input_file):
                 #wheel_mesh.export(os.path.join(output_dir, 'wheel'+str(w)+'.stl'))
                 #del wheel_mesh
                 #gc.collect()
-                wheel_mesh = trimesh.load_mesh(os.path.join(output_dir, 'wheel'+str(w)+'.stl'))
+                wheel_mesh = trimesh.load_mesh(os.path.join(output_dir, 'wheel'+str(w)+'.stl'), process=False)
             else:
                 wheel_mesh = trimesh.load_mesh(wheel, process=False)
             w+=1                
