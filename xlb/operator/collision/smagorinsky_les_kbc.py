@@ -442,8 +442,8 @@ class SmagorinskyLESKBC(Collision):
             tau_eff = half * (tau_0 + wp.sqrt(discriminant + _epsilon))
             
             # Clamp for stability
-            tau_min = self.compute_dtype(0.5001)
-            tau_eff = wp.max(tau_eff, tau_min)
+            # tau_min = self.compute_dtype(0.5001)
+            # tau_eff = wp.max(tau_eff, tau_min)
             
             # Convert to omega
             omega_eff = one / tau_eff
