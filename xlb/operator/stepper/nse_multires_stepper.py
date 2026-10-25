@@ -384,6 +384,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         precision_policy=DefaultConfig.default_precision_policy,
                         compute_backend=DefaultConfig.default_backend,
                         close_voxels=bc.voxelization_method.options.get("close_voxels"),
+                        protected_boundary_id=getattr(bc, 'ground_priority_protect_id', None),
+                        ground_wheel_bc_overlap_to_solid=getattr(bc, 'ground_wheel_bc_overlap_to_solid', False),
                     )
                 else:
                     raise ValueError(f"Unsupported voxelization method for multi-res: {bc.voxelization_method}")

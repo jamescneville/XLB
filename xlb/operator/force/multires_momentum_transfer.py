@@ -58,6 +58,8 @@ class MultiresMomentumTransfer(MomentumTransfer):
         compute_backend: ComputeBackend = None,
         moment_reference_point=None,
         validate_runtime=True,
+        gauge_reference_density=None,
+        gauge_force_diagnostic=False,
     ):
         from xlb.operator.force.momentum_transfer import LBMOperationSequence
 
@@ -80,11 +82,21 @@ class MultiresMomentumTransfer(MomentumTransfer):
                 "Mesh distance is supported only with STREAM_THEN_COLLIDE")
 
         self.validate_runtime = bool(validate_runtime)
+        # Experimental: remove the uniform reference-pressure contribution from
+        # every counted MEM link.  This changes *force reporting only*; it does
+        # not change the streaming BC or the computed flow field.
+        self.gauge_reference_density = (
+            None if gauge_reference_density is None else float(gauge_reference_density)
+        )
+        # The diagnostic observes the pressure offset in the SAME force kernel,
+        # avoiding additional Neon operator instances (which returned zero in v1).
+        self.capture_reference_pressure_bias = bool(gauge_force_diagnostic)
         self._l0_count = None
         self._indexed_fields = None
         self._force_container_cached = None
         self._l0_keys = None
         self._force_buf = None
+        self._bias_force_buf = None
         self._moment_buf = None
         self._lookup_errors = None
 
@@ -106,6 +118,10 @@ class MultiresMomentumTransfer(MomentumTransfer):
         device = self.force.device
         self.force = wp.zeros((1,), dtype=wp.vec3d, device=device)
         self.moment = wp.zeros((1,), dtype=wp.vec3d, device=device)
+        self.pressure_bias_force = (
+            wp.zeros((1,), dtype=wp.vec3d, device=device)
+            if self.capture_reference_pressure_bias else None
+        )
 
     @property
     def boundary_voxel_count(self):
@@ -119,8 +135,31 @@ class MultiresMomentumTransfer(MomentumTransfer):
         self._force_container_cached = None
         self._l0_keys = None
         self._force_buf = None
+        self._bias_force_buf = None
         self._moment_buf = None
         self._lookup_errors = None
+
+    def get_gauge_diagnostic_force_pair(self):
+        """(raw, gauge, pressure_bias), from this operator's last evaluation.
+
+        ``pressure_bias`` is the MEM contribution of the uniform reference
+        density on the *same missing links* used for the primary force.
+        Body primary: raw; wheel primary: gauge when wheelForceGaugeCorrect.
+        This does NOT alter flow state, wall-link ownership, or BC physics.
+        """
+        if not self.capture_reference_pressure_bias:
+            raise RuntimeError('Enable gauge_force_diagnostic on this operator first')
+        if self._l0_count is None:
+            raise RuntimeError('Evaluate the momentum-transfer operator before reading its diagnostic')
+        primary = self.force.numpy()[0].astype('float64').copy()
+        bias = self.pressure_bias_force.numpy()[0].astype('float64').copy()
+        if self.gauge_reference_density is None:
+            raw = primary
+            gauge = primary - bias
+        else:
+            gauge = primary
+            raw = primary + bias
+        return raw, gauge, bias
 
     def _construct_neon(self):
         import neon
@@ -131,6 +170,15 @@ class MultiresMomentumTransfer(MomentumTransfer):
         d = self.velocity_set.d
         compute_dtype = self.compute_dtype
         _moment_enabled = self.moment_reference_point is not None
+        _apply_gauge_correction = self.gauge_reference_density is not None
+        _gauge_rho = compute_dtype(
+            self.gauge_reference_density if _apply_gauge_correction else 0.0
+        )
+        _w = self.velocity_set.w
+        _capture_bias = self.capture_reference_pressure_bias
+        _bias_rho = compute_dtype(
+            self.gauge_reference_density if self.gauge_reference_density is not None else 1.0
+        )
         _c = self.velocity_set.c
         _opp = self.velocity_set.opp_indices
         _fmask = wp.types.vector(q, dtype=wp.uint8)
@@ -241,6 +289,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
             keys: wp.array(dtype=wp.int64),
             n: wp.int32,
             force_buf: wp.array(dtype=wp.vec3d),
+            bias_buf: wp.array(dtype=wp.vec3d),
             moment_buf: wp.array(dtype=wp.vec3d),
             lookup_errors: wp.array(dtype=wp.int32),
             rho_pn: Any,
@@ -267,18 +316,36 @@ class MultiresMomentumTransfer(MomentumTransfer):
                 rho_pn, u_pn, relax_pn, normvec_pn, normdist_pn
             )
             m = _uvec()
+            bias = _uvec()
             for axis in range(d):
                 m[axis] = compute_dtype(0.0)
+                if wp.static(_capture_bias):
+                    bias[axis] = compute_dtype(0.0)
                 for l in range(q):
                     if mask[l] == wp.uint8(1):
                         phi = pre[_opp[l]] + post[l]
+                        if wp.static(_apply_gauge_correction):
+                            # Retain the primary force exactly as before.
+                            phi -= compute_dtype(2.0) * _w[l] * _gauge_rho
+                        if wp.static(_capture_bias):
+                            # This link's uniform-pressure contribution, using
+                            # the very same link selection and direction.
+                            p_ref_link = compute_dtype(2.0) * _w[l] * _bias_rho
                         if _c[axis, _opp[l]] == 1:
                             m[axis] += phi
+                            if wp.static(_capture_bias):
+                                bias[axis] += p_ref_link
                         elif _c[axis, _opp[l]] == -1:
                             m[axis] -= phi
+                            if wp.static(_capture_bias):
+                                bias[axis] -= p_ref_link
             force_buf[slot] = wp.vec3d(
                 wp.float64(m[0]), wp.float64(m[1]), wp.float64(m[2])
             )
+            if wp.static(_capture_bias):
+                bias_buf[slot] = wp.vec3d(
+                    wp.float64(bias[0]), wp.float64(bias[1]), wp.float64(bias[2])
+                )
             if wp.static(_moment_enabled):
                 p = _xyz(index, bc_pn)
                 r = _uvec()
@@ -295,7 +362,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         @neon.Container.factory(name="MomentumTransfer_L0_buffer")
         def force_container(
             f_0: Any, f_1: Any, bc_mask: Any, missing_mask: Any,
-            keys: Any, n: Any, force_buf: Any, moment_buf: Any,
+            keys: Any, n: Any, force_buf: Any, bias_buf: Any, moment_buf: Any,
             lookup_errors: Any, rho: Any, u: Any, relax: Any,
             normvec: Any, normdist: Any,
         ):
@@ -315,7 +382,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
                 def kernel(index: Any):
                     functional(
                         index, f0_pn, f1_pn, bc_pn, missing_pn,
-                        keys, wp.int32(n), force_buf, moment_buf, lookup_errors,
+                        keys, wp.int32(n), force_buf, bias_buf, moment_buf, lookup_errors,
                         rho_pn, u_pn, relax_pn, normvec_pn, normdist_pn,
                     )
                 loader.declare_kernel(kernel)
@@ -389,6 +456,10 @@ class MultiresMomentumTransfer(MomentumTransfer):
         # Barrier before Neon accesses sorted keys on its own CUDA stream.
         wp.synchronize_device(device)
         self._force_buf = wp.empty((n,), dtype=wp.vec3d, device=device)
+        self._bias_force_buf = (
+            wp.empty((n,), dtype=wp.vec3d, device=device)
+            if self.capture_reference_pressure_bias else self._force_buf
+        )
         self._moment_buf = wp.empty((n,), dtype=wp.vec3d, device=device) if self.moment_reference_point is not None else wp.empty((1,), dtype=wp.vec3d, device=device)
         self._lookup_errors = wp.zeros((1,), dtype=wp.int32, device=device)
         print(f"[MomentumTransfer Option B] BC {self.no_slip_bc_instance.id}: "
@@ -410,13 +481,15 @@ class MultiresMomentumTransfer(MomentumTransfer):
         if self._l0_count == 0:
             self.force.zero_()
             self.moment.zero_()
+            if self.capture_reference_pressure_bias:
+                self.pressure_bias_force.zero_()
             return self.force.numpy()[0]
 
         if self._force_container_cached is None:
             self._force_container_cached = self.neon_container(
                 f_0, f_1, bc_mask, missing_mask,
                 self._l0_keys, self._l0_count,
-                self._force_buf, self._moment_buf, self._lookup_errors,
+                self._force_buf, self._bias_force_buf, self._moment_buf, self._lookup_errors,
                 _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn,
             )
 
@@ -432,6 +505,8 @@ class MultiresMomentumTransfer(MomentumTransfer):
         # sequencing after verifying stream interoperability in your build.
         wp.synchronize_device(self.force.device)
         wp.utils.array_sum(self._force_buf, out=self.force)
+        if self.capture_reference_pressure_bias:
+            wp.utils.array_sum(self._bias_force_buf, out=self.pressure_bias_force)
         if self.moment_reference_point is not None:
             wp.utils.array_sum(self._moment_buf, out=self.moment)
         result = self.force.numpy()[0]

@@ -774,6 +774,39 @@ def prep_inputs(input_file):
         boundary_conditions = setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vertices, wheel_centers, ulb, lbm_visc, grid_shape_zip, precision_policy, jsonfile, compute_backend)
     else:
         boundary_conditions = setup_boundary_conditions_DoNothing(grid, level_data, body_vertices, wheel_vertices, wheel_centers, ulb, lbm_visc, grid_shape_zip, precision_policy, jsonfile, compute_backend)
+    # SWT_CONTACT_SOLID_V1: opt-in wheel/ground conflict resolution.
+    # New contact-solid mode takes precedence over legacy ground-priority mode.
+    # Only pre-existing ground voxels which the AABB_CLOSE wheel masker would
+    # otherwise claim as wheel BC are changed to solid 255. No other ground
+    # voxels are converted. Fluid update/missing link rules are unchanged.
+    contact_solid = bool(jsonfile['settings'].get('groundWheelBCOverlapToSolid', False))
+    ground_priority = bool(jsonfile['settings'].get('groundWinsWheelOverlap', False))
+    if contact_solid or ground_priority:
+        if jsonfile['BCtypes'].get('wheel_voxelization', 'AABB_CLOSE') == 'RAY':
+            raise ValueError('Ground overlap modes require AABB_CLOSE wheel voxelization')
+        if len(boundary_conditions) < 8:
+            raise ValueError('Ground overlap modes require separate wheel BC objects')
+        ground_bc = boundary_conditions[3]  # existing SWT ordering: bottom / ground
+        if ground_bc.indices is None:
+            raise ValueError('Expected the ground BC to be indices-based')
+        ground_id = int(ground_bc.id)
+        wheel_bc_list = boundary_conditions[7:]
+        aabb_close_id = MeshVoxelizationMethod('AABB_CLOSE').id
+        for wheel_bc in wheel_bc_list:
+            if wheel_bc.voxelization_method is None or wheel_bc.voxelization_method.id != aabb_close_id:
+                raise ValueError('Ground overlap modes support AABB_CLOSE wheels only')
+            wheel_bc.ground_priority_protect_id = ground_id
+            wheel_bc.ground_wheel_bc_overlap_to_solid = contact_solid
+        if contact_solid:
+            print('SWT wheel/ground BC-overlap -> SOLID 255 ON: ground BC ID', ground_id,
+                  'wheel BC IDs', [int(bc.id) for bc in wheel_bc_list])
+            if ground_priority:
+                print('  NOTE: groundWheelBCOverlapToSolid overrides groundWinsWheelOverlap')
+        else:
+            print('SWT ground-priority ownership ON: ground BC ID', ground_id,
+                  'protected against wheel BC IDs', [int(bc.id) for bc in wheel_bc_list])
+    else:
+        print('SWT ground-priority ownership OFF (legacy wheel-mask behavior)')
     scm_progress(10)
     print(f"Progress 10%")
     # Create initializer
@@ -845,7 +878,14 @@ def prep_inputs(input_file):
         mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
         compute_backend=compute_backend,
         moment_reference_point=moment_reference_point,
+        gauge_reference_density=(
+            1.0 if jsonfile['settings'].get('bodyForceGaugeCorrect', False)
+            else None
+        ),
+        gauge_force_diagnostic=bool(jsonfile['settings'].get('forceGaugeDualDiagnostic', False)),
     )
+    print('Body MEM reference-pressure correction:',
+          bool(jsonfile['settings'].get('bodyForceGaugeCorrect', False)))
     wheel_momentum = None
     if wheel_vertices is not None:
         wheel_momentum = []
@@ -855,8 +895,21 @@ def prep_inputs(input_file):
                 mres_perf_opt=xlb.MresPerfOptimizationType.FUSION_AT_FINEST,
                 compute_backend=compute_backend,
                 moment_reference_point=moment_reference_point,
+                gauge_reference_density=(
+                    1.0 if jsonfile['settings'].get('wheelForceGaugeCorrect', False)
+                    else None
+                ),
+                gauge_force_diagnostic=bool(jsonfile['settings'].get('forceGaugeDualDiagnostic', False)),
             )
             wheel_momentum.append(mt)
+        print('Wheel MEM reference-pressure correction:',
+              bool(jsonfile['settings'].get('wheelForceGaugeCorrect', False)))
+
+    # SWT_DUAL_GAUGE_DIAGNOSTIC_V3: no duplicate Neon operators are created.
+    # Each primary MEM operator accumulates reference-pressure bias in its OWN
+    # force kernel, from precisely the links used in its primary force.
+    if jsonfile['settings'].get('forceGaugeDualDiagnostic', False):
+        print('SWT dual gauge diagnostic: V3 single-kernel pressure-bias capture ON')
 
     # Print simulation info
     print("\n" + "=" * 50 + "\n")
@@ -1475,17 +1528,71 @@ def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference
     start = time.time()
     boundary_force = momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
     print(f"Momentum Force Time {time.time()-start:.4f} seconds") 
-    wheel_force = [0.0, 0.0, 0.0]
+    wheel_force = np.zeros(3, dtype=float)
+    wheel_primary_vectors = []
     
     if wheel_momentum is not None:
         for i in range(len(wheel_momentum)):
-            wheel_force += wheel_momentum[i](sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
+            f_wheel = np.asarray(wheel_momentum[i](
+                sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask,
+                sim.rho0, sim.u0, sim.relax,
+                sim.normal_vector, sim.normal_distance,
+            ), dtype=float)
+            wheel_force += f_wheel
+            wheel_primary_vectors.append(f_wheel.copy())
+            print(f'  Wheel {i+1} MEM force (lattice): {f_wheel}')
+    # SWT_DUAL_GAUGE_DIAGNOSTIC_V3 -- derive raw/gauge from each PRIMARY
+    # operator and its own kernel-captured reference-pressure bias.
+    if momentum_transfer.capture_reference_pressure_bias:
+        body_raw, body_gauge, body_bias = momentum_transfer.get_gauge_diagnostic_force_pair()
+        wheels_raw = np.zeros(3, dtype=float)
+        wheels_gauge = np.zeros(3, dtype=float)
+        wheels_bias = np.zeros(3, dtype=float)
+        expected_body_primary = (
+            body_gauge if momentum_transfer.gauge_reference_density is not None
+            else body_raw
+        )
+        if not np.allclose(expected_body_primary, boundary_force, atol=1e-9, rtol=1e-9):
+            raise RuntimeError('DUAL MEM V3 body primary mismatch')
+        if wheel_momentum is not None:
+            for i, primary_mt in enumerate(wheel_momentum):
+                raw_vec, gauge_vec, bias_vec = primary_mt.get_gauge_diagnostic_force_pair()
+                primary_vec = wheel_primary_vectors[i]
+                expected_primary = (gauge_vec if primary_mt.gauge_reference_density is not None
+                                    else raw_vec)
+                if not np.allclose(expected_primary, primary_vec, atol=1e-9, rtol=1e-9):
+                    raise RuntimeError(f'DUAL MEM V3 wheel {i+1} primary mismatch')
+                wheels_raw += raw_vec
+                wheels_gauge += gauge_vec
+                wheels_bias += bias_vec
+                print(f'  DUAL MEM V3 wheel {i+1}: raw={raw_vec}, gauge={gauge_vec}, '
+                      f'pressure_bias={bias_vec}; L0_cells={primary_mt.boundary_voxel_count:,}')
+        diagnostic_scale = 2.0 / (ulb**2 * reference_area)
+        print('  DUAL MEM V3 same-state coefficients [Cd, Cl]:')
+        for label, vector in (
+            ('BODY raw', body_raw),
+            ('BODY gauge', body_gauge),
+            ('WHEELS raw', wheels_raw),
+            ('WHEELS gauge', wheels_gauge),
+            ('TOTAL raw/raw', body_raw+wheels_raw),
+            ('TOTAL raw/gauge', body_raw+wheels_gauge),
+            ('TOTAL gauge/gauge', body_gauge+wheels_gauge),
+        ):
+            print(f'    {label:19s} Cd={diagnostic_scale*vector[0]:+.6f} '
+                  f'Cl={diagnostic_scale*vector[2]:+.6f}')
+        print(f'  DUAL MEM V3 body pressure bias: force={body_bias}, '
+              f'dCd={-diagnostic_scale*body_bias[0]:+.6f} '
+              f'dCl={-diagnostic_scale*body_bias[2]:+.6f} '
+              f'L0_cells={momentum_transfer.boundary_voxel_count:,}')
+        print(f'  DUAL MEM V3 wheel pressure bias: force={wheels_bias}')
     print(f"Momentum Force Time after wheels {time.time()-start:.4f} seconds") 
     drag = boundary_force[0] + wheel_force[0]
     lift = boundary_force[2] + wheel_force[2]
     scale = 2.0 / (ulb**2 * reference_area)
     cd = scale * drag
     cl = scale * lift
+    print(f'  Body-only Cl: {scale*boundary_force[2]:.6f}; '
+          f'wheel-only Cl: {scale*wheel_force[2]:.6f}; total Cl: {cl:.6f}')
     if np.isnan(cd) or np.isnan(cl):
         raise ValueError(f"NaN detected in coefficients at step {step}: Cd={cd}, Cl={cl}")
    
@@ -1783,6 +1890,29 @@ def compute_voxel_statistics_and_reference_area( jsonfile, sim, h5exporter, leve
     mask_finest = level_id_field == finest_level
     bc_mask_finest = bc_mask_data[mask_finest]
     active_indices_finest = np.argwhere(level_data[finest_level][0])
+
+    # CPU-only startup audit; reuses the existing bc_mask readback, no extra
+    # GPU passes or changes to the simulation. Finest-level ground layer only.
+    if (jsonfile['settings'].get('groundWinsWheelOverlap', False)
+            or jsonfile['settings'].get('groundWheelBCOverlapToSolid', False)
+            or jsonfile['settings'].get('groundOwnershipAudit', False)):
+        ground_id = int(boundary_conditions[3].id)
+        ground_positions = active_indices_finest[bc_mask_finest == ground_id]
+        if ground_positions.shape[0] == 0:
+            print('SWT ground-owner mask audit: no ground BC found at finest level')
+        else:
+            ground_layer = int(np.bincount(ground_positions[:, 2]).argmax())
+            on_plane = active_indices_finest[:, 2] == ground_layer
+            plane_ids = bc_mask_finest[on_plane]
+            wheel_bc_ids = np.array([int(w.id) for w in wheel_ids], dtype=int)
+            ground_count = int(np.count_nonzero(plane_ids == ground_id))
+            wheel_count = int(np.count_nonzero(np.isin(plane_ids, wheel_bc_ids))) if wheel_bc_ids.size else 0
+            solid_count = int(np.count_nonzero(plane_ids == 255))
+            print('SWT ground-owner mask audit (finest level, local ground z index', ground_layer,
+                  '): ground_BC=', ground_count, 'wheel_BC=', wheel_count,
+                  'solid_255=', solid_count, 'total_active=', plane_ids.size)
+            if wheel_count:
+                print('  NOTE: wheel BC is present on this ground layer; check mask ownership and non-ground cells.')
 
     if jsonfile["BCtypes"]["car_voxelization"] == "RAY":
         target_ids = [boundary_conditions[0].id]
