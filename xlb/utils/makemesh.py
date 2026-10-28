@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import open3d as o3d
 from typing import Any
 import time
@@ -434,6 +435,349 @@ def print_padding_table(padding_values):
     print(tabulate(table, headers=headers, tablefmt="grid"))
 
 
+# SWT RC1: optional refinement topology cleanup. All functions are contained here;
+# no changes to the Neon solver, JSON schema or existing Warp voxelization path.
+# Enable with SWT_MRES_TOPOLOGY=apply, or inspect without modifications with =audit.
+# Default off preserves the original makeMesh output exactly.
+class _SWTMresTopologyError(RuntimeError):
+    pass
+
+
+def _swt_mres_origin(record):
+    """Origin in this level's integer lattice coordinates (pre-conversion data)."""
+    mask, spacing, origin, level = record
+    if np.ndim(mask) != 3 or np.ndim(origin) != 1 or len(origin) != 3:
+        raise _SWTMresTopologyError('Each level needs a 3D mask and a 3-vector origin')
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise _SWTMresTopologyError('Invalid level spacing')
+    lattice = np.asarray(origin, dtype=np.float64) / float(spacing)
+    if not np.all(np.isfinite(lattice)) or not np.allclose(lattice, np.rint(lattice), rtol=0, atol=1e-5):
+        raise _SWTMresTopologyError(f'L{level} origin is not aligned to its lattice')
+    return np.rint(lattice).astype(np.int64)
+
+
+def _swt_mres_children_count(fine, fine_origin, coarse_origin, coarse_shape):
+    """Count L0 children for each L1 lattice site, including a 1-cell halo.
+
+    A global L1 index (x,y,z) corresponds to L0 indices (2*x+a,2*y+b,2*z+c)
+    for child parities a,b,c in {0,1}. Both origins are in level-local units.
+    No 3D repeated/upscaled L0 array is allocated.
+    """
+    halo = np.asarray(coarse_shape, dtype=np.int64) + 2
+    first = coarse_origin - 1
+    beyond = first + halo
+    fine_shape = np.asarray(fine.shape, dtype=np.int64)
+    counts = np.zeros(tuple(int(x) for x in halo), dtype=np.uint8)
+    for px in (0, 1):
+        for py in (0, 1):
+            for pz in (0, 1):
+                parity = np.asarray((px, py, pz), dtype=np.int64)
+                lower = np.maximum(first, -np.floor_divide(-(fine_origin - parity), 2))
+                upper = np.minimum(beyond, np.floor_divide(fine_origin + fine_shape - 1 - parity, 2) + 1)
+                if np.any(lower >= upper):
+                    continue
+                extent = upper - lower
+                src0 = 2 * lower + parity - fine_origin
+                dst0 = lower - first
+                source_slice = tuple(slice(int(src0[i]), int(src0[i] + 2 * extent[i]), 2) for i in range(3))
+                target_slice = tuple(slice(int(dst0[i]), int(dst0[i] + extent[i])) for i in range(3))
+                part = fine[source_slice]
+                if part.shape != tuple(int(x) for x in extent):
+                    raise _SWTMresTopologyError('Invalid L0/L1 origin/shape mapping')
+                counts[target_slice] += part.astype(np.uint8, copy=False)
+    return counts
+
+
+def _swt_mres_bad_l1(coarse, fine_child_counts):
+    """Mark active L1 cells with opposite fine faces or >=3 fine-facing faces.
+
+    A face is classified as L0-facing only if its neighboring L1-volume cube
+    has all eight L0 children active. Partial cubes are NOT presumed to be L0.
+    """
+    sx, sy, sz = coarse.shape
+    p = fine_child_counts
+    # Keep only one pair of face slabs in memory at a time. Large SWT masks
+    # should not allocate six additional full-domain boolean arrays here.
+    opposite = np.zeros(coarse.shape, dtype=bool)
+    face_count = np.zeros(coarse.shape, dtype=np.uint8)
+    for minus, plus in (
+        (p[:-2, 1:-1, 1:-1], p[2:, 1:-1, 1:-1]),
+        (p[1:-1, :-2, 1:-1], p[1:-1, 2:, 1:-1]),
+        (p[1:-1, 1:-1, :-2], p[1:-1, 1:-1, 2:]),
+    ):
+        low_fine = minus == 8
+        high_fine = plus == 8
+        opposite |= low_fine & high_fine
+        face_count += low_fine
+        face_count += high_fine
+    opposite &= coarse
+    multiple = coarse & (face_count >= 3)
+    return opposite, multiple
+
+
+def _swt_mres_expand_within_l1(coarse, seed, rings):
+    """Six-connected one-L1-cell buffer, never crossing an inactive L1 cell."""
+    chosen = seed.copy()
+    frontier = seed.copy()
+    for _ in range(rings):
+        p = np.pad(frontier, 1, constant_values=False)
+        neighborhood = (p[:-2, 1:-1, 1:-1] | p[2:, 1:-1, 1:-1] |
+                        p[1:-1, :-2, 1:-1] | p[1:-1, 2:, 1:-1] |
+                        p[1:-1, 1:-1, :-2] | p[1:-1, 1:-1, 2:])
+        frontier = neighborhood & coarse & ~chosen
+        chosen |= frontier
+        if not np.any(frontier):
+            break
+    return chosen
+
+
+def _swt_mres_safe_selection(coarse, fine, counts, chosen, fine_origin, coarse_origin):
+    """Filter promotions to avoid L0/L1 overlap, invalid child bounds or L0/L2
+    face/edge/corner contacts. Return safe L1 coordinates and blocked count.
+
+    This is deliberately conservative: unsafe candidates remain L1. They are
+    reported, never silently written into an incomplete fine-grid stencil.
+    """
+    coords = np.argwhere(chosen)
+    if not len(coords):
+        return coords, 0
+    starts = 2 * (coords + coarse_origin) - fine_origin
+    good = np.all((starts >= 0) & (starts + 2 <= np.asarray(fine.shape)), axis=1)
+    center_counts = counts[tuple((coords + 1).T)]
+    good &= center_counts == 0
+    # Every D3Q27 neighboring L1-volume cube must be covered by L1 or
+    # a COMPLETE 2x2x2 L0 cube, including across the coarse-mask boundary.
+    supported = np.pad(coarse, 1, constant_values=False) | (counts == 8)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == dy == dz == 0:
+                    continue
+                good &= supported[coords[:, 0] + 1 + dx,
+                                  coords[:, 1] + 1 + dy,
+                                  coords[:, 2] + 1 + dz]
+    return coords[good], int(np.count_nonzero(~good))
+
+
+def _swt_mres_presence_at_level(fine, fine_origin, coarse_origin, coarse_shape, ratio):
+    """OR-reduce active occupancy through successive 2:1 lattices.
+
+    Complexity is proportional to the source mask size, rather than ratio^3;
+    global lattice indices (including negative origins) remain aligned.
+    Returns a one-cell halo around the target coarse mask.
+    """
+    if ratio < 2 or ratio & (ratio - 1):
+        raise _SWTMresTopologyError('Level ratio must be a power of two')
+    data = np.asarray(fine, dtype=bool)
+    base = np.asarray(fine_origin, dtype=np.int64).copy()
+    remaining = ratio
+    while remaining > 1:
+        low = np.mod(base, 2).astype(int)
+        high = (-(np.asarray(data.shape) + low)) % 2
+        padded = np.pad(data, tuple((int(low[i]), int(high[i])) for i in range(3)),
+                        mode='constant', constant_values=False)
+        data = (padded[0::2,0::2,0::2] | padded[0::2,0::2,1::2] |
+                padded[0::2,1::2,0::2] | padded[0::2,1::2,1::2] |
+                padded[1::2,0::2,0::2] | padded[1::2,0::2,1::2] |
+                padded[1::2,1::2,0::2] | padded[1::2,1::2,1::2])
+        base = np.floor_divide(base, 2)
+        remaining //= 2
+    result_shape = np.asarray(coarse_shape, dtype=np.int64) + 2
+    result = np.zeros(tuple(result_shape), dtype=bool)
+    first = np.asarray(coarse_origin, dtype=np.int64) - 1
+    lower = np.maximum(base, first)
+    upper = np.minimum(base + np.asarray(data.shape), first + result_shape)
+    if np.all(lower < upper):
+        src = lower - base
+        dst = lower - first
+        extent = upper - lower
+        ss = tuple(slice(int(src[i]), int(src[i]+extent[i])) for i in range(3))
+        ds = tuple(slice(int(dst[i]), int(dst[i]+extent[i])) for i in range(3))
+        result[ds] = data[ss]
+    return result
+
+
+def _swt_mres_neighbor26(presence):
+    """Coarse cells neighboring a finer occupied cube (face, edge, corner)."""
+    result = np.zeros(tuple(np.asarray(presence.shape) - 2), dtype=bool)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if (dx, dy, dz) != (0, 0, 0):
+                    result |= presence[1+dx:presence.shape[0]-1+dx,
+                                       1+dy:presence.shape[1]-1+dy,
+                                       1+dz:presence.shape[2]-1+dz]
+    return result
+
+
+def _swt_mres_repair_hierarchy(level_data, *, mode='apply'):
+    """Closure of refinement hierarchy under two safety rules at EVERY level.
+
+    1. A level L cell cannot have level L-1 on opposing faces or >=4 faces.
+    2. No level L cell may have a face/edge/corner contact with a cell
+       at level L-2 or finer (one-level transition / D3Q27 guard).
+
+    A violating L cell is replaced with eight L-1 children. Changes can
+    propagate through all levels until the global fixed point is reached.
+    There are no pass/cell caps. Since every operation replaces one coarse
+    leaf with eight finer leaves, termination is bounded by the finite domain
+    at the finest resolution, subject to physical memory availability.
+
+    Existing active cells are never deleted except through replacement by
+    their exact children. Unrelated levels and all existing parameters remain.
+    """
+    if mode not in ('audit', 'apply'):
+        raise _SWTMresTopologyError('mode must be audit or apply')
+    if len(level_data) < 2:
+        return level_data
+    masks = [np.asarray(rec[0], dtype=bool).copy() for rec in level_data]
+    origin = [_swt_mres_origin(rec) for rec in level_data]
+    num_levels = len(masks)
+    for i in range(1, num_levels):
+        if not np.isclose(float(level_data[i][1]), 2 * float(level_data[i-1][1])):
+            raise _SWTMresTopologyError('Level spacings must be 2:1, in finest-first order')
+    total_by_level = [0] * num_levels
+    iteration = 0
+    while True:
+        # Decide the entire current wave from one consistent snapshot.
+        planned = [np.zeros(m.shape, dtype=bool) for m in masks]
+        bad_by_level = []
+        gap_by_level = []
+        for c in range(1, num_levels):
+            counts = _swt_mres_children_count(masks[c-1], origin[c-1], origin[c], masks[c].shape)
+            forbidden = _swt_mres_forbidden_l1(masks[c], counts)
+            planned[c] |= forbidden
+            bad_by_level.append(int(forbidden.sum()))
+            gaps = np.zeros(masks[c].shape, dtype=bool)
+            for f in range(c-2, -1, -1):
+                presence = _swt_mres_presence_at_level(
+                    masks[f], origin[f], origin[c], masks[c].shape, 1 << (c-f))
+                gaps |= _swt_mres_neighbor26(presence)
+            gaps &= masks[c]
+            planned[c] |= gaps
+            gap_by_level.append(int(gaps.sum()))
+        count = sum(int(p.sum()) for p in planned)
+        if iteration == 0:
+            print('[SWT topology] %s initial forbidden per L1..LN=%s '
+                  'skipped-level guards=%s total_promotions=%d' %
+                  (mode.upper(), bad_by_level, gap_by_level, count), flush=True)
+        if mode == 'audit':
+            print('[SWT topology] AUDIT: no meshes modified', flush=True)
+            return level_data
+        if count == 0:
+            break
+        # Coarsest first so newly generated children can themselves be refined
+        # on the next pass. Every source cell must have no existing immediate
+        # child; otherwise the input hierarchy already overlaps.
+        for c in range(num_levels-1, 0, -1):
+            coords = np.argwhere(planned[c])
+            if not len(coords):
+                continue
+            fine = masks[c-1]
+            coarse = masks[c]
+            children = _swt_mres_children_count(fine, origin[c-1], origin[c], coarse.shape)
+            if np.any(children[tuple((coords + 1).T)]):
+                raise _SWTMresTopologyError(
+                    'Existing overlapping level masks at L%d/L%d; refusing to replace occupied cells' %
+                    (c-1,c))
+            starts_global = (coords + origin[c]) * 2
+            lo = np.minimum(origin[c-1], starts_global.min(axis=0))
+            hi = np.maximum(origin[c-1] + np.asarray(fine.shape),
+                            (starts_global + 2).max(axis=0))
+            lo = 2 * np.floor_divide(lo, 2)
+            hi = 2 * np.floor_divide(hi + 1, 2)
+            if np.any(lo != origin[c-1]) or np.any(hi != origin[c-1] + np.asarray(fine.shape)):
+                expanded = np.zeros(tuple(hi-lo), dtype=bool)
+                offset = origin[c-1] - lo
+                sl = tuple(slice(int(offset[k]), int(offset[k]+fine.shape[k])) for k in range(3))
+                expanded[sl] = fine
+                fine = expanded
+                origin[c-1] = lo
+                masks[c-1] = fine
+            starts = starts_global - origin[c-1]
+            for i in (0,1):
+                for j in (0,1):
+                    for k in (0,1):
+                        fine[starts[:,0]+i, starts[:,1]+j, starts[:,2]+k] = True
+            coarse[tuple(coords.T)] = False
+            total_by_level[c] += len(coords)
+        iteration += 1
+        if iteration <= 5 or iteration % 10 == 0:
+            print('[SWT topology] wave=%d promotions=%d cumulative=%d levels=%s' %
+                  (iteration, count, sum(total_by_level), total_by_level[1:]), flush=True)
+
+    # Independent final verification: both conditions on every pair.
+    for c in range(1, num_levels):
+        counts = _swt_mres_children_count(masks[c-1], origin[c-1], origin[c], masks[c].shape)
+        if np.any(_swt_mres_forbidden_l1(masks[c], counts)):
+            raise _SWTMresTopologyError('Nonconvergence at L%d/L%d' % (c-1,c))
+        for f in range(c-2, -1, -1):
+            presence = _swt_mres_presence_at_level(
+                masks[f], origin[f], origin[c], masks[c].shape, 1 << (c-f))
+            if np.any(masks[c] & _swt_mres_neighbor26(presence)):
+                raise _SWTMresTopologyError('Remaining skipped-level contact L%d/L%d' % (f,c))
+    output = []
+    for i, rec in enumerate(level_data):
+        output.append((masks[i].astype(rec[0].dtype, copy=False), rec[1],
+                       origin[i].astype(float)*float(rec[1]), rec[3]))
+    print('[SWT topology] CONVERGED waves=%d total_promoted=%d '
+          'promoted_by_level=%s remaining_forbidden=0 skipped_level_contacts=0' %
+          (iteration, sum(total_by_level), total_by_level[1:]), flush=True)
+    return output
+
+
+def _swt_mres_topology_cleanup(level_data, *, mode='audit', rings=0,
+                               max_fraction=None, max_cells=None,
+                               max_passes=None, strict=True):
+    """Backward-compatible entry point; applies recursive repair at all levels."""
+    return _swt_mres_repair_hierarchy(level_data, mode=mode)
+
+
+def _swt_mres_forbidden_l1(coarse, counts):
+    """Opposite fine faces OR >=4 fine-facing faces at any adjacent pair."""
+    faces = np.zeros(coarse.shape, dtype=np.uint8)
+    opposite = np.zeros(coarse.shape, dtype=bool)
+    for low, high in (
+        (counts[:-2,1:-1,1:-1] == 8, counts[2:,1:-1,1:-1] == 8),
+        (counts[1:-1,:-2,1:-1] == 8, counts[1:-1,2:,1:-1] == 8),
+        (counts[1:-1,1:-1,:-2] == 8, counts[1:-1,1:-1,2:] == 8),
+    ):
+        faces += low
+        faces += high
+        opposite |= low & high
+    return coarse & (opposite | (faces >= 4))
+
+
+def _swt_mres_topology_selftest():
+    """CPU-only regression tests for recursive, all-level closure."""
+    z=np.zeros(3)
+    coarse = np.ones((7,7,7),bool)
+    fine = np.zeros((14,14,14),bool)
+    for idx in ((3,3,2),(3,3,4)):
+        coarse[idx]=False
+        fine[2*idx[0]:2*idx[0]+2, 2*idx[1]:2*idx[1]+2, 2*idx[2]:2*idx[2]+2]=True
+    old=[(fine,1.,z,0),(coarse,2.,z,1)]
+    assert _swt_mres_topology_cleanup(old,mode='audit') is old
+    out=_swt_mres_topology_cleanup(old,mode='apply')
+    counts=_swt_mres_children_count(out[0][0],_swt_mres_origin(out[0]),_swt_mres_origin(out[1]),out[1][0].shape)
+    assert not np.any(_swt_mres_forbidden_l1(out[1][0],counts))
+    assert np.array_equal(old[0][0],fine)
+    # A level-2 cube two L2-index steps from a level-0 cube; refinement
+    # must provide an L1 buffer without touching existing fine cells.
+    a=np.zeros((24,24,24),bool)
+    b=np.zeros((12,12,12),bool)
+    c=np.zeros((6,6,6),bool)
+    a[8:10,8:10,8:10]=True
+    c[3,2,2]=True
+    multi=[(a,1.,z,0),(b,2.,z,1),(c,4.,z,2)]
+    fixed=_swt_mres_topology_cleanup(multi,mode='apply')
+    assert not fixed[2][0][3,2,2]
+    assert fixed[1][0].sum() >= 8
+    for l in (1,2):
+        cnt=_swt_mres_children_count(fixed[l-1][0],_swt_mres_origin(fixed[l-1]),_swt_mres_origin(fixed[l]),fixed[l][0].shape)
+        assert not np.any(_swt_mres_forbidden_l1(fixed[l][0],cnt))
+    print('[SWT topology] SELFTEST PASS all levels')
+
 # Generate a multi-level voxel mesh from an STL file
 def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, ground_refinement_level=-1, ground_voxel_height=4, downsample=-1):
     stem = Path(filename).stem
@@ -565,6 +909,24 @@ def makeMesh(levels, filename, voxSize, kernel, domainMultiplier, close=True, gr
             tocLevel = time.perf_counter()
             print(f"    Level defined in {tocLevel - ticLevel:0.1f} seconds")
             origin = np.copy(dOrigin)
+
+    # Optional SWT topology stage: after the ORIGINAL L0..LN grow/fill/remove,
+    # before the ORIGINAL statistics, downsample and level-index conversion.
+    # Default off: the original mesh is bit-for-bit unchanged.
+    swt_mode = os.environ.get('SWT_MRES_TOPOLOGY', 'off').strip().lower()
+    if swt_mode not in ('', 'off', 'audit', 'apply'):
+        raise _SWTMresTopologyError('SWT_MRES_TOPOLOGY must be off, audit or apply')
+    if swt_mode in ('audit', 'apply'):
+        if downsample >= 0:
+            raise _SWTMresTopologyError('Topology cleanup cannot be combined with downsample export')
+        level_data = _swt_mres_topology_cleanup(
+            level_data, mode=swt_mode,
+            rings=0,
+            max_fraction=None,
+            max_cells=None,
+            max_passes=None,
+            strict=True,
+        )
 
     toc = time.perf_counter()
 
