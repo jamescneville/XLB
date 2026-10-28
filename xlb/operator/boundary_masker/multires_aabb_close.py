@@ -30,7 +30,20 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
         close_voxels: int = None,
+        protected_boundary_id: int = None,
+        ground_wheel_bc_overlap_to_solid: bool = False,
     ):
+        # SWT_CONTACT_SOLID_V1: either preserve existing ground BC voxels
+        # (legacy ground priority) or convert ONLY the ground voxels that
+        # the wheel masker would otherwise paint as wheel BC into solid 255.
+        # Set before super(): Operator.__init__ may construct GPU kernels.
+        protected_id = 0 if protected_boundary_id is None else int(protected_boundary_id)
+        if protected_id != 0 and not (1 <= protected_id <= 253):
+            raise ValueError('protected_boundary_id must be in 1..253 or None')
+        if ground_wheel_bc_overlap_to_solid and protected_id == 0:
+            raise ValueError('ground_wheel_bc_overlap_to_solid requires protected_boundary_id')
+        self.protected_boundary_id = protected_id
+        self.ground_wheel_bc_overlap_to_solid = bool(ground_wheel_bc_overlap_to_solid)
         super().__init__(velocity_set, precision_policy, compute_backend, close_voxels)
         if self.compute_backend in [ComputeBackend.JAX, ComputeBackend.WARP]:
             raise NotImplementedError(f"Operator {self.__class__.__name__} not supported in {self.compute_backend} backend.")
@@ -55,6 +68,9 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
         # Set local constants
         lattice_central_index = self.velocity_set.center_index
+        # Captured as a compile-time constant inside NEON/Warp functionals.
+        _protected_bc_id = self.protected_boundary_id
+        _ground_overlap_to_solid = self.ground_wheel_bc_overlap_to_solid
 
         @wp.func
         def mres_hit_normal_weight(
@@ -102,6 +118,15 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             solid_val = wp.neon_read(solid_mask_pn, index, 0)
             bc_val = wp.neon_read(bc_mask_pn, index, 0)
 
+            # Ground-priority mode: never overwrite ground (original behavior).
+            # Contact-solid mode: keep ground if the wheel's own solid-mask
+            # directly covers this cell. We want to convert ONLY ground cells
+            # that the following wheel-BC adjacency test would otherwise claim.
+            # In either case, all unrelated ground cells stay ground.
+            if _protected_bc_id != 0 and bc_val == wp.uint8(_protected_bc_id):
+                if not _ground_overlap_to_solid or solid_val == wp.uint8(BC_SOLID):
+                    return
+
             # Keep existing solid or already-owned boundary cells untouched.
             if solid_val == wp.uint8(BC_SOLID) or bc_val == wp.uint8(BC_SOLID):
                 wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SOLID))
@@ -145,6 +170,21 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
                 if nval != wp.uint8(BC_SOLID):
                     continue
+
+                # SWT_CONTACT_SOLID_V1: this ground voxel WOULD be assigned the
+                # wheel BC in the original AABB_CLOSE masker (a neighboring cell
+                # belongs to this wheel's temporary solid mask). Instead, make
+                # this particular overlap voxel solid. Do not convert ground
+                # cells merely because they are near a wheel BC or wheel solid
+                # unless they meet this precise wheel-BC assignment condition.
+                # The direct wheel-solid overlap case already returned above.
+                if _protected_bc_id != 0 and bc_val == wp.uint8(_protected_bc_id):
+                    wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SOLID))
+                    # Remove existing moving-ground missing links: this node
+                    # is no longer an active boundary condition or MEM surface.
+                    for l in range(_q):
+                        self.write_field(missing_mask_pn, index, l, wp.uint8(False))
+                    return
 
                 # If no mesh distance is requested, keep the base ownership behavior:
                 # mark the cell as boundary and flag the missing opposite link.
