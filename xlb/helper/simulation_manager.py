@@ -71,6 +71,35 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         self.relax = grid.create_field(cardinality=1, dtype=self.precision_policy.store_precision)
         self.coalescence_factor = grid.create_field(cardinality=self.velocity_set.q, dtype=self.precision_policy.store_precision)
 
+        # Dedicated integer restriction accumulator.  Fine-to-coarse population
+        # deposits are quantized and atomically accumulated here, never inside
+        # f_0/f_1.  This keeps the physical population fields valid FP32/FP64
+        # values throughout streaming, explosion, boundary processing, and I/O.
+        import neon
+
+        if self.precision_policy.store_precision in (Precision.FP32, Precision.FP64):
+            # Always use a 64-bit integer accumulator.  For FP32 populations this
+            # permits a 2^48 scale, which preserves every meaningful FP32 LBM
+            # population exactly instead of discarding low mantissa bits as the
+            # prior int32/2^27 path did.
+            restriction_accumulator_dtype = wp.int64
+        else:
+            raise ValueError(
+                "deterministic fine-to-coarse restriction requires FP32 or FP64 "
+                "population storage; Neon multires FP16 storage is not supported"
+            )
+
+        # NeonMultiresGrid.create_field currently accepts only XLB floating/byte
+        # Precision values.  Allocate the integer mField through the wrapped
+        # Neon mGrid using the same lifecycle as create_field().
+        self.restriction_accumulator = grid.grid.new_field(
+            cardinality=self.velocity_set.q,
+            dtype=restriction_accumulator_dtype,
+            memory_type=neon.MemoryType.device(),
+        )
+        for level in range(self.count_levels):
+            self.restriction_accumulator.zero_run(level, stream_idx=0)
+
         # Dedicated ExtrapolationOutflowBC storage.  The BC no longer hides
         # auxiliary values inside physical distribution populations because
         # those populations participate in multires coalescence/explosion.
@@ -219,7 +248,7 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         self.iteration_idx = self.iteration_idx + 1
         self.sk.run()
 
-    def _build_recursion(self, level, app, config):
+    def _build_recursion(self, level, app, config, accumulate_to_coarser=False):
         """Unified multi-resolution recursion builder.
 
         config keys:
@@ -228,6 +257,13 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             coarse_collide_ops: list of op_names for coarse collision.
             coarse_stream_ops:  list of (op_name, extra_kwargs) for coarse streaming.
             fuse_finest:        if True, recurse once (not twice) when child is at level 0.
+
+        ``accumulate_to_coarser`` is true only for the final fine substep of
+        each 2:1 adjacent-level interval.  This implements raw-last restriction
+        throughout the hierarchy.
+
+        The integer restriction accumulator is reset immediately before the
+        first kernel that deposits the final fine state for a given interval.
         """
         if level < 0:
             return
@@ -237,15 +273,53 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         fields_swapped = dict(f_0_fd=self.f_1, f_1_fd=self.f_0, bc_mask_fd=self.bc_mask, missing_mask_fd=self.missing_mask, _rho0=self.rho1, _u0=self.u1, _rho1=self.rho0, _u1=self.u0, _relax=self.relax,normal_vector = self.normal_vector, normal_distance = self.normal_distance)
 
         if level == 0 and config["finest_ops"] is not None:
-            for op_name, swap, extra in config["finest_ops"]:
+            for op_name, swap, extra_template in config["finest_ops"]:
                 base = fields_swapped if swap else fields
-                self.add_to_app(app=app, op_name=op_name, level=level, **base, omega=omega, **extra)
+                extra = dict(extra_template)
+                reset_before = bool(
+                    extra.pop("_reset_restriction_accumulator_before", False)
+                )
+                if reset_before:
+                    self.add_to_app(
+                        app=app,
+                        op_name="reset_restriction_accumulator",
+                        level=level,
+                        restriction_accumulator_fd=self.restriction_accumulator,
+                        bc_mask_fd=self.bc_mask,
+                    )
+
+                if op_name != "SFV_finest_fused_pull":
+                    extra["restriction_accumulator_fd"] = self.restriction_accumulator
+
+                self.add_to_app(
+                    app=app,
+                    op_name=op_name,
+                    level=level,
+                    **base,
+                    omega=omega,
+                    **extra,
+                )
             return
+
+        # Non-fused raw-last restriction deposits into the dedicated integer
+        # field.  Reset the exact uncleVal targets before the accumulating
+        # collision container; the reset and accumulation are separate skeleton
+        # nodes, so no reset can race a deposit.
+        if accumulate_to_coarser:
+            self.add_to_app(
+                app=app,
+                op_name="reset_restriction_accumulator",
+                level=level,
+                restriction_accumulator_fd=self.restriction_accumulator,
+                bc_mask_fd=self.bc_mask,
+            )
 
         for op_name in config["coarse_collide_ops"]:
             collide_extra = {}
             if op_name in ("collide_coarse", "CFV_collide_coarse"):
                 collide_extra["extrap_aux_fd"] = self.extrap_aux
+                collide_extra["accumulate_to_coarser"] = bool(accumulate_to_coarser)
+                collide_extra["restriction_accumulator_fd"] = self.restriction_accumulator
             self.add_to_app(
                 app=app,
                 op_name=op_name,
@@ -257,10 +331,13 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             )
 
         if config["fuse_finest"] and level - 1 == 0:
-            self._build_recursion(level - 1, app, config)
+            # The fused finest operation list already contains both L0 phases.
+            self._build_recursion(level - 1, app, config, accumulate_to_coarser=False)
         else:
-            self._build_recursion(level - 1, app, config)
-            self._build_recursion(level - 1, app, config)
+            # First fine substep advances normally but does not restrict.
+            self._build_recursion(level - 1, app, config, accumulate_to_coarser=False)
+            # Final fine substep advances and supplies the endpoint state to L+1.
+            self._build_recursion(level - 1, app, config, accumulate_to_coarser=True)
 
         for op_name, extra in config["coarse_stream_ops"]:
             self.add_to_app(app=app, op_name=op_name, level=level, **fields_swapped, **extra)
@@ -279,25 +356,68 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
 
         stream_abc = {
             "coalescence_factor": self.coalescence_factor,
+            "restriction_accumulator_fd": self.restriction_accumulator,
             "timestep": 0,
             "extrap_aux_fd": self.extrap_aux,
         }
 
         # Finest-level op descriptors: (op_name, swap_f0_f1, extra_kwargs)
         fused_pull_finest = [
-            ("finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
-            ("finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
+            ("finest_fused_pull", False, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": True,
+                "accumulate_to_coarser": False,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
+            ("finest_fused_pull", True, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": False,
+                "accumulate_to_coarser": True,
+                "_reset_restriction_accumulator_before": True,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
         ]
         # Finest-level structural specialization. Each CFV class is a separate
         # compiled kernel so the common MRES/no-BC path contains no BC/wall code.
         sfv_fused_pull_finest = [
-            ("CFV_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
-            ("CFV_MRES_NOBC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
-            ("CFV_MRES_BC_finest_fused_pull", False, {"timestep": 0, "is_f1_the_explosion_src_field": True, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_BC_finest_fused_pull", False, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": True,
+                "accumulate_to_coarser": False,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
+            ("CFV_MRES_NOBC_finest_fused_pull", False, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": True,
+                "accumulate_to_coarser": False,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
+            ("CFV_MRES_BC_finest_fused_pull", False, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": True,
+                "accumulate_to_coarser": False,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
             ("SFV_finest_fused_pull", False, {}),
-            ("CFV_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
-            ("CFV_MRES_NOBC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
-            ("CFV_MRES_BC_finest_fused_pull", True, {"timestep": 0, "is_f1_the_explosion_src_field": False, "extrap_aux_fd": self.extrap_aux}),
+            ("CFV_BC_finest_fused_pull", True, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": False,
+                "accumulate_to_coarser": True,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
+            ("CFV_MRES_NOBC_finest_fused_pull", True, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": False,
+                "accumulate_to_coarser": True,
+                "_reset_restriction_accumulator_before": True,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
+            ("CFV_MRES_BC_finest_fused_pull", True, {
+                "timestep": 0,
+                "is_f1_the_explosion_src_field": False,
+                "accumulate_to_coarser": True,
+                "extrap_aux_fd": self.extrap_aux,
+            }),
             ("SFV_finest_fused_pull", True, {}),
         ]
 
@@ -353,7 +473,12 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             ).run(0)
             wp.synchronize()
 
-        self._build_recursion(self.count_levels - 1, self.app, config)
+        self._build_recursion(
+            self.count_levels - 1,
+            self.app,
+            config,
+            accumulate_to_coarser=False,
+        )
 
         bk = self.grid.get_neon_backend()
         self.sk = neon.Skeleton(backend=bk)

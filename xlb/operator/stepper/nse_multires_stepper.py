@@ -218,9 +218,10 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         """Precompute coalescence weighting factors for multi-resolution streaming.
 
         For each non-halo voxel at every level, this method accumulates
-        the number of finer neighbours that contribute populations via
-        coalescence (child-to-parent transfer), then inverts the count
-        so that the streaming kernel can apply the correct averaging weight.
+        the number of spatial finer-neighbour contributors for each population
+        direction, then stores the reciprocal count.  Production restriction
+        uses only the final fine substep of each 2:1 subcycled interval, so the
+        normalization is 1/N rather than the former 1/(2N).
 
         Parameters
         ----------
@@ -315,7 +316,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 # Same-level ngh:              YES
                                 # Compute coalescence factor
                                 if coalescence_factor > self.compute_dtype(0):
-                                    coalescence_factor = self.compute_dtype(1) / (self.compute_dtype(2) * coalescence_factor)
+                                    coalescence_factor = self.compute_dtype(1) / coalescence_factor
                                     wp.neon_write(coalescence_factor_pn, index, l, self.store_dtype(coalescence_factor))
 
                 loader.declare_kernel(compute)
@@ -423,6 +424,26 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         _opp_indices = self.velocity_set.opp_indices
         _c = self.velocity_set.c
 
+        # The deterministic restriction accumulator is always an int64 mField.
+        #
+        # FP32 uses a 2^48 fixed-point scale.  The conversion is performed in
+        # FP64 natively, so ordinary LBM FP32 populations retain all of their
+        # stored mantissa bits.  This removes the repeatable per-population
+        # quantization bias introduced by the former int32/2^27 path.
+        #
+        # FP64 keeps the 2^59 path.  Both variants are selected at Warp compile
+        # time and use the same int64 accumulator topology.
+        _restriction_accumulator_zero = wp.int64(0)
+        if self.precision_policy.store_precision == Precision.FP32:
+            _restriction_is_fp32 = True
+        elif self.precision_policy.store_precision == Precision.FP64:
+            _restriction_is_fp32 = False
+        else:
+            raise ValueError(
+                "deterministic fine-to-coarse restriction requires FP32 or FP64 "
+                "population storage; Neon multires FP16 storage is not supported"
+            )
+
         # Read the list of bc_to_id created upon instantiation
         bc_to_id = boundary_condition_registry.bc_to_id
 
@@ -471,7 +492,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             elif wp.static(self.boundary_conditions[i].id in hybrid_bc_ids):
                                 if _boundary_id == wp.static(self.boundary_conditions[i].id):
                                     f_result = wp.static(self.boundary_conditions[i].neon_functional)(
-                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn)
+                                        index, timestep, _missing_mask, f_0, f_1, f_pre, f_post, _rho, _u, _relax, _norm_vec_pn, _norm_dist_pn, wp.bool(True))
                             else:
                                 if _boundary_id == wp.static(self.boundary_conditions[i].id):
                                     f_result = wp.static(self.boundary_conditions[i].neon_functional)(
@@ -564,7 +585,57 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 _f1_thread = wp.neon_read(f_1_pn, index, _opp_indices[l])
                                 wp.neon_write(f_0_pn, index, _opp_indices[l], self.store_dtype(_f1_thread))
 
-        # Factory for neon_collide_pipeline: generates compile-time specialized variants
+        @neon.Container.factory(name="reset_restriction_accumulator")
+        def reset_restriction_accumulator(
+            level: int,
+            restriction_accumulator_fd: Any,
+            bc_mask_fd: Any,
+        ):
+            """Zero exact integer targets before one raw-last restriction phase.
+
+            The accumulator is a dedicated int32/int64 mField, so this reset
+            never touches f_0/f_1.  The native helper uses the same fine-cell to
+            coarse-uncle mapping as the fixed-point store.  Multiple source
+            cells can map to one target; atomicExch(0) is safe because this
+            container completes before the following accumulation container.
+            """
+            if level + 1 >= restriction_accumulator_fd.get_grid().num_levels:
+                raise ValueError(
+                    "restriction accumulator reset requires a coarser level"
+                )
+
+            def ll(loader: neon.Loader):
+                loader.set_mres_grid(restriction_accumulator_fd.get_grid(), level)
+                restriction_accumulator_pn = loader.get_mres_write_handle(
+                    restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                )
+                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+
+                @wp.func
+                def device(index: Any):
+                    _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
+                    if _boundary_id == wp.uint8(BC_SOLID):
+                        return
+                    if wp.neon_has_child(restriction_accumulator_pn, index):
+                        return
+
+                    for l in range(1, self.velocity_set.q):
+                        push_direction = wp.neon_ngh_idx(
+                            wp.int8(_c[0, l]),
+                            wp.int8(_c[1, l]),
+                            wp.int8(_c[2, l]),
+                        )
+                        wp.neon_mres_lbm_zero_fixed(
+                            restriction_accumulator_pn, index, l, push_direction
+                        )
+
+                loader.declare_kernel(device)
+
+            return ll
+
+        # Factory for neon_collide_pipeline: generates compile-time specialized variants.
+        # Restriction uses raw-last semantics: only the final fine substep of
+        # each adjacent-level interval writes to the coarser accumulator.
         def make_collide_pipeline(do_bc: bool, do_accumulation: bool, f0_is_pre_stream_source: bool = False):
             @wp.func
             def collide_pipeline_impl(
@@ -579,7 +650,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 omega: Any,
                 num_levels: int,
                 level: int,
-                accumulation_pn: Any,
+                restriction_accumulator_pn: Any,
                 _rho0_pn: Any,
                 _u0_pn: Any,
                 _rho1_pn: Any,
@@ -616,7 +687,22 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     for l in range(self.velocity_set.q):
                         push_direction = wp.neon_ngh_idx(wp.int8(_c[0, l]), wp.int8(_c[1, l]), wp.int8(_c[2, l]))
                         if level < num_levels - 1:
-                            wp.neon_mres_lbm_store_op(accumulation_pn, index, l, push_direction, self.store_dtype(_f_post_collision[l]))
+                            if wp.static(_restriction_is_fp32):
+                                wp.neon_mres_lbm_store_fixed_f32(
+                                    restriction_accumulator_pn,
+                                    index,
+                                    l,
+                                    push_direction,
+                                    wp.float32(_f_post_collision[l]),
+                                )
+                            else:
+                                wp.neon_mres_lbm_store_fixed_f64(
+                                    restriction_accumulator_pn,
+                                    index,
+                                    l,
+                                    push_direction,
+                                    wp.float64(_f_post_collision[l]),
+                                )
                         wp.neon_write(f_1_pn, index, l, self.store_dtype(_f_post_collision[l]))
                 else:
                     for l in range(self.velocity_set.q):
@@ -638,6 +724,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
         collide_bc_accum = make_collide_pipeline(
             do_bc=True, do_accumulation=True, f0_is_pre_stream_source=False
         )
+        collide_bc_no_accum = make_collide_pipeline(
+            do_bc=True, do_accumulation=False, f0_is_pre_stream_source=False
+        )
         collide_bc_accum_fused = make_collide_pipeline(
             do_bc=True, do_accumulation=True, f0_is_pre_stream_source=True
         )
@@ -652,6 +741,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             index: Any,
             f_0_pn: Any,
             coalescence_factor_pn: Any,
+            restriction_accumulator_pn: Any,
         ):
             _f_post_stream = self.stream.neon_functional(f_0_pn, index)
 
@@ -663,9 +753,17 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                 pull_direction = wp.neon_ngh_idx(wp.int8(-_c[0, l]), wp.int8(-_c[1, l]), wp.int8(-_c[2, l]))
 
+                # Use the physical population field only for topology and normal
+                # streaming/explosion.  No integer payload is ever stored in f_0/f_1.
                 has_ngh_at_same_level = wp.bool(False)
-                accumulated = self.compute_dtype(wp.neon_read_ngh(f_0_pn, index, pull_direction, l, self.store_dtype(0), has_ngh_at_same_level))
-                accumulated = wp.max(accumulated, self.compute_dtype(0.0))
+                wp.neon_read_ngh(
+                    f_0_pn,
+                    index,
+                    pull_direction,
+                    l,
+                    self.store_dtype(0),
+                    has_ngh_at_same_level,
+                )
 
                 if not wp.neon_has_finer_ngh(f_0_pn, index, pull_direction):
                     # No finer ngh in the pull direction (opposite of l)
@@ -683,14 +781,41 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 _f_post_stream[l] = self.compute_dtype(exploded_pop)
                 else:
                     # Finer ngh exists in the pull direction (opposite of l).
-                    # Read from the halo on top of that finer ngh.
                     if has_ngh_at_same_level:
-                        # Finer ngh in pull direction: YES
-                        # Same-level ngh:              YES
-                        # -> Coalescence
-                        coalescence_factor = self.compute_dtype(wp.neon_read(coalescence_factor_pn, index, l))
-                        accumulated = accumulated * coalescence_factor
-                        _f_post_stream[l] = self.compute_dtype(accumulated)
+                        # -> Coalescence: read the fixed-point integer sum from the
+                        # dedicated accumulator field, decode, clamp as before,
+                        # and apply the raw-last 1/N factor.
+                        has_accumulator_value = wp.bool(False)
+                        fixed_sum = wp.neon_read_ngh(
+                            restriction_accumulator_pn,
+                            index,
+                            pull_direction,
+                            l,
+                            _restriction_accumulator_zero,
+                            has_accumulator_value,
+                        )
+                        accumulated = self.compute_dtype(0.0)
+                        if has_accumulator_value:
+                            if wp.static(_restriction_is_fp32):
+                                accumulated = self.compute_dtype(
+                                    wp.neon_mres_lbm_decode_fixed_f32(fixed_sum)
+                                )
+                            else:
+                                accumulated = self.compute_dtype(
+                                    wp.neon_mres_lbm_decode_fixed_f64(fixed_sum)
+                                )
+                        # Preserve the raw-last baseline's downstream arithmetic:
+                        # clamp and apply 1/N in compute precision.  The only
+                        # intended change is eliminating per-deposit quantization.
+                        accumulated = wp.max(
+                            accumulated, self.compute_dtype(0.0)
+                        )
+                        coalescence_factor = self.compute_dtype(
+                            wp.neon_read(coalescence_factor_pn, index, l)
+                        )
+                        _f_post_stream[l] = self.compute_dtype(
+                            accumulated * coalescence_factor
+                        )
 
             return _f_post_stream
 
@@ -744,8 +869,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="collide_coarse")
-        def collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, extrap_aux_fd: Any, omega: Any, timestep: int, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
+        def collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, extrap_aux_fd: Any, restriction_accumulator_fd: Any, omega: Any, timestep: int, accumulate_to_coarser: bool, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             num_levels = f_0_fd.get_grid().num_levels
+            collision_pipeline = (
+                collide_bc_accum if accumulate_to_coarser else collide_bc_no_accum
+            )
 
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -755,6 +883,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     f_0_pn = loader.get_mres_read_handle(f_0_fd)
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
+                if accumulate_to_coarser:
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
+                        restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                    )
+                else:
+                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                        restriction_accumulator_fd
+                    )
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
                 if has_extrapolation_outflow:
@@ -777,7 +913,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         return
                     if not wp.neon_has_child(f_0_pn, index):
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
-                        collide_bc_accum(
+                        collision_pipeline(
                             index,
                             timestep,
                             _boundary_id,
@@ -789,7 +925,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             omega,
                             num_levels,
                             level,
-                            f_1_pn,
+                            restriction_accumulator_pn,
                             _rho0_pn,
                             _u0_pn,
                             _rho1_pn,
@@ -859,9 +995,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="CFV_collide_coarse")
-        def CFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, extrap_aux_fd: Any, omega: Any, timestep: int, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
+        def CFV_collide_coarse(level: int, f_0_fd: Any, f_1_fd: Any, bc_mask_fd: Any, missing_mask_fd: Any, extrap_aux_fd: Any, restriction_accumulator_fd: Any, omega: Any, timestep: int, accumulate_to_coarser: bool, _rho0: Any, _u0: Any,  _rho1: Any,  _u1: Any,  _relax: Any, normal_vector: Any,normal_distance: Any):
             """Collision on CFV voxels only — skips both solid and SFV."""
             num_levels = f_0_fd.get_grid().num_levels
+            collision_pipeline = (
+                collide_bc_accum if accumulate_to_coarser else collide_bc_no_accum
+            )
 
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -871,6 +1010,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     f_0_pn = loader.get_mres_read_handle(f_0_fd)
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
+                if accumulate_to_coarser:
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
+                        restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                    )
+                else:
+                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                        restriction_accumulator_fd
+                    )
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
                 missing_mask_pn = loader.get_mres_read_handle(missing_mask_fd)
                 if has_extrapolation_outflow:
@@ -894,7 +1041,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         return
                     if not wp.neon_has_child(f_0_pn, index):
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
-                        collide_bc_accum(
+                        collision_pipeline(
                             index,
                             timestep,
                             _boundary_id,
@@ -906,7 +1053,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                             omega,
                             num_levels,
                             level,
-                            f_1_pn,
+                            restriction_accumulator_pn,
                             _rho0_pn,
                             _u0_pn,
                             _rho1_pn,
@@ -932,6 +1079,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             missing_mask_fd: Any,
             extrap_aux_fd: Any,
             coalescence_factor: Any,
+            restriction_accumulator_fd: Any,
             timestep: int,
             _rho0: Any,
             _u0: Any,
@@ -959,6 +1107,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
                 _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
+                restriction_accumulator_pn = loader.get_mres_read_handle(
+                    restriction_accumulator_fd
+                )
 
                 @wp.func
                 def device(index: Any):
@@ -970,7 +1121,10 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
                     _f_post_collision = _f0_thread
-                    _f_post_stream = neon_stream_explode_coalesce(index, f_0_pn, coalescence_factor_pn)
+                    _f_post_stream = neon_stream_explode_coalesce(
+                        index, f_0_pn, coalescence_factor_pn,
+                        restriction_accumulator_pn,
+                    )
 
                     _f_post_stream = apply_bc_post_streaming(
                         index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, extrap_aux_pn, _f_post_collision, _f_post_stream,
@@ -999,6 +1153,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             missing_mask_fd: Any,
             extrap_aux_fd: Any,
             coalescence_factor: Any,
+            restriction_accumulator_fd: Any,
             timestep: int,
             _rho0: Any,
             _u0: Any,
@@ -1028,6 +1183,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
                 _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 coalescence_factor_pn = loader.get_mres_read_handle(coalescence_factor)
+                restriction_accumulator_pn = loader.get_mres_read_handle(
+                    restriction_accumulator_fd
+                )
 
                 @wp.func
                 def device(index: Any):
@@ -1041,7 +1199,10 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
                     _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
                     _f_post_collision = _f0_thread
-                    _f_post_stream = neon_stream_explode_coalesce(index, f_0_pn, coalescence_factor_pn)
+                    _f_post_stream = neon_stream_explode_coalesce(
+                        index, f_0_pn, coalescence_factor_pn,
+                        restriction_accumulator_pn,
+                    )
 
                     _f_post_stream = apply_bc_post_streaming(
                         index, timestep, _boundary_id, _missing_mask, f_0_pn, f_1_pn, extrap_aux_pn, _f_post_collision, _f_post_stream,
@@ -1231,9 +1392,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             bc_mask_fd: Any,
             missing_mask_fd: Any,
             extrap_aux_fd: Any,
+            restriction_accumulator_fd: Any,
             omega: Any,
             timestep: Any,
             is_f1_the_explosion_src_field: bool,
+            accumulate_to_coarser: bool,
             _rho0: Any,
             _u0: Any,
             _rho1: Any,
@@ -1245,6 +1408,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             if level != 0:
                 raise Exception("Only the finest level is supported for now")
             num_levels = f_0_fd.get_grid().num_levels
+            collision_pipeline = (
+                collide_bc_accum_fused
+                if accumulate_to_coarser
+                else collide_bc_only_fused
+            )
 
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -1268,7 +1436,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
                 _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
-                accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
+                if accumulate_to_coarser:
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
+                        restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                    )
+                else:
+                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                        restriction_accumulator_fd
+                    )
 
                 @wp.func
                 def device(index: Any):
@@ -1287,7 +1462,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
                     )
 
-                    collide_bc_accum_fused(
+                    collision_pipeline(
                         index,
                         timestep,
                         _boundary_id,
@@ -1299,7 +1474,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         omega,
                         num_levels,
                         level,
-                        accumulation_pn,
+                        restriction_accumulator_pn,
                         _rho0_pn,
                         _u0_pn,
                         _rho1_pn,
@@ -1395,9 +1570,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             bc_mask_fd: Any,
             missing_mask_fd: Any,
             extrap_aux_fd: Any,
+            restriction_accumulator_fd: Any,
             omega: Any,
             timestep: Any,
             is_f1_the_explosion_src_field: bool,
+            accumulate_to_coarser: bool,
             _rho0: Any,
             _u0: Any,
             _rho1: Any,
@@ -1410,6 +1587,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             if level != 0:
                 raise Exception("Only the finest level is supported for now")
             num_levels = f_0_fd.get_grid().num_levels
+            collision_pipeline = (
+                collide_bc_accum_fused
+                if accumulate_to_coarser
+                else collide_bc_only_fused
+            )
 
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -1433,7 +1615,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
                 _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                 explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
-                accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
+                if accumulate_to_coarser:
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
+                        restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                    )
+                else:
+                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                        restriction_accumulator_fd
+                    )
 
                 @wp.func
                 def device(index: Any):
@@ -1454,7 +1643,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         _rho0_pn, _u0_pn, _relax_pn,  _norm_vec_pn, _norm_dist_pn,
                     )
 
-                    collide_bc_accum_fused(
+                    collision_pipeline(
                         index,
                         timestep,
                         _boundary_id,
@@ -1466,7 +1655,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         omega,
                         num_levels,
                         level,
-                        accumulation_pn,
+                        restriction_accumulator_pn,
                         _rho0_pn,
                         _u0_pn,
                         _rho1_pn,
@@ -1496,9 +1685,11 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 bc_mask_fd: Any,
                 missing_mask_fd: Any,
                 extrap_aux_fd: Any,
+                restriction_accumulator_fd: Any,
                 omega: Any,
                 timestep: Any,
                 is_f1_the_explosion_src_field: bool,
+                accumulate_to_coarser: bool,
                 _rho0: Any,
                 _u0: Any,
                 _rho1: Any,
@@ -1510,6 +1701,20 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 if level != 0:
                     raise Exception("Only the finest level is supported for now")
                 num_levels = f_0_fd.get_grid().num_levels
+                if does_mres and does_bc:
+                    collision_pipeline = (
+                        collide_bc_accum_fused
+                        if accumulate_to_coarser
+                        else collide_bc_only_fused
+                    )
+                elif does_mres:
+                    collision_pipeline = (
+                        collide_accum_only
+                        if accumulate_to_coarser
+                        else collide_simple
+                    )
+                else:
+                    collision_pipeline = collide_bc_only_fused
 
                 def ll(loader: neon.Loader):
                     loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -1538,7 +1743,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _norm_vec_pn = loader.get_mres_write_handle(normal_vector)
                     _norm_dist_pn = loader.get_mres_write_handle(normal_distance)
                     explosion_src_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
-                    accumulation_pn = f_1_pn if is_f1_the_explosion_src_field else f_0_pn
+                    if does_mres and accumulate_to_coarser:
+                        restriction_accumulator_pn = loader.get_mres_write_handle(
+                            restriction_accumulator_fd, neon.Loader.Operation.stencil_up
+                        )
+                    else:
+                        restriction_accumulator_pn = loader.get_mres_read_handle(
+                            restriction_accumulator_fd
+                        )
 
                     @wp.func
                     def device(index: Any):
@@ -1606,30 +1818,13 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 _norm_dist_pn,
                             )
 
-                        if wp.static(does_mres and does_bc):
-                            collide_bc_accum_fused(
-                                index, timestep, _boundary_id, _missing_mask,
-                                f_0_pn, f_1_pn, extrap_aux_pn, _f_post_stream, omega,
-                                num_levels, level, accumulation_pn,
-                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn,
-                                _relax_pn, _norm_vec_pn, _norm_dist_pn,
-                            )
-                        if wp.static(does_mres and not does_bc):
-                            collide_accum_only(
-                                index, timestep, _boundary_id, _missing_mask,
-                                f_0_pn, f_1_pn, extrap_aux_pn, _f_post_stream, omega,
-                                num_levels, level, accumulation_pn,
-                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn,
-                                _relax_pn, _norm_vec_pn, _norm_dist_pn,
-                            )
-                        if wp.static(not does_mres):
-                            collide_bc_only_fused(
-                                index, timestep, _boundary_id, _missing_mask,
-                                f_0_pn, f_1_pn, extrap_aux_pn, _f_post_stream, omega,
-                                num_levels, level, accumulation_pn,
-                                _rho0_pn, _u0_pn, _rho1_pn, _u1_pn,
-                                _relax_pn, _norm_vec_pn, _norm_dist_pn,
-                            )
+                        collision_pipeline(
+                            index, timestep, _boundary_id, _missing_mask,
+                            f_0_pn, f_1_pn, extrap_aux_pn, _f_post_stream, omega,
+                            num_levels, level, restriction_accumulator_pn,
+                            _rho0_pn, _u0_pn, _rho1_pn, _u1_pn,
+                            _relax_pn, _norm_vec_pn, _norm_dist_pn,
+                        )
 
                     loader.declare_kernel(device)
 
@@ -1703,6 +1898,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         return None, {
             "initialize_extrap_aux": initialize_extrap_aux,
+            "reset_restriction_accumulator": reset_restriction_accumulator,
             "collide_coarse": collide_coarse,
             "stream_coarse_step_ABC": stream_coarse_step_ABC,
             "finest_fused_pull": finest_fused_pull,
