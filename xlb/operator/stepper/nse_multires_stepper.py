@@ -587,54 +587,6 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                                 _f1_thread = wp.neon_read(f_1_pn, index, _opp_indices[l])
                                 wp.neon_write(f_0_pn, index, _opp_indices[l], self.store_dtype(_f1_thread))
 
-        @neon.Container.factory(name="reset_restriction_accumulator")
-        def reset_restriction_accumulator(
-            level: int,
-            restriction_accumulator_fd: Any,
-            bc_mask_fd: Any,
-        ):
-            """Zero exact integer targets before one raw-last restriction phase.
-
-            The accumulator is a dedicated int32/int64 mField, so this reset
-            never touches f_0/f_1.  The native helper uses the same fine-cell to
-            coarse-uncle mapping as the fixed-point store.  Multiple source
-            cells can map to one target; atomicExch(0) is safe because this
-            container completes before the following accumulation container.
-            """
-            if level + 1 >= restriction_accumulator_fd.get_grid().num_levels:
-                raise ValueError(
-                    "restriction accumulator reset requires a coarser level"
-                )
-
-            def ll(loader: neon.Loader):
-                loader.set_mres_grid(restriction_accumulator_fd.get_grid(), level)
-                restriction_accumulator_pn = loader.get_mres_write_handle(
-                    restriction_accumulator_fd, neon.Loader.Operation.stencil_up
-                )
-                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
-
-                @wp.func
-                def device(index: Any):
-                    _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
-                    if _boundary_id == wp.uint8(BC_SOLID):
-                        return
-                    if wp.neon_has_child(restriction_accumulator_pn, index):
-                        return
-
-                    for l in range(1, self.velocity_set.q):
-                        push_direction = wp.neon_ngh_idx(
-                            wp.int8(_c[0, l]),
-                            wp.int8(_c[1, l]),
-                            wp.int8(_c[2, l]),
-                        )
-                        wp.neon_mres_lbm_zero_fixed(
-                            restriction_accumulator_pn, index, l, push_direction
-                        )
-
-                loader.declare_kernel(device)
-
-            return ll
-
         # Factory for neon_collide_pipeline: generates compile-time specialized variants.
         # Restriction uses raw-last semantics: only the final fine substep of
         # each adjacent-level interval writes to the coarser accumulator.
@@ -885,12 +837,15 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     f_0_pn = loader.get_mres_read_handle(f_0_fd)
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
-                if accumulate_to_coarser:
+                # Every parent collision clears its local child-halo accumulator
+                # cells.  When this level also restricts upward, request stencil_up
+                # so the same handle can atomically deposit into its own parent.
+                if accumulate_to_coarser and level + 1 < num_levels:
                     restriction_accumulator_pn = loader.get_mres_write_handle(
                         restriction_accumulator_fd, neon.Loader.Operation.stencil_up
                     )
                 else:
-                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
                         restriction_accumulator_fd
                     )
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
@@ -911,9 +866,24 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 @wp.func
                 def device(index: Any):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
+                    has_child = wp.neon_has_child(f_0_pn, index)
+
+                    # This coarse halo will receive raw-last deposits from the
+                    # finer level later in the skeleton.  Clear the dedicated
+                    # int64 field locally now: one thread owns each cell/cardinality,
+                    # so no atomic reset or extra container is required.
+                    if has_child:
+                        for l in range(1, self.velocity_set.q):
+                            wp.neon_write(
+                                restriction_accumulator_pn,
+                                index,
+                                l,
+                                _restriction_accumulator_zero,
+                            )
+
                     if _boundary_id == wp.uint8(BC_SOLID):
                         return
-                    if not wp.neon_has_child(f_0_pn, index):
+                    if not has_child:
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
                         collision_pipeline(
                             index,
@@ -1012,12 +982,15 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 else:
                     f_0_pn = loader.get_mres_read_handle(f_0_fd)
                     f_1_pn = loader.get_mres_write_handle(f_1_fd)
-                if accumulate_to_coarser:
+                # Every parent collision clears its local child-halo accumulator
+                # cells.  When this level also restricts upward, request stencil_up
+                # so the same handle can atomically deposit into its own parent.
+                if accumulate_to_coarser and level + 1 < num_levels:
                     restriction_accumulator_pn = loader.get_mres_write_handle(
                         restriction_accumulator_fd, neon.Loader.Operation.stencil_up
                     )
                 else:
-                    restriction_accumulator_pn = loader.get_mres_read_handle(
+                    restriction_accumulator_pn = loader.get_mres_write_handle(
                         restriction_accumulator_fd
                     )
                 bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
@@ -1037,11 +1010,25 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                 @wp.func
                 def device(index: Any):
                     _boundary_id = wp.neon_read(bc_mask_pn, index, 0)
+                    has_child = wp.neon_has_child(f_0_pn, index)
+
+                    # CFV_collide_coarse is the first coarse collision container
+                    # in the SFV_ALL schedule.  Reset every child-halo target before
+                    # filtering solid/SFV cells so no halo can retain a prior sum.
+                    if has_child:
+                        for l in range(1, self.velocity_set.q):
+                            wp.neon_write(
+                                restriction_accumulator_pn,
+                                index,
+                                l,
+                                _restriction_accumulator_zero,
+                            )
+
                     if _boundary_id == wp.uint8(BC_SOLID):
                         return
                     if _boundary_id == wp.uint8(BC_SFV):
                         return
-                    if not wp.neon_has_child(f_0_pn, index):
+                    if not has_child:
                         _f0_thread, _missing_mask = neon_get_thread_data(f_0_pn, missing_mask_pn, index)
                         collision_pipeline(
                             index,
@@ -1900,7 +1887,6 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         return None, {
             "initialize_extrap_aux": initialize_extrap_aux,
-            "reset_restriction_accumulator": reset_restriction_accumulator,
             "collide_coarse": collide_coarse,
             "stream_coarse_step_ABC": stream_coarse_step_ABC,
             "finest_fused_pull": finest_fused_pull,

@@ -262,8 +262,9 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         each 2:1 adjacent-level interval.  This implements raw-last restriction
         throughout the hierarchy.
 
-        The integer restriction accumulator is reset immediately before the
-        first kernel that deposits the final fine state for a given interval.
+        The parent collision clears the dedicated integer accumulator on its
+        local child-halo cells before either fine substep executes.  This fuses
+        reset work into an existing container while preserving raw-last timing.
         """
         if level < 0:
             return
@@ -276,17 +277,6 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             for op_name, swap, extra_template in config["finest_ops"]:
                 base = fields_swapped if swap else fields
                 extra = dict(extra_template)
-                reset_before = bool(
-                    extra.pop("_reset_restriction_accumulator_before", False)
-                )
-                if reset_before:
-                    self.add_to_app(
-                        app=app,
-                        op_name="reset_restriction_accumulator",
-                        level=level,
-                        restriction_accumulator_fd=self.restriction_accumulator,
-                        bc_mask_fd=self.bc_mask,
-                    )
 
                 if op_name != "SFV_finest_fused_pull":
                     extra["restriction_accumulator_fd"] = self.restriction_accumulator
@@ -300,19 +290,6 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
                     **extra,
                 )
             return
-
-        # Non-fused raw-last restriction deposits into the dedicated integer
-        # field.  Reset the exact uncleVal targets before the accumulating
-        # collision container; the reset and accumulation are separate skeleton
-        # nodes, so no reset can race a deposit.
-        if accumulate_to_coarser:
-            self.add_to_app(
-                app=app,
-                op_name="reset_restriction_accumulator",
-                level=level,
-                restriction_accumulator_fd=self.restriction_accumulator,
-                bc_mask_fd=self.bc_mask,
-            )
 
         for op_name in config["coarse_collide_ops"]:
             collide_extra = {}
@@ -373,7 +350,6 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
                 "timestep": 0,
                 "is_f1_the_explosion_src_field": False,
                 "accumulate_to_coarser": True,
-                "_reset_restriction_accumulator_before": True,
                 "extrap_aux_fd": self.extrap_aux,
             }),
         ]
@@ -409,7 +385,6 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
                 "timestep": 0,
                 "is_f1_the_explosion_src_field": False,
                 "accumulate_to_coarser": True,
-                "_reset_restriction_accumulator_before": True,
                 "extrap_aux_fd": self.extrap_aux,
             }),
             ("CFV_MRES_BC_finest_fused_pull", True, {
