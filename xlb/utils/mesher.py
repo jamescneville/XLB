@@ -4110,8 +4110,6 @@ class MultiresIO(object):
         lengthScale = float(lengthScale)
         if not np.isfinite(lengthScale) or lengthScale <= 0.0:
             raise ValueError(f"lengthScale must be a positive finite value, got {lengthScale!r}")
-        if triangle_fraction is not None and not 0.0 < float(triangle_fraction) <= 1.0:
-            raise ValueError(f"triangle_fraction must be in (0, 1], got {triangle_fraction!r}")
 
         cell_scalar = np.asarray(cell_scalar, dtype=np.float32)
         centroids = self.centroids

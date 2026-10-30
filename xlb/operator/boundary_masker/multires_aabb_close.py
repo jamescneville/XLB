@@ -30,20 +30,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
         precision_policy: PrecisionPolicy = None,
         compute_backend: ComputeBackend = None,
         close_voxels: int = None,
-        protected_boundary_id: int = None,
-        ground_wheel_bc_overlap_to_solid: bool = False,
     ):
-        # SWT_CONTACT_SOLID_V1: either preserve existing ground BC voxels
-        # (legacy ground priority) or convert ONLY the ground voxels that
-        # the wheel masker would otherwise paint as wheel BC into solid 255.
-        # Set before super(): Operator.__init__ may construct GPU kernels.
-        protected_id = 0 if protected_boundary_id is None else int(protected_boundary_id)
-        if protected_id != 0 and not (1 <= protected_id <= 253):
-            raise ValueError('protected_boundary_id must be in 1..253 or None')
-        if ground_wheel_bc_overlap_to_solid and protected_id == 0:
-            raise ValueError('ground_wheel_bc_overlap_to_solid requires protected_boundary_id')
-        self.protected_boundary_id = protected_id
-        self.ground_wheel_bc_overlap_to_solid = bool(ground_wheel_bc_overlap_to_solid)
         super().__init__(velocity_set, precision_policy, compute_backend, close_voxels)
         if self.compute_backend in [ComputeBackend.JAX, ComputeBackend.WARP]:
             raise NotImplementedError(f"Operator {self.__class__.__name__} not supported in {self.compute_backend} backend.")
@@ -68,9 +55,6 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
         # Set local constants
         lattice_central_index = self.velocity_set.center_index
-        # Captured as a compile-time constant inside NEON/Warp functionals.
-        _protected_bc_id = self.protected_boundary_id
-        _ground_overlap_to_solid = self.ground_wheel_bc_overlap_to_solid
 
         @wp.func
         def mres_hit_normal_weight(
@@ -95,7 +79,62 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             return alignment * alignment * distance_weight * link_weight
 
 
-        
+        @wp.func
+        def reset_missing_mask_preserve_domain(
+            index: Any,
+            distances_pn: Any,
+            bc_mask_pn: Any,
+            missing_mask_pn: Any,
+            needs_mesh_distance: bool,
+            grid_shape: wp.vec3i,
+            level: Any,
+        ):
+            """
+            Reset a voxel's missing-mask state for AABB_CLOSE ownership while
+            preserving immutable physical-domain missing links.
+
+            A mesh BC may replace an indices-based domain BC on the same voxel.
+            The old AABB_CLOSE reset cleared every missing direction, including
+            pulls which physically leave the simulation domain.  Those links must
+            remain missing regardless of which BC ID owns the voxel.
+
+            For mesh-distance BCs, seed recovered physical-domain links with a
+            halfway-wall distance (q=0.5).  HybridBC decodes the distance for a
+            missing direction l from the known/opposite population slot
+            _opp_indices[l].
+            """
+            for l in range(_q):
+                pull_index, _ = self.helper_masker.get_pull_index(
+                    bc_mask_pn,
+                    wp.int32(l),
+                    index,
+                    level,
+                )
+
+                if not self.helper_masker.is_in_bounds(pull_index, grid_shape):
+                    self.write_field(
+                        missing_mask_pn,
+                        index,
+                        l,
+                        wp.uint8(True),
+                    )
+
+                    if needs_mesh_distance:
+                        self.write_field(
+                            distances_pn,
+                            index,
+                            _opp_indices[l],
+                            self.store_dtype(wp.float32(0.5)),
+                        )
+                else:
+                    self.write_field(
+                        missing_mask_pn,
+                        index,
+                        l,
+                        wp.uint8(False),
+                    )
+
+
         # Main AABB close: sets bc_mask, missing_mask, distances based on solid_mask
         # bc_mask: wp.uint8, missing_mask: wp.uint8, distances: dtype from precision policy (float)
         @wp.func
@@ -110,6 +149,8 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             needs_mesh_distance: bool,
             normal_vector: Any,
             normal_distance: Any,
+            grid_shape: wp.vec3i,
+            level: Any,
         ):
             reset_done = wp.bool(False)
 
@@ -117,15 +158,6 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
             solid_val = wp.neon_read(solid_mask_pn, index, 0)
             bc_val = wp.neon_read(bc_mask_pn, index, 0)
-
-            # Ground-priority mode: never overwrite ground (original behavior).
-            # Contact-solid mode: keep ground if the wheel's own solid-mask
-            # directly covers this cell. We want to convert ONLY ground cells
-            # that the following wheel-BC adjacency test would otherwise claim.
-            # In either case, all unrelated ground cells stay ground.
-            if _protected_bc_id != 0 and bc_val == wp.uint8(_protected_bc_id):
-                if not _ground_overlap_to_solid or solid_val == wp.uint8(BC_SOLID):
-                    return
 
             # Keep existing solid or already-owned boundary cells untouched.
             if solid_val == wp.uint8(BC_SOLID) or bc_val == wp.uint8(BC_SOLID):
@@ -171,27 +203,19 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 if nval != wp.uint8(BC_SOLID):
                     continue
 
-                # SWT_CONTACT_SOLID_V1: this ground voxel WOULD be assigned the
-                # wheel BC in the original AABB_CLOSE masker (a neighboring cell
-                # belongs to this wheel's temporary solid mask). Instead, make
-                # this particular overlap voxel solid. Do not convert ground
-                # cells merely because they are near a wheel BC or wheel solid
-                # unless they meet this precise wheel-BC assignment condition.
-                # The direct wheel-solid overlap case already returned above.
-                if _protected_bc_id != 0 and bc_val == wp.uint8(_protected_bc_id):
-                    wp.neon_write(bc_mask_pn, index, 0, wp.uint8(BC_SOLID))
-                    # Remove existing moving-ground missing links: this node
-                    # is no longer an active boundary condition or MEM surface.
-                    for l in range(_q):
-                        self.write_field(missing_mask_pn, index, l, wp.uint8(False))
-                    return
-
                 # If no mesh distance is requested, keep the base ownership behavior:
                 # mark the cell as boundary and flag the missing opposite link.
                 if not needs_mesh_distance:
                     if not reset_done:
-                        for l in range(_q):
-                            self.write_field( missing_mask_pn,  index, _opp_indices[l],   wp.uint8(False),  )
+                        reset_missing_mask_preserve_domain(
+                            index,
+                            distances_pn,
+                            bc_mask_pn,
+                            missing_mask_pn,
+                            needs_mesh_distance,
+                            grid_shape,
+                            level,
+                        )
                         reset_done = wp.bool(True)
 
                     self.write_field(bc_mask_pn, index, 0, wp.uint8(id_number))
@@ -212,8 +236,15 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 # solid-mask adjacency when the mesh ray did not actually resolve.                
 
                 if not reset_done:
-                    for l in range(_q):
-                        self.write_field( missing_mask_pn, index, _opp_indices[l], wp.uint8(False),)
+                    reset_missing_mask_preserve_domain(
+                        index,
+                        distances_pn,
+                        bc_mask_pn,
+                        missing_mask_pn,
+                        needs_mesh_distance,
+                        grid_shape,
+                        level,
+                    )
                     reset_done = wp.bool(True)             
 
                 self.write_field(bc_mask_pn, index, 0, wp.uint8(id_number))
@@ -516,6 +547,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             needs_mesh_distance: Any,            
             normal_vector: Any,
             normal_distance: Any,
+            grid_shape: Any,
             level: Any,
         ):
             def aabb_launcher(loader: neon.Loader):
@@ -539,7 +571,9 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                         solid_mask_pn,
                         needs_mesh_distance,
                         norm_vec_pn,
-                        norm_dist_pn
+                        norm_dist_pn,
+                        grid_shape,
+                        level,
                     )
 
                 loader.declare_kernel(aabb_kernel)
@@ -577,6 +611,11 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
         mesh_id, bc_id = self._prepare_kernel_inputs(bc, bc_mask)
 
         grid = bc_mask.get_grid()
+        # Physical-domain bounds are expressed in finest-level/global indices.
+        # get_pull_index() scales its offset by 2**level, matching the indices
+        # masker convention, so the same finest-grid shape is valid at all levels.
+        grid_shape = self.helper_masker.get_grid_shape(bc_mask)
+
         # Create fields using new_field
         solid_mask = grid.new_field(cardinality=1, dtype=wp.uint8, memory_type=neon.MemoryType.device())
         solid_mask_out = grid.new_field(
@@ -612,7 +651,17 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 solid_mask, solid_mask_out = solid_mask_out, solid_mask
 
             container_aabb = self.neon_container_dict["container_aabb"](
-                mesh_id, bc_id, distances, bc_mask, missing_mask, solid_mask, wp.static(bc.needs_mesh_distance), normal_vector, normal_distance, level
+                mesh_id,
+                bc_id,
+                distances,
+                bc_mask,
+                missing_mask,
+                solid_mask,
+                wp.static(bc.needs_mesh_distance),
+                normal_vector,
+                normal_distance,
+                grid_shape,
+                level,
             )
             container_aabb.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
 
