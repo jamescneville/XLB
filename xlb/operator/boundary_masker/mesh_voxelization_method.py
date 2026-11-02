@@ -2,7 +2,7 @@
 Mesh voxelization method registry.
 
 Defines the available voxelization strategies (AABB, Ray, AABB-Close,
-Winding) and provides a factory function to create the corresponding
+AABB-Solid, Winding) and provides a factory function to create the corresponding
 :class:`VoxelizationMethod` data object.
 """
 
@@ -14,6 +14,7 @@ METHODS = {
     "RAY": 2,
     "AABB_CLOSE": 3,
     "WINDING": 4,
+    "AABB_SOLID": 5,
 }
 
 
@@ -28,7 +29,7 @@ class VoxelizationMethod:
     name : str
         Human-readable name (``"AABB"``, ``"RAY"``, etc.).
     options : dict
-        Extra options (e.g. ``close_voxels`` for AABB_CLOSE).
+        Extra options (e.g. ``close_voxels`` for AABB_CLOSE and AABB_SOLID).
     """
 
     id: int
@@ -42,7 +43,7 @@ def MeshVoxelizationMethod(name: str, **options):
     Parameters
     ----------
     name : str
-        One of ``"AABB"``, ``"RAY"``, ``"AABB_CLOSE"``, ``"WINDING"``.
+        One of ``"AABB"``, ``"RAY"``, ``"AABB_CLOSE"``, ``"AABB_SOLID"``, ``"WINDING"``.
     **options
         Additional keyword arguments forwarded to
         ``VoxelizationMethod.options``.

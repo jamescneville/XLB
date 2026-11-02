@@ -357,6 +357,7 @@ class MeshBoundaryMasker(Operator):
             points=wp.array(mesh_vertices, dtype=wp.vec3),
             indices=wp.array(mesh_indices, dtype=wp.int32),
         )
+        self._mesh = mesh  # mesh_id is only a handle: keep the BVH alive for as long as the masker is
         mesh_id = wp.uint64(mesh.id)
         bc_id = bc.id
         return mesh_id, bc_id

@@ -1574,11 +1574,11 @@ def setup_boundary_conditions_DoNothing(grid, level_data, body_vertices, wheel_v
     if jsonfile['BCtypes']['car_voxelization'] == "RAY":
         CarvoxelizationMethod = MeshVoxelizationMethod("RAY")
     else:
-        CarvoxelizationMethod = MeshVoxelizationMethod("AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
+        CarvoxelizationMethod = MeshVoxelizationMethod("AABB_SOLID" if jsonfile['BCtypes']['car_voxelization'] == "AABB_SOLID" else "AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
     if jsonfile['BCtypes']['wheel_voxelization'] == "RAY":
         WheelvoxelizationMethod = MeshVoxelizationMethod("RAY")
     else:
-        WheelvoxelizationMethod = MeshVoxelizationMethod("AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
+        WheelvoxelizationMethod = MeshVoxelizationMethod("AABB_SOLID" if jsonfile['BCtypes']['wheel_voxelization'] == "AABB_SOLID" else "AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
     #Setup car bc
     if jsonfile['BCtypes']['car'] == "nonequilibrium_regularized":
         bc_body = HybridBC(
@@ -1769,11 +1769,11 @@ def setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vert
     if jsonfile['BCtypes']['car_voxelization'] == "RAY":
         CarvoxelizationMethod = MeshVoxelizationMethod("RAY")
     else:
-        CarvoxelizationMethod = MeshVoxelizationMethod("AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
+        CarvoxelizationMethod = MeshVoxelizationMethod("AABB_SOLID" if jsonfile['BCtypes']['car_voxelization'] == "AABB_SOLID" else "AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
     if jsonfile['BCtypes']['wheel_voxelization'] == "RAY":
         WheelvoxelizationMethod = MeshVoxelizationMethod("RAY")
     else:
-        WheelvoxelizationMethod = MeshVoxelizationMethod("AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
+        WheelvoxelizationMethod = MeshVoxelizationMethod("AABB_SOLID" if jsonfile['BCtypes']['wheel_voxelization'] == "AABB_SOLID" else "AABB_CLOSE", close_voxels=jsonfile['mesher']['close_voxels'])
     #Setup car bc
     if jsonfile['BCtypes']['car'] == "nonequilibrium_regularized":
         bc_body = HybridBC(

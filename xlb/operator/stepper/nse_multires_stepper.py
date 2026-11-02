@@ -87,6 +87,7 @@ from xlb.operator.boundary_masker import (
     MeshVoxelizationMethod,
     MultiresMeshMaskerAABB,
     MultiresMeshMaskerAABBClose,
+    MultiresMeshMaskerAABBSolid,
     MultiresIndicesBoundaryMasker,
     MultiresMeshMaskerRay,
     MultiresMeshMaskerTrapped,
@@ -352,6 +353,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
         # Process mesh-based boundary conditions for 3D
         if DefaultConfig.velocity_set.d == 3 and bc_with_vertices:
+            # Enclosed regions are searched once, by the last AABB_SOLID mesh, once every earlier mesh is in bc_mask
+            solid_bcs = [bc for bc in bc_with_vertices if bc.voxelization_method.id is MeshVoxelizationMethod("AABB_SOLID").id]
             for bc in bc_with_vertices:
                 if bc.voxelization_method.id is MeshVoxelizationMethod("AABB").id:
                     mesh_masker = MultiresMeshMaskerAABB(
@@ -371,6 +374,14 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                         precision_policy=DefaultConfig.default_precision_policy,
                         compute_backend=DefaultConfig.default_backend,
                         close_voxels=bc.voxelization_method.options.get("close_voxels"),
+                    )
+                elif bc.voxelization_method.id is MeshVoxelizationMethod("AABB_SOLID").id:
+                    mesh_masker = MultiresMeshMaskerAABBSolid(
+                        velocity_set=DefaultConfig.velocity_set,
+                        precision_policy=DefaultConfig.default_precision_policy,
+                        compute_backend=DefaultConfig.default_backend,
+                        close_voxels=bc.voxelization_method.options.get("close_voxels"),
+                        fill_enclosed=bc is solid_bcs[-1],
                     )
                 else:
                     raise ValueError(f"Unsupported voxelization method for multi-res: {bc.voxelization_method}")
