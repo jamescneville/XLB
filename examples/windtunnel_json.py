@@ -4,6 +4,7 @@ import warp as wp
 import numpy as np
 import os, sys, time, trimesh
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1866,11 +1867,17 @@ def setup_boundary_conditions_extrap(grid, level_data, body_vertices, wheel_vert
         return [bc_body, bc_outlet, bc_top, bc_bottom, bc_front, bc_back, bc_inlet] # Body must be last. Outlet must be second to last
 # Utility Functions
 # =================
-def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center=None,rear_center=None,):
+def print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center=None,rear_center=None, accumulate=False):
     """
     Calculate and print lift and drag coefficients.
+
+    accumulate=True also adds this evaluation to each operator's per-cell force mean
+    (used by write_drag_development).
     """
     start = time.time()
+    momentum_transfer.accumulate_cells = accumulate
+    for mt in (wheel_momentum or []):
+        mt.accumulate_cells = accumulate
     boundary_force = momentum_transfer(sim.f_0, sim.f_1, sim.bc_mask, sim.missing_mask, sim.rho0, sim.u0, sim.relax, sim.normal_vector, sim.normal_distance)
     print(f"Momentum Force Time {time.time()-start:.4f} seconds") 
     wheel_force = [0.0, 0.0, 0.0]
@@ -1955,6 +1962,133 @@ def plot_drag_lift(drag_values, output_dir, script_name, percentile_range=(15, 8
         plt.yscale('log')
     plt.savefig(os.path.join(output_dir, 'drag_lift_plot.png'))
     plt.close()
+
+def write_drag_development(momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, output_dir,
+                           plot_aspect=0.5, cd_peak_frac=0.8, cl_peak_frac=0.8):
+    """
+    Write cumulative Cd and Cl versus streamwise position (nose to tail) as CSV and PNG.
+
+    Uses the per-cell momentum-exchange forces (same values that sum to the reported
+    force), binned per finest voxel column in x, wheels included. Both coefficients
+    use the single full-car reference area, so the curves end at the total Cd and Cl.
+    The side-view
+    outline comes from the same boundary cells, in two styles for comparison:
+    "voxel" (stair-stepped) and "centres" (voxel centres joined). Wheels are drawn
+    as filled circles over the body so the underbody is hidden behind them.
+
+    Axes are true scale in metres (equal aspect) with the car on y=0. See the
+    plot_aspect / cd_peak_frac / cl_peak_frac layout comment below.
+    """
+    try:
+        body = momentum_transfer.get_cell_forces()
+        if body is None:
+            return
+        wheels = [w for w in (mt.get_cell_forces() for mt in (wheel_momentum or [])) if w is not None]
+        xyz = np.concatenate([body[0]] + [w[0] for w in wheels])
+        scale = 2.0 / (ulb**2 * reference_area)
+
+        x0 = int(xyz[:, 0].min())
+        nbin = int(xyz[:, 0].max()) - x0 + 1
+        length = nbin * voxel_size
+        x_edge = np.arange(nbin + 1) * voxel_size
+
+        def profile(cells):
+            zmin = np.full(nbin, np.inf)
+            zmax = np.full(nbin, -np.inf)
+            cx = (cells[:, 0] - x0).astype(np.int64)
+            np.minimum.at(zmin, cx, cells[:, 2])
+            np.maximum.at(zmax, cx, cells[:, 2])
+            keep = np.isfinite(zmin)
+            return np.nonzero(keep)[0], zmin[keep], zmax[keep]
+
+        def outline(prof, style):
+            # Closed polygon in metres: top profile nose to tail, then bottom profile back.
+            i, zmin, zmax = prof
+            if style == "voxel":
+                xs = np.column_stack([i, i + 1]).ravel() * voxel_size
+                top, bot = np.repeat(zmax + 0.5, 2) * voxel_size, np.repeat(zmin - 0.5, 2) * voxel_size
+            else:
+                xs = (i + 0.5) * voxel_size
+                top, bot = zmax * voxel_size, zmin * voxel_size
+            return np.concatenate([xs, xs[::-1]]), np.concatenate([top, bot[::-1]])
+
+        body_prof = profile(body[0])
+        # A wheel outline uses its longest run of contiguous columns, so a stray boundary cell cannot drag a
+        # sliver across the plot. Anything dropped is reported.
+        def main_run(prof, label):
+            i, zmin, zmax = prof
+            runs = np.split(np.arange(len(i)), np.flatnonzero(np.diff(i) > 1) + 1)
+            keep = max(runs, key=len)
+            if len(keep) < len(i):
+                dropped = np.setdiff1d(np.arange(len(i)), keep)
+                print(f"Warning: {label} has {len(dropped)} column(s) outside its main outline, at x = "
+                      f"{np.round((i[dropped] + x0) * voxel_size, 3).tolist()} m (z {np.round(zmin[dropped] * voxel_size, 3).tolist()} "
+                      f"to {np.round(zmax[dropped] * voxel_size, 3).tolist()} m): not drawn")
+            return i[keep], zmin[keep], zmax[keep]
+
+        wheel_profs = [main_run(profile(w[0]), f"wheel {k}") for k, w in enumerate(wheels)]
+
+        # Every boundary cell, body and wheels alike, is binned where it sits
+        cells = [body] + wheels
+        ix = np.concatenate([(c[0][:, 0] - x0) for c in cells]).astype(np.int64)
+        fx = np.bincount(ix, weights=np.concatenate([c[1][:, 0] for c in cells]), minlength=nbin)
+        fz = np.bincount(ix, weights=np.concatenate([c[1][:, 2] for c in cells]), minlength=nbin)
+        np.savez_compressed(os.path.join(output_dir, "drag_development_cells.npz"), x0=x0, voxel_size=voxel_size,
+                            **{f"{name}_{field}": data for name, cell in zip(["body"] + [f"wheel{k}" for k in range(len(wheels))], cells)
+                               for field, data in zip(["xyz", "force"], cell)})
+        cd = np.concatenate([[0.0], np.cumsum(fx)]) * scale
+        cl = np.concatenate([[0.0], np.cumsum(fz)]) * scale
+        print(f"Drag development: Cd={cd[-1]:.4f}, Cl={cl[-1]:.4f} over {nbin} voxel columns")
+
+        with open(os.path.join(output_dir, "drag_development.csv"), 'w') as fd:
+            fd.write("x_m,Cd_cum,Cl_cum\n")
+            for xm, c_d, c_l in zip(x_edge, cd, cl):
+                fd.write(f"{xm},{c_d},{c_l}\n")
+        height = float(np.concatenate([body[0][:, 2]] + [w[0][:, 2] for w in wheels]).max()) * voxel_size
+
+        # Fixed proportions so plots look alike between cars: the plot is plot_aspect * length tall,
+        # the final Cd reaches cd_peak_frac of that height, and the largest |Cl| reaches
+        # cl_peak_frac of the half-height around a zero line drawn at mid car height.
+        plot_h = plot_aspect * length
+        panels = (
+            ('Cd', cd, cd[-1], 0.0, cd_peak_frac * plot_h, (0.0, plot_h), 'tab:blue'),
+            ('Cl', cl, np.abs(cl).max(), height / 2.0, cl_peak_frac * plot_h / 2.0,
+             (height / 2.0 - plot_h / 2.0, height / 2.0 + plot_h / 2.0), 'tab:red'),
+        )
+
+        names = {'Cd': 'drag', 'Cl': 'lift'}
+        for style in ("voxel", "centres"):
+            fig, axes = plt.subplots(2, 1, figsize=(11, 11))
+            for ax, (label, y, ref, zero, peak, ylim, color) in zip(axes, panels):
+                ref = ref if abs(ref) > 1.0e-12 else 1.0
+                gain = peak / ref
+                px, pz = outline(body_prof, style)
+                ax.plot(px, pz, color='0.3', linewidth=1.0, zorder=1)
+                for wheel_prof in wheel_profs:
+                    wx, wz = outline(wheel_prof, style)
+                    ax.fill(wx, wz, facecolor='white', edgecolor='0.3', linewidth=1.0, zorder=2)
+                ax.axhline(0.0, color='0.5', linewidth=0.8, zorder=0)
+                if zero != 0.0:
+                    ax.axhline(zero, color=color, linewidth=0.8, linestyle='--', zorder=0)
+                ax.plot(x_edge, zero + y * gain, color=color, linewidth=2.0, zorder=3)
+                ax.set_xlim(0.0, length)
+                ax.set_ylim(*ylim)
+                ax.set_aspect('equal', adjustable='box')
+                ticks = MaxNLocator(nbins=6).tick_values((ylim[0] - zero) / gain, (ylim[1] - zero) / gain)
+                pos = zero + ticks * gain
+                inside = (pos >= ylim[0] - 1e-9) & (pos <= ylim[1] + 1e-9)
+                ax.set_yticks(pos[inside])
+                ax.set_yticklabels([f'{t:g}' for t in ticks[inside]])
+                ax.grid(True, linestyle=':')
+                ax.set_ylabel(f'Accumulated {label}')
+                ax.set_title(f'Accumulated {names[label]} coefficient ({label}) along vehicle length: final {label} = {y[-1]:.4f}')
+                ax.set_xlabel('Position (m)')
+            fig.tight_layout()
+            fig.savefig(os.path.join(output_dir, f'drag_development_{style}.png'), dpi=150)
+            plt.close(fig)
+    except Exception as e:
+        print(f"Warning: drag development output failed: {e}")
+
 
 def infer_axle_reference_points_from_voxels(solid_voxel_indices, flow_direction=1.0, ground_z=0.0, min_contact_layers=2, max_contact_layers=4,  max_internal_x_gap=2,
 ):
@@ -3100,7 +3234,7 @@ def solve(
             force_output_interval = forcePrint_interval if step < crossover_step else final_forcePrint_interval
             if step % force_output_interval == 0 or step == num_steps - 1 or time_out:
                 sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                
-                cd, cl, drag, cl_f, cl_r = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center, rear_center)
+                cd, cl, drag, cl_f, cl_r = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center, rear_center, accumulate=step >= crossover_step)
                 wp.synchronize()
                 total_lattice_updates = total_lattice_updates_per_step * steps_since_last_print
                 MLUPS = total_lattice_updates / compute_time / 1e6 if compute_time > 0 else 0.0
@@ -3140,6 +3274,7 @@ def solve(
                     fd.write(f"{step},{cd},{cl},{cl_f},{cl_r}\n")
 
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
+            write_drag_development(momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, output_dir)
 
             # Calculate and print average Cd and Cl for the last cutover%
             drag_values_array = np.array(drag_values)
@@ -3365,7 +3500,7 @@ def solve(
                     wp.synchronize()
                     interval_compute_time += time.time() - interval_start
                     sim.macro(sim.f_0, sim.bc_mask, sim.rho, sim.u, streamId=0)                    
-                    cd, cl, drag, cl_f, cl_r = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center, rear_center)                    
+                    cd, cl, drag, cl_f, cl_r = print_lift_drag(sim, step, momentum_transfer, wheel_momentum, ulb, reference_area, drag_values, front_center, rear_center, accumulate=step >= crossover_step)
                     wp.synchronize()
                     scm_results_available() 
                     interval_start = time.time()
@@ -3520,6 +3655,7 @@ def solve(
                 for step, cd, cl, cl_f, cl_r in drag_values:
                     fd.write(f"{step},{cd},{cl},{cl_f},{cl_r}\n")
             plot_drag_lift(drag_values, output_dir, jsonfile['outputName'])
+            write_drag_development(momentum_transfer, wheel_momentum, ulb, reference_area, voxel_size, output_dir)
 
             # Calculate and print average Cd and Cl after crossover step
             drag_values_array = np.array(drag_values)

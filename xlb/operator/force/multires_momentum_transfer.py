@@ -13,6 +13,12 @@ from xlb.operator.force import MomentumTransfer
 from xlb.mres_perf_optimization_type import MresPerfOptimizationType
 
 
+@wp.kernel
+def _accumulate_cell_force(src: wp.array(dtype=wp.vec3d), dst: wp.array(dtype=wp.vec3d)):
+    i = wp.tid()
+    dst[i] = dst[i] + src[i]
+
+
 class MultiresMomentumTransfer(MomentumTransfer):
     """Compute boundary forces on L0 without floating-point atomic accumulation.
 
@@ -67,6 +73,12 @@ class MultiresMomentumTransfer(MomentumTransfer):
         self._force_buf = None
         self._moment_buf = None
         self._force_container = None
+
+        # Optional per-cell force accumulation (set accumulate_cells before a force
+        # evaluation to include it in the running mean returned by get_cell_forces).
+        self.accumulate_cells = False
+        self._cell_sum = None
+        self._cell_samples = 0
 
         super().__init__(
             no_slip_bc_instance,
@@ -301,6 +313,7 @@ class MultiresMomentumTransfer(MomentumTransfer):
         self._l0_masks = (bc_mask, missing_mask)
         self._force_buf = wp.empty((n,), dtype=wp.vec3d)
         self._moment_buf = wp.empty((n if self.moment_reference_point is not None else 1,), dtype=wp.vec3d)
+        self._cell_sum = wp.zeros((n,), dtype=wp.vec3d)
         #print(f"MomentumTransfer BC {self.no_slip_bc_instance.id}: {n} L0 boundary cells")
 
     @Operator.register_backend(ComputeBackend.NEON)
@@ -340,4 +353,25 @@ class MultiresMomentumTransfer(MomentumTransfer):
         wp.utils.array_sum(self._force_buf, out=self.force)
         if self.moment_reference_point is not None:
             wp.utils.array_sum(self._moment_buf, out=self.moment)
+        if self.accumulate_cells:
+            wp.launch(_accumulate_cell_force, dim=n, inputs=[self._force_buf, self._cell_sum])
+            self._cell_samples += 1
         return self.force.numpy()[0]
+
+    def get_cell_forces(self):
+        """Return finest-level boundary-cell indices (n, 3) and per-cell force (n, 3).
+
+        The force is the mean over the accumulated evaluations, or the most recent
+        evaluation if none were accumulated. Per-cell values are the same ones that
+        are summed into the total, so they include the reference_density correction.
+        Returns None before the first force evaluation.
+        """
+        if self._l0_keys is None or self._l0_keys.size == 0:
+            return None
+        keys = self._l0_keys.numpy()
+        xyz = np.stack([keys >> 42, (keys >> 21) & 0x1FFFFF, keys & 0x1FFFFF], axis=1)
+        if self._cell_samples > 0:
+            force = self._cell_sum.numpy() / self._cell_samples
+        else:
+            force = self._force_buf.numpy()
+        return xyz, force
