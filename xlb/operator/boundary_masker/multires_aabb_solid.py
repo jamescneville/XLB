@@ -2,12 +2,13 @@
 Multi-resolution AABB-Solid boundary masker.
 
 AABB-Close, plus: fluid that cannot reach the domain exterior through face-connected fluid, on any combination of
-levels, is retagged as solid (255) before boundaries are assigned. Hollow bodies and wheel cavities that the AABB
-shell leaves sealed become solid, so no boundary cells are created inside them.
+levels, is retagged as solid (255). Hollow bodies and wheel cavities that the AABB shell leaves sealed become solid,
+so the flow solver does not run inside them.
 
-Solid means this mesh's solid mask or a solid cell already in ``bc_mask`` from a mesh masked earlier (the stepper
-masks the body first, then each wheel). A cavity that the wheel and the body only seal together is therefore found
-when the wheel is masked.
+The search runs once, after the boundaries of the last AABB-Solid mesh are in ``bc_mask``. Solid is simply
+``bc_mask == 255``, which by then holds every mesh, so a cavity that the wheel and the body only seal together is
+found. Enclosed cells are tagged in ``bc_mask`` directly and never go through a boundary pass, so no mesh BC (a
+rotating wheel, say) can end up owning boundary cells it did not create.
 
 The search runs entirely on the Neon grid. A single uint8 ``reach`` field is relaxed in place until nothing changes:
 
@@ -53,8 +54,8 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
     Parameters
     ----------
     fill_enclosed : bool
-        Search for enclosed regions in this call. The search covers every solid cell already in ``bc_mask``, so it only
-        needs to run once, for the last mesh. Otherwise this masker behaves like AABB-Close.
+        Search for enclosed regions after this mesh. The search covers every solid cell already in ``bc_mask``, so it
+        only needs to run once, for the last mesh. Otherwise this masker behaves like AABB-Close.
     seed_floor : bool
         If False (default) the lower z face of the domain is the ground, not an exterior opening, so a cavity that only
         touches the ground is still sealed. If True it counts as exterior like the other faces.
@@ -115,10 +116,9 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
 
         # One relaxation step on one level
         @neon.Container.factory(name="EnclosedFluidRelax")
-        def relax(solid_mask: Any, bc_mask: Any, reach: Any, changed: Any, level: Any):
+        def relax(bc_mask: Any, reach: Any, changed: Any, level: Any):
             def launcher(loader: neon.Loader):
-                loader.set_mres_grid(solid_mask.get_grid(), level)
-                solid_pn = loader.get_mres_read_handle(solid_mask)
+                loader.set_mres_grid(bc_mask.get_grid(), level)
                 bc_pn = loader.get_mres_read_handle(bc_mask)
                 reach_pn = loader.get_mres_write_handle(reach)
 
@@ -140,7 +140,7 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
                                         if cval != wp.uint8(0):
                                             found = wp.bool(True)
                     else:
-                        if wp.neon_read(solid_pn, index, 0) == wp.uint8(BC_SOLID) or wp.neon_read(bc_pn, index, 0) == wp.uint8(BC_SOLID):
+                        if wp.neon_read(bc_pn, index, 0) == wp.uint8(BC_SOLID):
                             return
                         if reached_through_face(index, reach_pn, 1, 0, 0):
                             found = wp.bool(True)
@@ -165,21 +165,20 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
 
         # Fluid leaf cells that were never reached become solid
         @neon.Container.factory(name="EnclosedFluidTag")
-        def tag(solid_mask: Any, bc_mask: Any, reach: Any, tagged: Any, level: Any):
+        def tag(bc_mask: Any, reach: Any, tagged: Any, level: Any):
             def launcher(loader: neon.Loader):
-                loader.set_mres_grid(solid_mask.get_grid(), level)
-                solid_pn = loader.get_mres_write_handle(solid_mask)
-                bc_pn = loader.get_mres_read_handle(bc_mask)
+                loader.set_mres_grid(bc_mask.get_grid(), level)
+                bc_pn = loader.get_mres_write_handle(bc_mask)
                 reach_pn = loader.get_mres_read_handle(reach)
 
                 @wp.func
                 def kernel(index: Any):
-                    if wp.neon_has_child(solid_pn, index):
+                    if wp.neon_has_child(bc_pn, index):
                         return
-                    if wp.neon_read(solid_pn, index, 0) == wp.uint8(BC_SOLID) or wp.neon_read(bc_pn, index, 0) == wp.uint8(BC_SOLID):
+                    if wp.neon_read(bc_pn, index, 0) == wp.uint8(BC_SOLID):
                         return
                     if wp.neon_read(reach_pn, index, 0) == wp.uint8(0):
-                        wp.neon_write(solid_pn, index, 0, wp.uint8(BC_SOLID))
+                        wp.neon_write(bc_pn, index, 0, wp.uint8(BC_SOLID))
                         wp.atomic_add(tagged, level, 1)
 
                 loader.declare_kernel(kernel)
@@ -193,7 +192,7 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
     def neon_implementation(self, bc, distances, bc_mask, missing_mask, normal_vector, normal_distance, stream=0):
         return super().neon_implementation(bc, distances, bc_mask, missing_mask, normal_vector, normal_distance, stream)
 
-    def _finalize_solid_mask(self, grid, solid_mask, bc_mask, stream):
+    def _finalize_bc_mask(self, grid, bc_mask, stream):
         if not self.fill_enclosed:
             return
         t0 = time.time()
@@ -206,7 +205,7 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
             reach.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
 
         # Built once, launched many times
-        relax = {level: self.relax_container(solid_mask, bc_mask, reach, changed, level) for level in levels}
+        relax = {level: self.relax_container(bc_mask, reach, changed, level) for level in levels}
         sweep = levels + levels[-2::-1]  # fine to coarse, then back to fine
 
         passes = 0
@@ -225,7 +224,7 @@ class MultiresMeshMaskerAABBSolid(MultiresMeshMaskerAABBClose):
         tagged.zero_()
         wp.synchronize()
         for level in levels:
-            self.tag_container(solid_mask, bc_mask, reach, tagged, level).run(0, container_runtime=run)
+            self.tag_container(bc_mask, reach, tagged, level).run(0, container_runtime=run)
         grid.backend.sync()
         counts = [int(n) for n in tagged.numpy()[: len(levels)]]
         print(f"\tAABB_SOLID: {sum(counts):,} enclosed fluid cells made solid ({counts} per level), {passes} passes, search {t_search:.1f} s, total {time.time() - t0:.1f} s", flush=True)

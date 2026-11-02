@@ -594,8 +594,8 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
         return functional_dict, container_dict
 
-    def _finalize_solid_mask(self, grid, solid_mask, bc_mask, stream):
-        """Hook for subclasses: called once the solid mask is complete on every level, before boundaries are assigned."""
+    def _finalize_bc_mask(self, grid, bc_mask, stream):
+        """Hook for subclasses: called once the boundaries of this mesh are in bc_mask."""
 
     @Operator.register_backend(ComputeBackend.NEON)
     def neon_implementation(
@@ -653,9 +653,6 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             if self.close_voxels % 2 > 0:
                 solid_mask, solid_mask_out = solid_mask_out, solid_mask
 
-        self._finalize_solid_mask(grid, solid_mask, bc_mask, stream)
-
-        for level in range(grid.num_levels):
             container_aabb = self.neon_container_dict["container_aabb"](
                 mesh_id,
                 bc_id,
@@ -670,5 +667,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 level,
             )
             container_aabb.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+
+        self._finalize_bc_mask(grid, bc_mask, stream)
 
         return distances, bc_mask, missing_mask, normal_vector, normal_distance
