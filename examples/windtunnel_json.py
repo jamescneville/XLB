@@ -936,45 +936,36 @@ def trim_wheel_with_plinth(
     plinth_voxels=None,
 ):
     """
-    Trim wheel using the existing slice_plane(..., cap=True) workflow and
-    append a plinth beneath the generated trim plane.
+    Trim a mesh and add a plinth surface below the trim plane.
 
-    The resulting mesh does NOT need to be watertight. The intent is simply
-    to provide additional STL surface geometry beneath the trimmed wheel for
-    AABB_CLOSE voxelization.
+    The plinth footprint is the 2D convex hull of all mesh/plane intersection
+    points. This avoids requiring closed section contours. Its surface consists
+    of vertical perimeter triangles and a triangulated bottom patch; it does
+    not need to be watertight.
 
-    No boolean engine is required.
-    No Path3D.to_2D()/to_planar() is required.
+    If trimming or plinth generation fails for a valid Trimesh input, this
+    function logs a warning and returns an unchanged copy of the input mesh.
+    The returned info dictionary records whether the plinth was created or the
+    original mesh was used as a fallback.
 
     Parameters
     ----------
     mesh : trimesh.Trimesh
-        Original wheel mesh in physical/model coordinates.
-
+        Original mesh in physical/model coordinates.
     voxel_size : float
-        Finest physical voxel size.
-
+        Finest physical voxel size, in the same units as the mesh coordinates.
     trim_voxels : float
-        Height of trim plane above original wheel minimum Z, in finest voxels.
-
+        Cut height above the original mesh minimum Z, in finest voxels.
     plinth_voxels : float or None
-        Height of plinth below trim plane, in finest voxels.
-
-        If None:
-            plinth_voxels = trim_voxels
-
-        Thus trim_voxels=1 and plinth_voxels=None:
-            - trim one voxel above original tire bottom
-            - extend plinth one voxel down
-            - plinth bottom returns to original tire minimum Z
+        Plinth height below the cut, in finest voxels. Defaults to
+        trim_voxels.
 
     Returns
     -------
     result : trimesh.Trimesh
-        Trimmed/capped wheel plus appended plinth geometry.
-
+        Trimmed mesh with plinth, or the original mesh copy on failure.
     info : dict
-        Geometry diagnostics.
+        Geometry diagnostics and fallback status.
     """
 
     if not isinstance(mesh, trimesh.Trimesh):
@@ -983,346 +974,202 @@ def trim_wheel_with_plinth(
         )
 
     if mesh.is_empty:
-        raise ValueError("Cannot trim an empty wheel mesh")
+        raise ValueError("Cannot trim an empty mesh")
 
-    voxel_size = float(voxel_size)
-    trim_voxels = float(trim_voxels)
+    # Keep a clean fallback copy. Any ordinary error during the cut or
+    # plinth construction returns this unchanged mesh to the caller.
+    original = mesh.copy()
+    original_bounds = np.asarray(original.bounds, dtype=np.float64)
+    original_min_z = float(original_bounds[0][2])
+    original_max_z = float(original_bounds[1][2])
 
-    if voxel_size <= 0.0:
-        raise ValueError("voxel_size must be positive")
+    try:
+        voxel_size = float(voxel_size)
+        trim_voxels = float(trim_voxels)
 
-    if trim_voxels <= 0.0:
-        raise ValueError("trim_voxels must be positive")
+        if voxel_size <= 0.0:
+            raise ValueError("voxel_size must be positive")
+        if trim_voxels <= 0.0:
+            raise ValueError("trim_voxels must be positive")
 
-    if plinth_voxels is None:
-        plinth_voxels = trim_voxels
+        if plinth_voxels is None:
+            plinth_voxels = trim_voxels
+        plinth_voxels = float(plinth_voxels)
 
-    plinth_voxels = float(plinth_voxels)
+        if plinth_voxels <= 0.0:
+            raise ValueError("plinth_voxels must be positive")
 
-    if plinth_voxels <= 0.0:
-        raise ValueError("plinth_voxels must be positive")
+        trim_height = trim_voxels * voxel_size
+        plinth_height = plinth_voxels * voxel_size
+        cut_z = original_min_z + trim_height
+        bottom_z = cut_z - plinth_height
 
-    source = mesh.copy()
+        if cut_z >= original_max_z:
+            raise ValueError(
+                f"Trim plane is at or above mesh top: "
+                f"cut_z={cut_z}, max_z={original_max_z}"
+            )
 
-    original_min_z = float(source.bounds[0][2])
-    original_max_z = float(source.bounds[1][2])
+        plane_origin = np.array([0.0, 0.0, cut_z], dtype=np.float64)
+        plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-    trim_height = trim_voxels * voxel_size
-    plinth_height = plinth_voxels * voxel_size
-
-    cut_z = original_min_z + trim_height
-    bottom_z = cut_z - plinth_height
-
-    if cut_z >= original_max_z:
-        raise ValueError(
-            f"Trim plane is above wheel top: "
-            f"cut_z={cut_z}, max_z={original_max_z}"
+        # Do not ask Trimesh to cap the cut. The plinth is generated from
+        # the section point cloud below and does not depend on closed loops.
+        trimmed = original.slice_plane(
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
+            cap=False,
         )
 
-    plane_origin = np.array(
-        [0.0, 0.0, cut_z],
-        dtype=np.float64,
-    )
+        if trimmed is None or trimmed.is_empty:
+            raise RuntimeError("The trim operation produced an empty mesh")
 
-    plane_normal = np.array(
-        [0.0, 0.0, 1.0],
-        dtype=np.float64,
-    )
-
-    # ==============================================================
-    # 1. Existing production-style trimmed + capped tire
-    # ==============================================================
-
-    trimmed = source.slice_plane(
-        plane_origin=plane_origin,
-        plane_normal=plane_normal,
-        cap=True,
-    )
-
-    if trimmed is None or trimmed.is_empty:
-        raise RuntimeError(
-            "slice_plane(..., cap=True) produced an empty wheel"
+        section = original.section(
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
         )
 
-    # ==============================================================
-    # 2. Get the REAL trim contour directly from the original mesh
-    #
-    # Path3D.discrete gives us the actual cut loops as 3-D point
-    # sequences. This avoids trying to reconstruct the perimeter from
-    # the triangulated cap.
-    # ==============================================================
+        if section is None or len(section.entities) == 0:
+            raise RuntimeError(
+                f"No section points found at trim plane z={cut_z}"
+            )
 
-    section = source.section(
-        plane_origin=plane_origin,
-        plane_normal=plane_normal,
-    )
+        point_arrays = []
+        for entity in section.entities:
+            points = np.asarray(
+                entity.discrete(section.vertices),
+                dtype=np.float64,
+            )
+            if points.ndim == 2 and points.shape[0] > 0:
+                point_arrays.append(points[:, :2])
 
-    if section is None:
-        raise RuntimeError(
-            f"No wheel intersection found at trim plane z={cut_z}"
-        )
+        if not point_arrays:
+            raise RuntimeError(
+                f"No usable section points found at trim plane z={cut_z}"
+            )
 
-    contours = section.discrete
+        xy = np.vstack(point_arrays)
+        xy = xy[np.all(np.isfinite(xy), axis=1)]
+        xy = np.unique(xy, axis=0)
 
-    if contours is None or len(contours) == 0:
-        raise RuntimeError(
-            "Wheel trim section contains no discrete contours"
-        )
+        if len(xy) < 3:
+            raise RuntimeError(
+                f"Need at least three distinct section points; found {len(xy)}"
+            )
 
-    # ==============================================================
-    # 3. Build vertical plinth walls
-    # ==============================================================
+        # Normalize coordinates before the rank check and hull calculation
+        # to reduce sensitivity to model size and coordinate offset.
+        centered_xy = xy - xy.mean(axis=0)
+        xy_scale = float(np.max(np.ptp(centered_xy, axis=0)))
 
-    wall_vertices = []
-    wall_faces = []
+        if not np.isfinite(xy_scale) or xy_scale <= 0.0:
+            raise RuntimeError("Section points have no 2D extent")
 
-    num_wall_segments = 0
+        normalized_xy = centered_xy / xy_scale
+        if np.linalg.matrix_rank(normalized_xy) < 2:
+            raise RuntimeError(
+                "Section points are collinear; cannot form a 2D footprint"
+            )
 
-    for contour in contours:
+        from scipy.spatial import ConvexHull
 
-        points = np.asarray(
-            contour,
+        hull = ConvexHull(normalized_xy)
+        footprint = xy[hull.vertices]
+
+        if len(footprint) < 3:
+            raise RuntimeError("Convex hull contains fewer than three points")
+
+        plinth_vertices = []
+        plinth_faces = []
+
+        def add_triangle(a, b, c):
+            base = len(plinth_vertices)
+            plinth_vertices.extend([a, b, c])
+            plinth_faces.append([base, base + 1, base + 2])
+
+        # Extrude each hull edge downward as a pair of vertical triangles.
+        for i in range(len(footprint)):
+            j = (i + 1) % len(footprint)
+            top_a = np.array([footprint[i, 0], footprint[i, 1], cut_z])
+            top_b = np.array([footprint[j, 0], footprint[j, 1], cut_z])
+            bottom_a = np.array(
+                [footprint[i, 0], footprint[i, 1], bottom_z]
+            )
+            bottom_b = np.array(
+                [footprint[j, 0], footprint[j, 1], bottom_z]
+            )
+
+            add_triangle(top_a, bottom_a, bottom_b)
+            add_triangle(top_a, bottom_b, top_b)
+
+        # Add a bottom patch. A fan is valid because the footprint is convex.
+        center_xy = footprint.mean(axis=0)
+        bottom_center = np.array(
+            [center_xy[0], center_xy[1], bottom_z],
             dtype=np.float64,
         )
 
-        if points.ndim != 2 or points.shape[0] < 2:
-            continue
+        for i in range(len(footprint)):
+            j = (i + 1) % len(footprint)
+            bottom_a = np.array(
+                [footprint[i, 0], footprint[i, 1], bottom_z],
+                dtype=np.float64,
+            )
+            bottom_b = np.array(
+                [footprint[j, 0], footprint[j, 1], bottom_z],
+                dtype=np.float64,
+            )
+            add_triangle(bottom_center, bottom_b, bottom_a)
 
-        # Force the section to the exact desired Z.
-        points = points.copy()
-        points[:, 2] = cut_z
-
-        # Remove immediately repeated points.
-        cleaned = [points[0]]
-
-        for p in points[1:]:
-            if np.linalg.norm(p - cleaned[-1]) > 1.0e-12:
-                cleaned.append(p)
-
-        points = np.asarray(
-            cleaned,
-            dtype=np.float64,
+        plinth = trimesh.Trimesh(
+            vertices=np.asarray(plinth_vertices, dtype=np.float64),
+            faces=np.asarray(plinth_faces, dtype=np.int64),
+            process=False,
         )
 
-        if len(points) < 2:
-            continue
+        if plinth.is_empty:
+            raise RuntimeError("Plinth generation produced no triangles")
 
-        # Section loops should normally already be closed, but explicitly
-        # close them if necessary.
-        if np.linalg.norm(
-            points[0] - points[-1]
-        ) > 1.0e-10:
+        result = trimesh.util.concatenate([trimmed, plinth])
+        if result is None or result.is_empty:
+            raise RuntimeError("Combining the trimmed mesh and plinth failed")
 
-            points = np.vstack(
-                (
-                    points,
-                    points[0],
-                )
-            )
+        info = {
+            "plinth_created": True,
+            "fallback_to_original": False,
+            "original_min_z": original_min_z,
+            "original_max_z": original_max_z,
+            "cut_z": cut_z,
+            "trim_height": trim_height,
+            "plinth_height": plinth_height,
+            "plinth_bottom_z": bottom_z,
+            "section_point_count": int(len(xy)),
+            "footprint_point_count": int(len(footprint)),
+            "plinth_faces": int(len(plinth.faces)),
+            "final_min_z": float(result.bounds[0][2]),
+            "final_max_z": float(result.bounds[1][2]),
+            "total_faces": int(len(result.faces)),
+            "total_vertices": int(len(result.vertices)),
+            "warning": None,
+        }
 
-        for i in range(len(points) - 1):
+        return result, info
 
-            top_a = points[i].copy()
-            top_b = points[i + 1].copy()
-
-            # Ignore degenerate contour segments.
-            if np.linalg.norm(top_b - top_a) <= 1.0e-12:
-                continue
-
-            bottom_a = top_a.copy()
-            bottom_b = top_b.copy()
-
-            bottom_a[2] = bottom_z
-            bottom_b[2] = bottom_z
-
-            base = len(wall_vertices)
-
-            wall_vertices.extend(
-                [
-                    top_a,
-                    top_b,
-                    bottom_b,
-                    bottom_a,
-                ]
-            )
-
-            # Quad split into two triangles.
-            wall_faces.append(
-                [
-                    base + 0,
-                    base + 1,
-                    base + 2,
-                ]
-            )
-
-            wall_faces.append(
-                [
-                    base + 0,
-                    base + 2,
-                    base + 3,
-                ]
-            )
-
-            num_wall_segments += 1
-
-    if len(wall_faces) == 0:
-        raise RuntimeError(
-            "Unable to generate any plinth wall triangles"
+    except Exception as exc:
+        warning = (
+            "Mesh trim/plinth creation failed; using the original mesh "
+            f"without trimming or plinth: {exc}"
         )
+        logging.warning(warning)
 
-    wall_mesh = trimesh.Trimesh(
-        vertices=np.asarray(
-            wall_vertices,
-            dtype=np.float64,
-        ),
-        faces=np.asarray(
-            wall_faces,
-            dtype=np.int64,
-        ),
-        process=False,
-    )
-
-    # ==============================================================
-    # 4. Copy the existing trim cap downward
-    #
-    # We DON'T need to figure out its perimeter.
-    #
-    # We only find triangles lying entirely in the trim plane, copy
-    # those actual triangles, and translate the copies downward.
-    #
-    # Duplicate vertices do not matter here.
-    # ==============================================================
-
-    trimmed_vertices = np.asarray(
-        trimmed.vertices,
-        dtype=np.float64,
-    )
-
-    trimmed_faces = np.asarray(
-        trimmed.faces,
-        dtype=np.int64,
-    )
-
-    tri_vertices = trimmed_vertices[
-        trimmed_faces
-    ]
-
-    z_tol = max(
-        voxel_size * 1.0e-5,
-        1.0e-10,
-    )
-
-    cap_mask = np.all(
-        np.abs(
-            tri_vertices[:, :, 2] - cut_z
-        ) <= z_tol,
-        axis=1,
-    )
-
-    cap_triangles = tri_vertices[
-        cap_mask
-    ].copy()
-
-    num_cap_faces = len(
-        cap_triangles
-    )
-
-    if num_cap_faces == 0:
-        raise RuntimeError(
-            "Could not identify the horizontal trim cap"
-        )
-
-    # Move an exact copy of the cap down to the bottom of the plinth.
-    cap_triangles[:, :, 2] = bottom_z
-
-    bottom_vertices = cap_triangles.reshape(
-        (-1, 3)
-    )
-
-    bottom_faces = np.arange(
-        len(bottom_vertices),
-        dtype=np.int64,
-    ).reshape(
-        (-1, 3)
-    )
-
-    bottom_mesh = trimesh.Trimesh(
-        vertices=bottom_vertices,
-        faces=bottom_faces,
-        process=False,
-    )
-
-    # ==============================================================
-    # 5. Concatenate.
-    #
-    # No boolean.
-    # No welding requirement.
-    # No watertight requirement.
-    #
-    # The trimmed tire keeps its existing cap.
-    # The plinth adds vertical walls and a bottom surface.
-    # ==============================================================
-
-    result = trimesh.util.concatenate(
-        [
-            trimmed,
-            wall_mesh,
-            bottom_mesh,
-        ]
-    )
-
-    if result is None or result.is_empty:
-        raise RuntimeError(
-            "Concatenating wheel and plinth failed"
-        )
-
-    final_min_z = float(
-        result.bounds[0][2]
-    )
-
-    final_max_z = float(
-        result.bounds[1][2]
-    )
-
-    info = {
-        "original_min_z": original_min_z,
-        "original_max_z": original_max_z,
-
-        "cut_z": cut_z,
-        "trim_height": trim_height,
-
-        "plinth_height": plinth_height,
-        "plinth_bottom_z": bottom_z,
-
-        "final_min_z": final_min_z,
-        "final_max_z": final_max_z,
-
-        "section_loops": int(
-            len(contours)
-        ),
-
-        "wall_segments": int(
-            num_wall_segments
-        ),
-
-        "wall_faces": int(
-            len(wall_faces)
-        ),
-
-        "bottom_faces": int(
-            num_cap_faces
-        ),
-
-        "total_faces": int(
-            len(result.faces)
-        ),
-
-        "total_vertices": int(
-            len(result.vertices)
-        ),
-    }
-
-    return result, info
+        info = {
+            "plinth_created": False,
+            "fallback_to_original": True,
+            "original_min_z": original_min_z,
+            "original_max_z": original_max_z,
+            "warning": warning,
+        }
+        return original, info
 
 # Mesh Generation Functions
 # =========================
