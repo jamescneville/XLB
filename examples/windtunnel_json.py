@@ -1398,7 +1398,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
             wheelCenter = wheelCenter / voxel_size
             wheel_centers.append((wheelCenter, wheelSize[0]/voxel_size))
             if jsonfile['mesher']['trim'] == True:
-                zShift = jsonfile['mesher']['trim_voxels']
+                zShift = 2 if "surfaceRemesh" not in jsonfile.get("settings", {}) else jsonfile['mesher']['trim_voxels']
                 wheel_mesh, plinth_info = trim_wheel_with_plinth( mesh=mesh,  voxel_size=voxel_size,  trim_voxels=zShift, plinth_voxels=zShift, )
 
                 # Debug output.
@@ -1431,7 +1431,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
         wheel_vertices=None
         wheel_centers = None
         if jsonfile['mesher']['trim'] == True:
-            zShift = jsonfile['mesher']['trim_voxels']
+            zShift = 2 if "surfaceRemesh" not in jsonfile.get("settings", {}) else jsonfile['mesher']['trim_voxels']
             body_mesh, plinth_info = trim_wheel_with_plinth(mesh=body_mesh, voxel_size=voxel_size, trim_voxels=zShift, plinth_voxels=zShift, localize_regions=True, )
 
             # Debug output.
