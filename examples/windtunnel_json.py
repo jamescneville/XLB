@@ -934,14 +934,25 @@ def trim_wheel_with_plinth(
     voxel_size,
     trim_voxels=1.0,
     plinth_voxels=None,
+    localize_regions=False,
+    region_merge_voxels=None,
+    max_region_fraction=0.20,
 ):
     """
     Trim a mesh and add a plinth surface below the trim plane.
 
-    The plinth footprint is the 2D convex hull of all mesh/plane intersection
-    points. This avoids requiring closed section contours. Its surface consists
-    of vertical perimeter triangles and a triangulated bottom patch; it does
-    not need to be watertight.
+    By default, the plinth footprint is the 2D convex hull of all
+    mesh/plane-intersection points. This is intended for a single wheel mesh.
+
+    With localize_regions=True, section linework is converted into local 2D
+    regions. Nearby tread regions are merged up to region_merge_voxels, then
+    each region receives its own convex-hull plinth. This mode is intended for
+    a merged vehicle scan. If a resulting footprint is too large relative to
+    the input mesh's XY bounds, the function declines to make a broad plate and
+    returns the original mesh instead.
+
+    Each plinth has vertical perimeter triangles plus top and bottom patches.
+    The result does not need to be topologically watertight.
 
     If trimming or plinth generation fails for a valid Trimesh input, this
     function logs a warning and returns an unchanged copy of the input mesh.
@@ -959,6 +970,14 @@ def trim_wheel_with_plinth(
     plinth_voxels : float or None
         Plinth height below the cut, in finest voxels. Defaults to
         trim_voxels.
+    localize_regions : bool
+        If True, create separate plinths from grouped 2D section regions.
+    region_merge_voxels : float or None
+        Maximum approximate gap to bridge between nearby section regions,
+        in finest voxels. Defaults to trim_voxels.
+    max_region_fraction : float
+        In localize_regions mode, reject any single footprint whose area
+        exceeds this fraction of the input mesh's XY bounding-box area.
 
     Returns
     -------
@@ -999,6 +1018,17 @@ def trim_wheel_with_plinth(
         if plinth_voxels <= 0.0:
             raise ValueError("plinth_voxels must be positive")
 
+        localize_regions = bool(localize_regions)
+        if region_merge_voxels is None:
+            region_merge_voxels = trim_voxels
+        region_merge_voxels = float(region_merge_voxels)
+        max_region_fraction = float(max_region_fraction)
+
+        if region_merge_voxels < 0.0:
+            raise ValueError("region_merge_voxels cannot be negative")
+        if not 0.0 < max_region_fraction <= 1.0:
+            raise ValueError("max_region_fraction must be in (0, 1]")
+
         trim_height = trim_voxels * voxel_size
         plinth_height = plinth_voxels * voxel_size
         cut_z = original_min_z + trim_height
@@ -1035,13 +1065,23 @@ def trim_wheel_with_plinth(
             )
 
         point_arrays = []
+        section_lines = []
+        import shapely
+        from shapely.geometry import LineString, Polygon
+        from shapely.ops import unary_union
+
         for entity in section.entities:
             points = np.asarray(
                 entity.discrete(section.vertices),
                 dtype=np.float64,
             )
             if points.ndim == 2 and points.shape[0] > 0:
-                point_arrays.append(points[:, :2])
+                xy_points = points[:, :2]
+                point_arrays.append(xy_points)
+
+                for a, b in zip(xy_points[:-1], xy_points[1:]):
+                    if np.linalg.norm(b - a) > 1.0e-12:
+                        section_lines.append(LineString([a, b]))
 
         if not point_arrays:
             raise RuntimeError(
@@ -1057,27 +1097,110 @@ def trim_wheel_with_plinth(
                 f"Need at least three distinct section points; found {len(xy)}"
             )
 
-        # Normalize coordinates before the rank check and hull calculation
-        # to reduce sensitivity to model size and coordinate offset.
-        centered_xy = xy - xy.mean(axis=0)
-        xy_scale = float(np.max(np.ptp(centered_xy, axis=0)))
-
-        if not np.isfinite(xy_scale) or xy_scale <= 0.0:
-            raise RuntimeError("Section points have no 2D extent")
-
-        normalized_xy = centered_xy / xy_scale
-        if np.linalg.matrix_rank(normalized_xy) < 2:
-            raise RuntimeError(
-                "Section points are collinear; cannot form a 2D footprint"
-            )
-
         from scipy.spatial import ConvexHull
 
-        hull = ConvexHull(normalized_xy)
-        footprint = xy[hull.vertices]
+        def convex_footprint(points_2d):
+            points_2d = np.unique(
+                np.asarray(points_2d, dtype=np.float64),
+                axis=0,
+            )
+            if len(points_2d) < 3:
+                return None
 
-        if len(footprint) < 3:
-            raise RuntimeError("Convex hull contains fewer than three points")
+            centered = points_2d - points_2d.mean(axis=0)
+            scale = float(np.max(np.ptp(centered, axis=0)))
+            if not np.isfinite(scale) or scale <= 0.0:
+                return None
+
+            normalized = centered / scale
+            if np.linalg.matrix_rank(normalized) < 2:
+                return None
+
+            hull = ConvexHull(normalized)
+            return points_2d[hull.vertices]
+
+        footprints = []
+
+        if localize_regions:
+            if not section_lines:
+                raise RuntimeError("Section has no usable line segments")
+
+            linework = unary_union(section_lines)
+            merge_distance = region_merge_voxels * voxel_size
+
+            # First build actual enclosed section areas. If the scan section
+            # is open, buffer its linework to form local regions instead.
+            areas = shapely.build_area(linework)
+            if areas is None or areas.is_empty:
+                regions = linework.buffer(0.5 * merge_distance)
+            elif merge_distance > 0.0:
+                # Close small gaps between tread blocks while keeping
+                # separate tire regions apart when their spacing is larger.
+                regions = areas.buffer(0.5 * merge_distance).buffer(
+                    -0.5 * merge_distance
+                )
+            else:
+                regions = areas
+
+            def collect_polygons(geometry):
+                if isinstance(geometry, Polygon):
+                    return [geometry]
+                parts = []
+                for part in getattr(geometry, "geoms", []):
+                    parts.extend(collect_polygons(part))
+                return parts
+
+            region_polygons = [
+                polygon
+                for polygon in collect_polygons(regions)
+                if not polygon.is_empty and polygon.area > 0.0
+            ]
+
+            if not region_polygons:
+                raise RuntimeError(
+                    "Could not form any local plinth regions from the scan section"
+                )
+
+            mesh_xy_span = np.ptp(
+                np.asarray(original.vertices, dtype=np.float64)[:, :2],
+                axis=0,
+            )
+            mesh_xy_area = max(
+                float(mesh_xy_span[0] * mesh_xy_span[1]),
+                1.0e-30,
+            )
+
+            for polygon in region_polygons:
+                hull_polygon = polygon.convex_hull
+                if hull_polygon.is_empty or hull_polygon.area <= 0.0:
+                    continue
+
+                area_fraction = float(hull_polygon.area / mesh_xy_area)
+                if area_fraction > max_region_fraction:
+                    raise RuntimeError(
+                        "A grouped scan-section region is too broad for a "
+                        f"local plinth ({area_fraction:.1%} of mesh XY bounds); "
+                        "returning the original mesh"
+                    )
+
+                footprint = np.asarray(
+                    hull_polygon.exterior.coords[:-1],
+                    dtype=np.float64,
+                )
+                if len(footprint) >= 3:
+                    footprints.append(footprint)
+
+            if not footprints:
+                raise RuntimeError(
+                    "Local scan regions did not produce valid footprints"
+                )
+        else:
+            footprint = convex_footprint(xy)
+            if footprint is None or len(footprint) < 3:
+                raise RuntimeError(
+                    "Section points cannot form a 2D plinth footprint"
+                )
+            footprints = [footprint]
 
         plinth_vertices = []
         plinth_faces = []
@@ -1087,39 +1210,45 @@ def trim_wheel_with_plinth(
             plinth_vertices.extend([a, b, c])
             plinth_faces.append([base, base + 1, base + 2])
 
-        # Extrude each hull edge downward as a pair of vertical triangles.
-        for i in range(len(footprint)):
-            j = (i + 1) % len(footprint)
-            top_a = np.array([footprint[i, 0], footprint[i, 1], cut_z])
-            top_b = np.array([footprint[j, 0], footprint[j, 1], cut_z])
-            bottom_a = np.array(
-                [footprint[i, 0], footprint[i, 1], bottom_z]
-            )
-            bottom_b = np.array(
-                [footprint[j, 0], footprint[j, 1], bottom_z]
-            )
-
-            add_triangle(top_a, bottom_a, bottom_b)
-            add_triangle(top_a, bottom_b, top_b)
-
-        # Add a bottom patch. A fan is valid because the footprint is convex.
-        center_xy = footprint.mean(axis=0)
-        bottom_center = np.array(
-            [center_xy[0], center_xy[1], bottom_z],
-            dtype=np.float64,
-        )
-
-        for i in range(len(footprint)):
-            j = (i + 1) % len(footprint)
-            bottom_a = np.array(
-                [footprint[i, 0], footprint[i, 1], bottom_z],
+        # Build a separate open plinth surface for each local footprint.
+        # Each one has perimeter walls plus top and bottom fan caps.
+        for footprint in footprints:
+            center_xy = footprint.mean(axis=0)
+            top_center = np.array(
+                [center_xy[0], center_xy[1], cut_z],
                 dtype=np.float64,
             )
-            bottom_b = np.array(
-                [footprint[j, 0], footprint[j, 1], bottom_z],
+            bottom_center = np.array(
+                [center_xy[0], center_xy[1], bottom_z],
                 dtype=np.float64,
             )
-            add_triangle(bottom_center, bottom_b, bottom_a)
+
+            for i in range(len(footprint)):
+                j = (i + 1) % len(footprint)
+                top_a = np.array(
+                    [footprint[i, 0], footprint[i, 1], cut_z],
+                    dtype=np.float64,
+                )
+                top_b = np.array(
+                    [footprint[j, 0], footprint[j, 1], cut_z],
+                    dtype=np.float64,
+                )
+                bottom_a = np.array(
+                    [footprint[i, 0], footprint[i, 1], bottom_z],
+                    dtype=np.float64,
+                )
+                bottom_b = np.array(
+                    [footprint[j, 0], footprint[j, 1], bottom_z],
+                    dtype=np.float64,
+                )
+
+                # Side wall.
+                add_triangle(top_a, bottom_a, bottom_b)
+                add_triangle(top_a, bottom_b, top_b)
+
+                # Separate top surface at the cut plane and bottom patch.
+                add_triangle(top_center, top_a, top_b)
+                add_triangle(bottom_center, bottom_b, bottom_a)
 
         plinth = trimesh.Trimesh(
             vertices=np.asarray(plinth_vertices, dtype=np.float64),
@@ -1144,8 +1273,17 @@ def trim_wheel_with_plinth(
             "plinth_height": plinth_height,
             "plinth_bottom_z": bottom_z,
             "section_point_count": int(len(xy)),
-            "footprint_point_count": int(len(footprint)),
+            "footprint_regions": int(len(footprints)),
+            "footprint_point_count": int(
+                sum(len(footprint) for footprint in footprints)
+            ),
             "plinth_faces": int(len(plinth.faces)),
+            "localize_regions": localize_regions,
+            "region_merge_distance": (
+                region_merge_voxels * voxel_size
+                if localize_regions
+                else None
+            ),
             "final_min_z": float(result.bounds[0][2]),
             "final_max_z": float(result.bounds[1][2]),
             "total_faces": int(len(result.faces)),
@@ -1294,7 +1432,7 @@ def mesh_prep(voxel_size, car_mesh, body_mesh, wheel_meshes, output_dir, jsonfil
         wheel_centers = None
         if jsonfile['mesher']['trim'] == True:
             zShift = jsonfile['mesher']['trim_voxels']
-            body_mesh, plinth_info = trim_wheel_with_plinth(mesh=body_mesh, voxel_size=voxel_size, trim_voxels=zShift,plinth_voxels=zShift, )
+            body_mesh, plinth_info = trim_wheel_with_plinth(mesh=body_mesh, voxel_size=voxel_size, trim_voxels=zShift, plinth_voxels=zShift, localize_regions=True, )
 
             # Debug output.
             body_mesh.export(os.path.join(output_dir,'temp.stl',))
