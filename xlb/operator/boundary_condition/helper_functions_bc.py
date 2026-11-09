@@ -69,6 +69,10 @@ class HelperFunctionsBC(object):
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
 
+        # Loop split point: both halves of a q-long loop have <= 16 iterations (Warp's default
+        # max_unroll), so each half is fully unrolled.
+        _split = min(14, _q)
+
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
 
@@ -704,9 +708,18 @@ class HelperFunctionsBC(object):
             # -----------------------------------------------------------------
             # SANDWICH DETECTION
             # -----------------------------------------------------------------
-            for l in range(_q):
+            # No early `return` inside the loops, and two <=16-iteration halves, so Warp fully unrolls
+            # both and _missing_mask / _opp_indices are only ever indexed with literals. A `return` in a
+            # rolled loop forces runtime indexing -> per-thread local arrays and register spills.
+            is_sandwich = wp.bool(False)
+            for l in range(0, _split):
                 if _missing_mask[l] == wp.uint8(1) and _missing_mask[_opp_indices[l]] == wp.uint8(1):
-                    return u_wall, _relax
+                    is_sandwich = wp.bool(True)
+            for l in range(_split, _q):
+                if _missing_mask[l] == wp.uint8(1) and _missing_mask[_opp_indices[l]] == wp.uint8(1):
+                    is_sandwich = wp.bool(True)
+            if is_sandwich:
+                return u_wall, _relax
 
             # -----------------------------------------------------------------
             # GEOMETRY: SURFACE NORMAL AND WALL DISTANCE
