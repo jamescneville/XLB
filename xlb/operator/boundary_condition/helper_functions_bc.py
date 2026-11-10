@@ -69,6 +69,10 @@ class HelperFunctionsBC(object):
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
 
+        # Unique opposite-direction pairs (13 for D3Q27): a compile-time constant, so loops over pairs unroll.
+        _symmetry_pairs = self.velocity_set.symmetry_pairs
+        _n_symmetry_pairs = self.velocity_set.n_symmetry_pairs
+
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
 
@@ -704,9 +708,16 @@ class HelperFunctionsBC(object):
             # -----------------------------------------------------------------
             # SANDWICH DETECTION
             # -----------------------------------------------------------------
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1) and _missing_mask[_opp_indices[l]] == wp.uint8(1):
-                    return u_wall, _relax
+            # Sandwich check over the unique opposite pairs: a pair is sandwiched iff both of its members are
+            # missing. 13 iterations and no early `return`, so Warp fully unrolls the loop and _missing_mask is
+            # only ever indexed with literals. A `return` in a rolled loop forces runtime indexing -> per-thread
+            # local arrays and register spills.
+            is_sandwich = wp.bool(False)
+            for p in range(_n_symmetry_pairs):
+                if _missing_mask[_symmetry_pairs[p, 0]] == wp.uint8(1) and _missing_mask[_symmetry_pairs[p, 1]] == wp.uint8(1):
+                    is_sandwich = wp.bool(True)
+            if is_sandwich:
+                return u_wall, _relax
 
             # -----------------------------------------------------------------
             # GEOMETRY: SURFACE NORMAL AND WALL DISTANCE
