@@ -1549,6 +1549,80 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
             return ll
 
+        @neon.Container.factory(name="mark_cfv_blocks")
+        def mark_cfv_blocks(level: int, f_0_fd: Any, bc_mask_fd: Any, needs_mres_fd: Any, p0: int, p1: int, p2: int, nmax: int):
+            """Flag every finest-level data block that holds a voxel of each CFV class.
+
+            Mirrors the class tests of make_cfv_finest_split exactly (cls 0 = CFV_BC, 1 = CFV_MRES_NOBC,
+            2 = CFV_MRES_BC). Setup-time only; the flags become per-class block lists so each CFV kernel
+            launches work only on blocks that can contain its voxels.
+            """
+            def ll(loader: neon.Loader):
+                loader.set_mres_grid(bc_mask_fd.get_grid(), level)
+                f_0_pn = loader.get_mres_read_handle(f_0_fd)
+                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+                needs_pn = loader.get_mres_read_handle(needs_mres_fd)
+
+                @wp.func
+                def device(index: Any):
+                    _b = wp.neon_read(bc_mask_pn, index, 0)
+                    if _b == wp.uint8(BC_SOLID):
+                        return
+                    if _b == wp.uint8(BC_SFV):
+                        return
+                    if wp.neon_has_child(f_0_pn, index):
+                        return
+                    _n = wp.neon_read(needs_pn, index, 0)
+                    if _n == wp.uint8(0):
+                        if _b != wp.uint8(BC_NONE):
+                            wp.neon_mark_block(index, p0, p1, p2, 0, nmax)
+                    else:
+                        if _b == wp.uint8(BC_NONE):
+                            wp.neon_mark_block(index, p0, p1, p2, 1, nmax)
+                        else:
+                            wp.neon_mark_block(index, p0, p1, p2, 2, nmax)
+
+                loader.declare_kernel(device)
+
+            return ll
+
+        @neon.Container.factory(name="mark_cfv_blocks")
+        def mark_cfv_blocks(level: int, f_0_fd: Any, bc_mask_fd: Any, needs_mres_fd: Any, p0: int, p1: int, p2: int, nmax: int):
+            """Flag every finest-level data block that holds a voxel of each CFV class.
+
+            Mirrors the class tests of make_cfv_finest_split exactly (cls 0 = CFV_BC, 1 = CFV_MRES_NOBC,
+            2 = CFV_MRES_BC). Setup-time only; the flags become per-class block lists so each CFV kernel
+            launches work only on blocks that can contain its voxels.
+            """
+            def ll(loader: neon.Loader):
+                loader.set_mres_grid(bc_mask_fd.get_grid(), level)
+                f_0_pn = loader.get_mres_read_handle(f_0_fd)
+                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+                needs_pn = loader.get_mres_read_handle(needs_mres_fd)
+
+                @wp.func
+                def device(index: Any):
+                    _b = wp.neon_read(bc_mask_pn, index, 0)
+                    if _b == wp.uint8(BC_SOLID):
+                        return
+                    if _b == wp.uint8(BC_SFV):
+                        return
+                    if wp.neon_has_child(f_0_pn, index):
+                        return
+                    _n = wp.neon_read(needs_pn, index, 0)
+                    if _n == wp.uint8(0):
+                        if _b != wp.uint8(BC_NONE):
+                            wp.neon_mark_block(index, p0, p1, p2, 0, nmax)
+                    else:
+                        if _b == wp.uint8(BC_NONE):
+                            wp.neon_mark_block(index, p0, p1, p2, 1, nmax)
+                        else:
+                            wp.neon_mark_block(index, p0, p1, p2, 2, nmax)
+
+                loader.declare_kernel(device)
+
+            return ll
+
         @neon.Container.factory(name="CFV_finest_fused_pull")
         def CFV_finest_fused_pull(
             level: int,
@@ -1892,6 +1966,8 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             "SFV_finest_fused_pull": SFV_finest_fused_pull,
             "SFV_reset_bc_mask": SFV_reset_bc_mask,
             "mark_needs_mres": mark_needs_mres,
+            "mark_cfv_blocks": mark_cfv_blocks,
+            "mark_cfv_blocks": mark_cfv_blocks,
             "CFV_BC_finest_fused_pull": CFV_BC_finest_fused_pull,
             "CFV_MRES_NOBC_finest_fused_pull": CFV_MRES_NOBC_finest_fused_pull,
             "CFV_MRES_BC_finest_fused_pull": CFV_MRES_BC_finest_fused_pull,

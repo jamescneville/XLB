@@ -7,6 +7,7 @@ precomputation, and the recursive time-stepping skeleton that correctly
 interleaves coarse and fine grid updates.
 """
 
+import os
 import warp as wp
 from xlb.operator.stepper import MultiresIncompressibleNavierStokesStepper
 from xlb.operator.macroscopic import MultiresMacroscopic
@@ -319,6 +320,48 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         for op_name, extra in config["coarse_stream_ops"]:
             self.add_to_app(app=app, op_name=op_name, level=level, **fields_swapped, **extra)
 
+    def _build_cfv_block_lists(self):
+        """Restrict each finest-level CFV kernel to the data blocks that contain its voxels.
+
+        Flags blocks per class with a setup kernel, compacts them on the host into [count, ids...] arrays and
+        registers each array's address with neon.Container.block_lists BEFORE the CFV containers are built (the
+        pointer is baked into the kernel). Blocks without a voxel of the class would only run the early-out path.
+        """
+        import neon
+        import numpy as np
+
+        if not hasattr(neon.Container, "block_lists"):
+            print("[cfv-block-lists] skipped: installed Neon has no block-list support")
+            return
+
+        dims = self.f_0.get_grid().dimensions
+        edge = 4  # data block edge (neon StaticBlock 4x4x4)
+        nmax = ((int(dims.x) + edge - 1) // edge) * ((int(dims.y) + edge - 1) // edge) * ((int(dims.z) + edge - 1) // edge)
+        flags = wp.zeros(4 * nmax + 1, dtype=wp.uint8, device="cuda:0")
+        addr = int(flags.ptr)
+        wp.synchronize()
+        self.neon_container["mark_cfv_blocks"](
+            0, self.f_0, self.bc_mask, self.needs_mres,
+            addr & 0xFFFF, (addr >> 16) & 0xFFFF, (addr >> 32) & 0xFFFF, nmax,
+        ).run(0)
+        wp.synchronize()
+        h = flags.numpy()
+        if h[4 * nmax] != 0:
+            raise RuntimeError("CFV block lists: block id exceeded the dense bound")
+        h = h[: 4 * nmax].reshape(nmax, 4)
+        self._cfv_block_lists = {}
+        names = ["CFV_BC_finest_fused_pull", "CFV_MRES_NOBC_finest_fused_pull", "CFV_MRES_BC_finest_fused_pull"]
+        for cls, name in enumerate(names):
+            ids = np.nonzero(h[:, cls])[0].astype(np.uint32)
+            arr = np.zeros(ids.size + 1, dtype=np.uint32)
+            arr[0] = ids.size
+            arr[1:] = ids
+            dev = wp.array(arr, dtype=wp.uint32, device="cuda:0")
+            self._cfv_block_lists[name] = dev  # keep alive: address is baked into the kernel
+            neon.Container.block_lists[name] = int(dev.ptr)
+            print(f"[cfv-block-lists] {name}: {ids.size} blocks")
+        del flags
+
     def _construct_stepper_skeleton(self):
         import neon
 
@@ -447,6 +490,8 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
                 0, self.f_0, self.bc_mask, self.needs_mres
             ).run(0)
             wp.synchronize()
+            if os.environ.get("XLB_CFV_BLOCK_LISTS", "0") == "1":
+                self._build_cfv_block_lists()
 
         self._build_recursion(
             self.count_levels - 1,
