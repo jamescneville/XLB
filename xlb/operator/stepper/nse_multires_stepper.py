@@ -1595,6 +1595,39 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
 
             return ll
 
+        @neon.Container.factory(name="mark_coarse_cfv")
+        def mark_coarse_cfv(level: int, f_0_fd: Any, bc_mask_fd: Any, p0: int, p1: int, p2: int, nmax: int, per_voxel: bool = False):
+            """Flag the data blocks (or voxels) of one coarse level that the CFV coarse kernels process.
+
+            cls 0 = voxels CFV_collide_coarse acts on (a voxel with children, which clears its accumulator, or a
+            non-solid non-SFV voxel); cls 1 = voxels SFV_stream_coarse_step_ABC acts on (non-solid, non-SFV, no
+            children). Same tests as those kernels. Setup-time only.
+            """
+            def ll(loader: neon.Loader):
+                loader.set_mres_grid(bc_mask_fd.get_grid(), level)
+                f_0_pn = loader.get_mres_read_handle(f_0_fd)
+                bc_mask_pn = loader.get_mres_read_handle(bc_mask_fd)
+
+                @wp.func
+                def device(index: Any):
+                    _b = wp.neon_read(bc_mask_pn, index, 0)
+                    _has_child = wp.neon_has_child(f_0_pn, index)
+                    _cfv = _b != wp.uint8(BC_SOLID) and _b != wp.uint8(BC_SFV)
+                    if _has_child or _cfv:
+                        if wp.static(per_voxel):
+                            wp.neon_mark_voxel(index, p0, p1, p2, 0, nmax)
+                        else:
+                            wp.neon_mark_block(index, p0, p1, p2, 0, nmax)
+                    if _cfv and not _has_child:
+                        if wp.static(per_voxel):
+                            wp.neon_mark_voxel(index, p0, p1, p2, 1, nmax)
+                        else:
+                            wp.neon_mark_block(index, p0, p1, p2, 1, nmax)
+
+                loader.declare_kernel(device)
+
+            return ll
+
         @neon.Container.factory(name="CFV_finest_fused_pull")
         def CFV_finest_fused_pull(
             level: int,
@@ -1939,6 +1972,7 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             "SFV_reset_bc_mask": SFV_reset_bc_mask,
             "mark_needs_mres": mark_needs_mres,
             "mark_cfv_blocks": mark_cfv_blocks,
+            "mark_coarse_cfv": mark_coarse_cfv,
             "CFV_BC_finest_fused_pull": CFV_BC_finest_fused_pull,
             "CFV_MRES_NOBC_finest_fused_pull": CFV_MRES_NOBC_finest_fused_pull,
             "CFV_MRES_BC_finest_fused_pull": CFV_MRES_BC_finest_fused_pull,
