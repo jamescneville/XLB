@@ -378,7 +378,7 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
                 arr[1:] = ids
                 dev = wp.array(arr, dtype=wp.uint32, device="cuda:0")
                 self._cfv_block_lists[(name, level)] = dev  # keep alive: address is baked into the kernel
-                neon.Container.block_lists[(name, level)] = int(dev.ptr)
+                neon.Container.block_lists[(name, level)] = (int(dev.ptr), (int(ids.size) + 63) // 64)
                 print(f"[cfv-block-lists] L{level} {name}: {ids.size} voxels")
 
         self._cfv_block_lists = {}
