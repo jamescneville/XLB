@@ -1550,12 +1550,12 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
             return ll
 
         @neon.Container.factory(name="mark_cfv_blocks")
-        def mark_cfv_blocks(level: int, f_0_fd: Any, bc_mask_fd: Any, needs_mres_fd: Any, p0: int, p1: int, p2: int, nmax: int, per_voxel: bool = False):
-            """Flag every finest-level data block (or voxel) that belongs to each CFV class.
+        def mark_cfv_blocks(level: int, f_0_fd: Any, bc_mask_fd: Any, needs_mres_fd: Any, p0: int, p1: int, p2: int, nblk: int):
+            """Flag every finest-level voxel that belongs to each CFV class.
 
             Mirrors the class tests of make_cfv_finest_split exactly (cls 0 = CFV_BC, 1 = CFV_MRES_NOBC,
-            2 = CFV_MRES_BC). Setup-time only; the flags become per-class lists so each CFV kernel
-            launches work only on the blocks (per_voxel=False) or voxels (per_voxel=True) it can process.
+            2 = CFV_MRES_BC). Setup-time only; the flags become per-class lists so each CFV kernel launches
+            one thread per voxel it can process. Flags go to a window of nblk data blocks (see neon_mark_voxel).
             """
             def ll(loader: neon.Loader):
                 loader.set_mres_grid(bc_mask_fd.get_grid(), level)
@@ -1575,29 +1575,20 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _n = wp.neon_read(needs_pn, index, 0)
                     if _n == wp.uint8(0):
                         if _b != wp.uint8(BC_NONE):
-                            if wp.static(per_voxel):
-                                wp.neon_mark_voxel(index, p0, p1, p2, 0, nmax)
-                            else:
-                                wp.neon_mark_block(index, p0, p1, p2, 0, nmax)
+                            wp.neon_mark_voxel(index, p0, p1, p2, 0, nblk)
                     else:
                         if _b == wp.uint8(BC_NONE):
-                            if wp.static(per_voxel):
-                                wp.neon_mark_voxel(index, p0, p1, p2, 1, nmax)
-                            else:
-                                wp.neon_mark_block(index, p0, p1, p2, 1, nmax)
+                            wp.neon_mark_voxel(index, p0, p1, p2, 1, nblk)
                         else:
-                            if wp.static(per_voxel):
-                                wp.neon_mark_voxel(index, p0, p1, p2, 2, nmax)
-                            else:
-                                wp.neon_mark_block(index, p0, p1, p2, 2, nmax)
+                            wp.neon_mark_voxel(index, p0, p1, p2, 2, nblk)
 
                 loader.declare_kernel(device)
 
             return ll
 
         @neon.Container.factory(name="mark_coarse_cfv")
-        def mark_coarse_cfv(level: int, f_0_fd: Any, bc_mask_fd: Any, p0: int, p1: int, p2: int, nmax: int, per_voxel: bool = False):
-            """Flag the data blocks (or voxels) of one coarse level that the CFV coarse kernels process.
+        def mark_coarse_cfv(level: int, f_0_fd: Any, bc_mask_fd: Any, p0: int, p1: int, p2: int, nblk: int):
+            """Flag the voxels of one coarse level that the CFV coarse kernels process.
 
             cls 0 = voxels CFV_collide_coarse acts on (a voxel with children, which clears its accumulator, or a
             non-solid non-SFV voxel); cls 1 = voxels SFV_stream_coarse_step_ABC acts on (non-solid, non-SFV, no
@@ -1614,15 +1605,9 @@ class MultiresIncompressibleNavierStokesStepper(Stepper):
                     _has_child = wp.neon_has_child(f_0_pn, index)
                     _cfv = _b != wp.uint8(BC_SOLID) and _b != wp.uint8(BC_SFV)
                     if _has_child or _cfv:
-                        if wp.static(per_voxel):
-                            wp.neon_mark_voxel(index, p0, p1, p2, 0, nmax)
-                        else:
-                            wp.neon_mark_block(index, p0, p1, p2, 0, nmax)
+                        wp.neon_mark_voxel(index, p0, p1, p2, 0, nblk)
                     if _cfv and not _has_child:
-                        if wp.static(per_voxel):
-                            wp.neon_mark_voxel(index, p0, p1, p2, 1, nmax)
-                        else:
-                            wp.neon_mark_block(index, p0, p1, p2, 1, nmax)
+                        wp.neon_mark_voxel(index, p0, p1, p2, 1, nblk)
 
                 loader.declare_kernel(device)
 

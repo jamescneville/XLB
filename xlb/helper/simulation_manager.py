@@ -336,43 +336,41 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
             print("[cfv-block-lists] skipped: installed Neon has no block-list support")
             return
 
-        dims = self.f_0.get_grid().dimensions
-        edge = 4  # data block edge (neon StaticBlock 4x4x4)
+        # The voxels are flagged in windows of WINDOW_BLOCKS data blocks so that no array or index approaches 2**31 on
+        # large grids. Window layout: 16-byte header (first block of the window, "more windows" marker), then the
+        # flags of three classes (see neon_mark_voxel). List entries are uint32 (data block * 64 + local index).
+        WINDOW_BLOCKS = 1 << 21
+        span = WINDOW_BLOCKS * 64
+        flags = wp.zeros(16 + 3 * span, dtype=wp.uint8, device="cuda:0")
+        addr = int(flags.ptr)
 
-        def flag_and_register(level, names, run_mark):
-            """run_mark(p0, p1, p2, n, per_voxel) launches the marking container for this level."""
+        def flag_and_register(level, names, make_mark):
+            """make_mark(p0, p1, p2, nblk) builds the marking container for this level."""
             n_cls = len(names)
-            scale = 1 << level
-            nmax = 1
-            for d in (dims.x, dims.y, dims.z):
-                nmax *= (((int(d) + scale - 1) // scale) + edge - 1) // edge
-
-            # Pass 1, per data block: the highest block id holding a class voxel bounds pass 2's flags.
-            flags = wp.zeros(4 * nmax + 1, dtype=wp.uint8, device="cuda:0")
-            addr = int(flags.ptr)
-            wp.synchronize()
-            run_mark(addr & 0xFFFF, (addr >> 16) & 0xFFFF, (addr >> 32) & 0xFFFF, nmax, False)
-            wp.synchronize()
-            h = flags.numpy()
-            if h[4 * nmax] != 0:
-                raise RuntimeError("CFV block lists: block id exceeded the dense bound")
-            used = np.nonzero(h[: 4 * nmax].reshape(nmax, 4).any(axis=1))[0]
-            del flags, h
-            nvox = (int(used.max()) + 1) * 64 if used.size else 64
-
-            # Pass 2, per voxel: flags indexed class * nvox + block * 64 + (x + 4y + 16z).
-            vflags = wp.zeros(n_cls * nvox + 1, dtype=wp.uint8, device="cuda:0")
-            vaddr = int(vflags.ptr)
-            wp.synchronize()
-            run_mark(vaddr & 0xFFFF, (vaddr >> 16) & 0xFFFF, (vaddr >> 32) & 0xFFFF, nvox, True)
-            wp.synchronize()
-            vh = vflags.numpy()
-            if vh[n_cls * nvox] != 0:
-                raise RuntimeError("CFV voxel lists: voxel index exceeded the flagged range")
-            del vflags
+            mark = make_mark(addr & 0xFFFF, (addr >> 16) & 0xFFFF, (addr >> 32) & 0xFFFF, WINDOW_BLOCKS)
+            found = [[] for _ in names]
+            first = 0
+            while True:
+                flags.zero_()
+                header = wp.array(np.array([first, 0, 0, 0], dtype=np.int32).view(np.uint8), dtype=wp.uint8, device="cuda:0")
+                wp.copy(flags, header, count=16)
+                wp.synchronize()
+                mark.run(0)
+                wp.synchronize()
+                h = flags.numpy()
+                for cls in range(n_cls):
+                    local = np.nonzero(h[16 + cls * span: 16 + (cls + 1) * span])[0]
+                    ids = local + first * 64
+                    if ids.size and int(ids[-1]) > 0xFFFFFFFF:
+                        print(f"[cfv-block-lists] L{level}: voxel index exceeds 32 bits, lists skipped for this level")
+                        return
+                    found[cls].append(ids.astype(np.uint32))
+                if h[8] == 0:
+                    break
+                first += WINDOW_BLOCKS
 
             for cls, name in enumerate(names):
-                ids = np.nonzero(vh[cls * nvox:(cls + 1) * nvox])[0].astype(np.uint32)
+                ids = np.concatenate(found[cls])
                 arr = np.zeros(ids.size + 1, dtype=np.uint32)
                 arr[0] = ids.size | 0x80000000
                 arr[1:] = ids
@@ -385,17 +383,17 @@ class MultiresSimulationManager(MultiresIncompressibleNavierStokesStepper):
         flag_and_register(
             0,
             ["CFV_BC_finest_fused_pull", "CFV_MRES_NOBC_finest_fused_pull", "CFV_MRES_BC_finest_fused_pull"],
-            lambda p0, p1, p2, n, pv: self.neon_container["mark_cfv_blocks"](
-                0, self.f_0, self.bc_mask, self.needs_mres, p0, p1, p2, n, pv
-            ).run(0),
+            lambda p0, p1, p2, n: self.neon_container["mark_cfv_blocks"](
+                0, self.f_0, self.bc_mask, self.needs_mres, p0, p1, p2, n
+            ),
         )
         for level in range(1, self.count_levels):
             flag_and_register(
                 level,
                 ["CFV_collide_coarse", "SFV_stream_coarse_step_ABC"],
-                lambda p0, p1, p2, n, pv, level=level: self.neon_container["mark_coarse_cfv"](
-                    level, self.f_0, self.bc_mask, p0, p1, p2, n, pv
-                ).run(0),
+                lambda p0, p1, p2, n, level=level: self.neon_container["mark_coarse_cfv"](
+                    level, self.f_0, self.bc_mask, p0, p1, p2, n
+                ),
             )
 
     def _construct_stepper_skeleton(self):
